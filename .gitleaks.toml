@@ -1,0 +1,10 @@
+title = "Bowline public repository secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "bowline-forbidden-retired-placeholder-artifact"
+description = "Reject the retired authorization placeholder in any public file."
+regex = '''(?i)(example[-]key)'''
+secretGroup = 1

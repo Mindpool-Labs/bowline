@@ -1,0 +1,25 @@
+listen: 0.0.0.0:8080
+upstream: http://127.0.0.1:9999
+actual_supply_id: openai/gpt-5-mini
+policy_bundle: policies/default.yaml
+registry_feed: registry/feed.json
+ledger_dir: ./ledger
+attribution:
+  version: 1
+  response_header: x-upstream-deployment
+  namespace: upstream-deployment
+  mappings:
+    - value: primary
+      supply_id: openai/gpt-5-mini
+trusted_proxy_cidrs:
+  - 127.0.0.0/8
+  - ::1/128
+runtime:
+  connect_timeout_ms: 2000
+  response_header_timeout_ms: 300000
+  stream_idle_timeout_ms: 300000
+  shutdown_grace_ms: 30000
+  writer_queue_capacity: 1024
+  accounting_limit_bytes: 2097152
+  ledger_segment_bytes: 67108864
+  ledger_max_segments: 32

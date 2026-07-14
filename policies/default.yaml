@@ -1,0 +1,20 @@
+# Bowline policy subjects are workload identities only: API-key digests, routes, apps, and tags.
+# Policies never match on request or response content.
+version: 1
+identities:
+  - match: { app: support-bot }
+    tags: [customer-data]
+  - match: { route: /v1/chat/completions, api_key_digest: "sha256:ab12" }
+    tags: [internal]
+rules:
+  - name: customer-data-stays-sovereign
+    subject: { tags: [customer-data] }
+    task_class: heavy-lifting
+    require:
+      supply_class: [owned, vpc-open-weights]
+      cloud_act_exposure: false
+      retention: [none]
+  - name: default
+    default: true
+    require:
+      supply_class: [owned, vpc-open-weights, vpc-frontier, public-api]

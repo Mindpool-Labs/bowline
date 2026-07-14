@@ -1,0 +1,13 @@
+version: 1
+delimiter: comma
+columns:
+  row_id: synthetic_row_id
+  period_start_ms: period_start
+  period_end_ms: period_end
+  supply_id: exact_supply
+  currency: currency
+  charge_basis: basis
+  charge_usd: charge
+  request_count: requests
+  input_tokens: input_tokens
+  output_tokens: output_tokens

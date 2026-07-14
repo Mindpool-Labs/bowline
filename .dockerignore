@@ -1,0 +1,12 @@
+.git
+.github
+target
+ledger
+reports
+*.bwl
+*.tmp
+.DS_Store
+docs
+deploy
+scripts
+examples/ollama

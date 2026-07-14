@@ -1,0 +1,1 @@
+{"schema_version":1,"row_id":"synthetic-east-001","period_start_ms":1780272000000,"period_end_ms":1782864000000,"supply_id":"public/east","currency":"USD","charge_basis":"inference-usage-net","charge_usd":"123.456789","request_count":1000,"input_tokens":2000000,"output_tokens":500000}

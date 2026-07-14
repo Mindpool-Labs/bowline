@@ -1,0 +1,8 @@
+version: 1
+dataset_id: support-regression-v1
+protocol: responses
+cases_file: support-cases.jsonl
+task_class: mechanical
+policy_identity:
+  app: support
+  tags: [team.customer-ops, environment.prod]

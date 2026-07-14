@@ -1,0 +1,2 @@
+rid,start_ms,end_ms,supply,currency,basis,net_charge,requests,input_tokens,output_tokens
+synthetic-east-001,1780272000000,1782864000000,public/east,USD,inference-usage-net,123.456789,1000,2000000,500000

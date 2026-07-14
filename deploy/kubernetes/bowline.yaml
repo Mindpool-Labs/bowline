@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bowline-runtime
+data:
+  bowline.yaml: |
+    listen: 0.0.0.0:8080
+    upstream: https://replace-with-openai-compatible-upstream.example
+    actual_supply_id: replace/with-registry-entry
+    policy_bundle: /config/static/default.yaml
+    registry_feed: /config/static/feed.json
+    ledger_dir: /evidence
+    trusted_proxy_cidrs:
+      - 10.0.0.0/8
+    runtime:
+      connect_timeout_ms: 2000
+      response_header_timeout_ms: 300000
+      stream_idle_timeout_ms: 300000
+      shutdown_grace_ms: 30000
+      writer_queue_capacity: 1024
+      accounting_limit_bytes: 2097152
+      ledger_segment_bytes: 67108864
+      ledger_max_segments: 32
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bowline-evidence
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bowline
+  labels:
+    app.kubernetes.io/name: bowline
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bowline
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bowline
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bowline
+          image: ghcr.io/mindpool-labs/bowline:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--config", "/config/runtime/bowline.yaml"]
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: runtime-config
+              mountPath: /config/runtime
+              readOnly: true
+            - name: static-config
+              mountPath: /config/static
+              readOnly: true
+            - name: evidence
+              mountPath: /evidence
+      volumes:
+        - name: runtime-config
+          configMap:
+            name: bowline-runtime
+        - name: static-config
+          configMap:
+            name: bowline-static
+        - name: evidence
+          persistentVolumeClaim:
+            claimName: bowline-evidence
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bowline
+spec:
+  selector:
+    app.kubernetes.io/name: bowline
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

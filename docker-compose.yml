@@ -1,0 +1,29 @@
+services:
+  echo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: echo-upstream
+    ports:
+      - "8080:8080"
+    volumes:
+      - bowline-ledger:/config/ledger
+
+  bowline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: bowline
+    depends_on:
+      - echo
+    network_mode: "service:echo"
+    volumes:
+      - ./bowline.example.yaml:/config/bowline.example.yaml:ro
+      - ./policies:/config/policies:ro
+      - ./registry:/config/registry:ro
+      - ./tco.example.yaml:/config/tco.example.yaml:ro
+      - bowline-ledger:/config/ledger
+    command: ["serve", "--config", "/config/bowline.example.yaml"]
+
+volumes:
+  bowline-ledger:

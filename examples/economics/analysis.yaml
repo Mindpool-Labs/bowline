@@ -1,0 +1,22 @@
+# Synthetic manifest template. Replace its explicit run IDs with locally completed synthetic runs.
+schema_version: 1
+as_of_ms: 1783036800000
+traffic_run_id: synthetic-traffic-run
+mode: billing-reconciled
+billing_run_id: synthetic-billing-run
+quality_run_ids: [synthetic-quality-v2-run]
+window_start_ms: 1782864000000
+window_end_ms: 1783036800000
+require_request_count: true
+require_input_tokens: true
+require_output_tokens: true
+request_tolerance_ppm: 50000
+input_token_tolerance_ppm: 50000
+output_token_tolerance_ppm: 50000
+minimum_record_coverage_ppm: 950000
+minimum_qualified_charge_coverage_ppm: 950000
+maximum_charge_variance_ppm: 100000
+minimum_duration_ms: 86400000
+minimum_supported_records: 100
+annualize: true
+representative_window_acknowledged: true

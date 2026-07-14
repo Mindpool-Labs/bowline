@@ -1,0 +1,23 @@
+# Containerized Bowline in front of Ollama running on the host.
+# From the workspace root:
+#   docker compose -f examples/ollama/compose.yml up --build -d
+services:
+  bowline-ollama:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: bowline
+    ports:
+      - "8092:8092"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./bowline.ollama.docker.yaml:/config/bowline.yaml:ro
+      - ../../policies:/config/policies:ro
+      - ../../tco.example.yaml:/config/tco.example.yaml:ro
+      - ./feed.ollama.json:/config/feed.ollama.json:ro
+      - bowline-ollama-ledger:/config/ledger
+    command: ["serve", "--config", "/config/bowline.yaml"]
+
+volumes:
+  bowline-ollama-ledger:

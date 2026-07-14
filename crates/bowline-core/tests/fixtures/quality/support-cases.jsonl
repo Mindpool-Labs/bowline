@@ -1,0 +1,1 @@
+{"case_id":"support-001","request":{"input":"Return JSON with status ok"},"expected":{"answer":"{\"status\":\"ok\"}","regex":"^\\{.*status.*ok.*\\}$","schema":{"type":"object","required":["status"],"properties":{"status":{"const":"ok"}}},"status":"ok","tool_name":"lookup","tool_arguments":{"id":"1"}}}

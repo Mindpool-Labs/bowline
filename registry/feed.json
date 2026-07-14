@@ -1,0 +1,230 @@
+{
+  "_note": "Seeded illustrative feed — verify prices before relying on counterfactuals.",
+  "feed_version": "2026-07-09.1",
+  "entries": [
+    {
+      "id": "openai/gpt-5.5",
+      "model": "gpt-5.5",
+      "location": "OpenAI public API, US",
+      "attributes": {
+        "class": "public-api",
+        "jurisdiction": "us",
+        "retention": "days30",
+        "training_use": false,
+        "cloud_act_exposure": true
+      },
+      "price": {
+        "input_per_mtok_usd": 5.0,
+        "output_per_mtok_usd": 25.0
+      },
+      "ratings": {
+        "mechanical": 0.94,
+        "heavy-lifting": 0.93,
+        "taste-sensitive": 0.91,
+        "judgment": 0.94
+      },
+      "available": null
+    },
+    {
+      "id": "openai/gpt-5-mini",
+      "model": "gpt-5-mini",
+      "location": "OpenAI public API, US",
+      "attributes": {
+        "class": "public-api",
+        "jurisdiction": "us",
+        "retention": "days30",
+        "training_use": false,
+        "cloud_act_exposure": true
+      },
+      "price": {
+        "input_per_mtok_usd": 0.25,
+        "output_per_mtok_usd": 2.0
+      },
+      "ratings": {
+        "mechanical": 0.82,
+        "heavy-lifting": 0.52,
+        "taste-sensitive": 0.62,
+        "judgment": 0.5
+      },
+      "available": null
+    },
+    {
+      "id": "anthropic/claude-sonnet-5",
+      "model": "claude-sonnet-5",
+      "location": "Anthropic public API, US",
+      "attributes": {
+        "class": "public-api",
+        "jurisdiction": "us",
+        "retention": "days30",
+        "training_use": false,
+        "cloud_act_exposure": true
+      },
+      "price": {
+        "input_per_mtok_usd": 3.0,
+        "output_per_mtok_usd": 15.0
+      },
+      "ratings": {
+        "mechanical": 0.91,
+        "heavy-lifting": 0.9,
+        "taste-sensitive": 0.9,
+        "judgment": 0.92
+      },
+      "available": null
+    },
+    {
+      "id": "anthropic/claude-haiku-4.5",
+      "model": "claude-haiku-4.5",
+      "location": "Anthropic public API, US",
+      "attributes": {
+        "class": "public-api",
+        "jurisdiction": "us",
+        "retention": "days30",
+        "training_use": false,
+        "cloud_act_exposure": true
+      },
+      "price": {
+        "input_per_mtok_usd": 1.0,
+        "output_per_mtok_usd": 5.0
+      },
+      "ratings": {
+        "mechanical": 0.86,
+        "heavy-lifting": 0.66,
+        "taste-sensitive": 0.72,
+        "judgment": 0.62
+      },
+      "available": null
+    },
+    {
+      "id": "bedrock-eu/claude-sonnet-5",
+      "model": "claude-sonnet-5",
+      "location": "Amazon Bedrock, EU region",
+      "attributes": {
+        "class": "vpc-frontier",
+        "jurisdiction": "eu",
+        "retention": "none",
+        "training_use": false,
+        "cloud_act_exposure": true
+      },
+      "price": {
+        "input_per_mtok_usd": 3.0,
+        "output_per_mtok_usd": 15.0
+      },
+      "ratings": {
+        "mechanical": 0.91,
+        "heavy-lifting": 0.9,
+        "taste-sensitive": 0.9,
+        "judgment": 0.92
+      },
+      "available": null
+    },
+    {
+      "id": "vpc/qwen3-32b",
+      "model": "qwen3-32b",
+      "location": "Customer VPC, EU GPU cluster",
+      "attributes": {
+        "class": "vpc-open-weights",
+        "jurisdiction": "eu",
+        "retention": "none",
+        "training_use": false,
+        "cloud_act_exposure": false
+      },
+      "price": {
+        "input_per_mtok_usd": 0.35,
+        "output_per_mtok_usd": 0.55
+      },
+      "ratings": {
+        "mechanical": 0.82,
+        "heavy-lifting": 0.85,
+        "taste-sensitive": 0.63,
+        "judgment": 0.6
+      },
+      "available": null
+    },
+    {
+      "id": "vpc/llama-3.3-70b",
+      "model": "llama-3.3-70b",
+      "location": "Customer VPC, EU GPU cluster",
+      "attributes": {
+        "class": "vpc-open-weights",
+        "jurisdiction": "eu",
+        "retention": "none",
+        "training_use": false,
+        "cloud_act_exposure": false
+      },
+      "price": {
+        "input_per_mtok_usd": 0.45,
+        "output_per_mtok_usd": 0.7
+      },
+      "ratings": {
+        "mechanical": 0.83,
+        "heavy-lifting": 0.85,
+        "taste-sensitive": 0.66,
+        "judgment": 0.61
+      },
+      "available": null
+    },
+    {
+      "id": "local/llama-3.3-70b",
+      "model": "llama-3.3-70b",
+      "location": "Customer-owned workstation",
+      "attributes": {
+        "class": "owned",
+        "jurisdiction": "local",
+        "retention": "none",
+        "training_use": false,
+        "cloud_act_exposure": false
+      },
+      "price": null,
+      "ratings": {
+        "mechanical": 0.83,
+        "heavy-lifting": 0.85,
+        "taste-sensitive": 0.66,
+        "judgment": 0.61
+      },
+      "available": null
+    },
+    {
+      "id": "local/qwen3-32b",
+      "model": "qwen3-32b",
+      "location": "Customer-owned workstation",
+      "attributes": {
+        "class": "owned",
+        "jurisdiction": "local",
+        "retention": "none",
+        "training_use": false,
+        "cloud_act_exposure": false
+      },
+      "price": null,
+      "ratings": {
+        "mechanical": 0.82,
+        "heavy-lifting": 0.85,
+        "taste-sensitive": 0.63,
+        "judgment": 0.6
+      },
+      "available": null
+    },
+    {
+      "id": "bedrock-us/claude-haiku-4.5",
+      "model": "claude-haiku-4.5",
+      "location": "Amazon Bedrock, US region",
+      "attributes": {
+        "class": "vpc-frontier",
+        "jurisdiction": "us",
+        "retention": "none",
+        "training_use": false,
+        "cloud_act_exposure": true
+      },
+      "price": {
+        "input_per_mtok_usd": 1.0,
+        "output_per_mtok_usd": 5.0
+      },
+      "ratings": {
+        "mechanical": 0.86,
+        "heavy-lifting": 0.66,
+        "taste-sensitive": 0.72,
+        "judgment": 0.62
+      },
+      "available": null
+    }
+  ]
+}

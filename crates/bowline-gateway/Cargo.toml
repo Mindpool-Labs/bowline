@@ -1,0 +1,34 @@
+[package]
+name = "bowline-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bowline-bench"
+path = "src/bin/bowline-bench.rs"
+test = false
+bench = false
+
+[dependencies]
+bowline-core = { path = "../bowline-core" }
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+ipnet.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
+url.workspace = true
+csv.workspace = true
+libc.workspace = true
+crc32fast.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "bowline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+bowline-core = { path = "../bowline-core" }
+bowline-gateway = { path = "../bowline-gateway" }
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+sha2.workspace = true
+libc.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+csv.workspace = true

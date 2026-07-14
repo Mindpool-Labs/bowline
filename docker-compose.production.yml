@@ -1,0 +1,63 @@
+name: bowline-production
+
+services:
+  echo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: echo-upstream
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 128M
+
+  bowline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: bowline
+      args:
+        VCS_REF: ${BOWLINE_VCS_REF:-unknown}
+        VERSION: ${BOWLINE_VERSION:-0.1.0-dev}
+    depends_on:
+      - echo
+    network_mode: "service:echo"
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 35s
+    volumes:
+      - ./bowline.example.yaml:/config/bowline.example.yaml:ro
+      - ./policies:/config/policies:ro
+      - ./registry:/config/registry:ro
+      - ./tco.example.yaml:/config/tco.example.yaml:ro
+      - bowline-evidence:/config/ledger
+    command: ["serve", "--config", "/config/bowline.example.yaml"]
+    healthcheck:
+      test: ["CMD", "/bowline", "health", "--url", "http://127.0.0.1:8080/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+
+volumes:
+  bowline-evidence:

@@ -1,0 +1,25 @@
+[package]
+name = "bowline-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+libc.workspace = true
+url.workspace = true
+ipnet.workspace = true
+jsonschema.workspace = true
+regex.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

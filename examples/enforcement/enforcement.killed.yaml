@@ -1,0 +1,47 @@
+# Synthetic killed controlled-enforcement configuration. It contains no usable promotion evidence.
+version: 1
+global_candidate_in_flight: 2
+kill_switch:
+  trust_root: __TRUST_ROOT__
+  relative_path: state
+actuators:
+  - supply_id: local/qwen3-32b
+    base_url: http://127.0.0.1:9/v1
+    authorization_env: BOWLINE_SYNTHETIC_CANDIDATE_AUTHORIZATION
+    health_path: /v1/models
+    connect_timeout_ms: 1000
+    response_header_timeout_ms: 30000
+    stream_idle_timeout_ms: 30000
+    concurrency: 1
+    probe_timeout_ms: 1000
+    probe_max_bytes: 65536
+    breaker_consecutive_failures: 3
+    breaker_cooldown_ms: 30000
+routes:
+  - route_id: synthetic-support-chat
+    method: POST
+    path: /v1/chat/completions
+    protocol: chat-completions
+    workload:
+      app: synthetic-support
+      resolved_tags: [evaluation]
+    mode: canary-enforce
+    rollout_ppm: 10000
+    promoted_supply_id: local/qwen3-32b
+    actual_supply_id: openai/gpt-5-mini
+    task_class: heavy-lifting
+    model_authority: preserve
+    fallback: bypass
+    promotion:
+      authorization_path: private/authorization/synthetic-support-chat.json
+      economics_bundle_path: private/economics-bundle
+      economics_report_digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      opportunity_digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      quality_run_path: private/quality-run
+      quality_run_id: synthetic-quality-placeholder
+      quality_report_digest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+      policy_digest: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+      registry_digest: sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+      owned_cost_digest: sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+      max_economics_age_ms: 86400000
+      expires_at_ms: 4102444800000

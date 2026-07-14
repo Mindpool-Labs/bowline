@@ -1,0 +1,19 @@
+version: 1
+kind: envoy-typed-json-v1
+source_contract: bowline-envoy-typed-json-v1
+attribution_namespace: deployment
+timestamp_unit: milliseconds
+fields:
+  event_id: /request_id
+  observed_at_ms: /observed_at_ms
+  method: /method
+  route: /route
+  model: /model
+  actual_supply_value: /deployment
+  status: /status
+  streamed: /streamed
+  latency_ms: /latency_ms
+  input_tokens: /input_tokens
+  output_tokens: /output_tokens
+  dimensions.app: /app
+constants: {}

@@ -1,0 +1,2 @@
+{"schema_version":1,"row_id":"synthetic-july-01","period_start_ms":1782864000000,"period_end_ms":1782950400000,"supply_id":"openai/gpt-5-mini","currency":"USD","charge_basis":"inference-usage-net","charge_usd":"1.250000","request_count":100,"input_tokens":200000,"output_tokens":50000}
+{"schema_version":1,"row_id":"synthetic-july-02","period_start_ms":1782950400000,"period_end_ms":1783036800000,"supply_id":"openai/gpt-5-mini","currency":"USD","charge_basis":"inference-usage-net","charge_usd":"1.500000","request_count":120,"input_tokens":240000,"output_tokens":60000}

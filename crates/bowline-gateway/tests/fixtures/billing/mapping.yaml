@@ -1,0 +1,13 @@
+version: 1
+delimiter: comma
+columns:
+  row_id: rid
+  period_start_ms: start_ms
+  period_end_ms: end_ms
+  supply_id: supply
+  currency: currency
+  charge_basis: basis
+  charge_usd: net_charge
+  request_count: requests
+  input_tokens: input_tokens
+  output_tokens: output_tokens

@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible Bowline defect
+title: "[bug] "
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include secrets, customer content, or private evidence. Security issues belong at security@mindpool.io.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options: [native, Docker Compose, Kubernetes, other]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Include minimal commands and redacted configuration.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: integrity
+    attributes:
+      label: Health and integrity counters
+      description: Redact infrastructure identifiers.

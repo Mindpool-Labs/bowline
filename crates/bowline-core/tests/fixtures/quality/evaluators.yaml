@@ -1,0 +1,10 @@
+version: 1
+evaluators:
+  - { id: exact, kind: exact-match, expected_key: answer, required: true }
+  - { id: normalized, kind: normalized-match, expected_key: answer, required: true }
+  - { id: pattern, kind: regex, expected_key: regex, required: true }
+  - { id: schema, kind: json-schema, expected_key: schema, required: true }
+  - { id: field, kind: field, pointer: /status, expected_key: status, required: true }
+  - { id: tool, kind: tool-call, call_index: 0, expected_name_key: tool_name, expected_arguments_key: tool_arguments, require_total_calls: 1, required: true }
+  - { id: latency, kind: latency-ceiling, max_ms: 3000, required: true }
+  - { id: cost, kind: cost-ceiling, max_usd: 0.02, required: true }

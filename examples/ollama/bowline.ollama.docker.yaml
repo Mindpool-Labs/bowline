@@ -1,0 +1,7 @@
+# Container-side config for examples/ollama/compose.yml.
+listen: 0.0.0.0:8092
+upstream: http://host.docker.internal:11434
+policy_bundle: /config/policies/default.yaml
+registry_feed: /config/feed.ollama.json
+ledger_dir: /config/ledger
+tco: /config/tco.example.yaml

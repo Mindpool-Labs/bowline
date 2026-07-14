@@ -1,0 +1,19 @@
+version: 1
+kind: litellm-jsonl-v1
+source_contract: bowline-litellm-callback-v1
+attribution_namespace: deployment
+timestamp_unit: milliseconds
+fields:
+  event_id: /request_id
+  observed_at_ms: /started_at_ms
+  route: /route
+  model: /model
+  actual_supply_value: /deployment
+  status: /status_code
+  latency_ms: /latency_ms
+  input_tokens: /usage/prompt_tokens
+  output_tokens: /usage/completion_tokens
+  dimensions.app: /metadata/app
+constants:
+  method: POST
+  streamed: false

@@ -1,0 +1,13 @@
+typed_json_format:
+  app: "%DYNAMIC_METADATA(bowline:app)%"
+  deployment: "%DYNAMIC_METADATA(bowline:deployment)%"
+  input_tokens: "%DYNAMIC_METADATA(bowline:input_tokens)%"
+  latency_ms: "%DURATION%"
+  method: "%REQ(:METHOD)%"
+  model: "%DYNAMIC_METADATA(bowline:model)%"
+  observed_at_ms: "%DYNAMIC_METADATA(bowline:observed_at_ms)%"
+  output_tokens: "%DYNAMIC_METADATA(bowline:output_tokens)%"
+  request_id: "%REQ(X-REQUEST-ID)%"
+  route: "%DYNAMIC_METADATA(bowline:route)%"
+  status: "%RESPONSE_CODE%"
+  streamed: "%DYNAMIC_METADATA(bowline:streamed)%"

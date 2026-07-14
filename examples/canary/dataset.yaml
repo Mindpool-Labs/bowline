@@ -1,0 +1,9 @@
+# Synthetic public example only; it is not evidence of production representativeness.
+version: 1
+dataset_id: synthetic-status-v1
+protocol: responses
+cases_file: cases.jsonl
+task_class: mechanical
+policy_identity:
+  app: synthetic-canary
+  tags: [environment:test]

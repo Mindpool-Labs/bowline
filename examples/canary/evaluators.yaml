@@ -1,0 +1,11 @@
+# Synthetic public example only; thresholds are illustrative operator inputs.
+version: 1
+evaluators:
+  - id: answer
+    kind: normalized-match
+    expected_key: answer
+    required: true
+  - id: latency
+    kind: latency-ceiling
+    max_ms: 3000
+    required: true

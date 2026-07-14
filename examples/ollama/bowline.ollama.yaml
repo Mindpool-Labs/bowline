@@ -1,0 +1,9 @@
+# Bowline shadow mode in front of a local Ollama server.
+# Paths resolve relative to this file. Native run (from the workspace root):
+#   cargo run -p bowline -- serve --config examples/ollama/bowline.ollama.yaml
+listen: 127.0.0.1:8091
+upstream: http://127.0.0.1:11434
+policy_bundle: ../../policies/default.yaml
+registry_feed: feed.ollama.json
+ledger_dir: ./ledger
+tco: ../../tco.example.yaml

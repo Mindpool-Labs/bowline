@@ -1,0 +1,11 @@
+# Monthly hardware amortization declared by the operator.
+monthly_amortization_usd: 1200.0
+
+# Monthly power cost declared by the operator.
+monthly_power_usd: 300.0
+
+# Monthly operations cost declared by the operator.
+monthly_ops_usd: 500.0
+
+# Monthly throughput capacity declared by the operator, in million tokens.
+monthly_capacity_mtok: 2000.0
