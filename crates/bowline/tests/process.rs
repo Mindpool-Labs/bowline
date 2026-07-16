@@ -471,6 +471,98 @@ fn restart_after_unclean_shutdown_preserves_evidence_and_starts_new_run() {
     assert_ne!(manifests[0].run_id, manifests[1].run_id);
 }
 
+#[test]
+fn file_lease_process_failover_promotes_standby_after_active_is_killed() {
+    let dir = fs::canonicalize(tempdir("file-lease-process-failover")).unwrap();
+    let lease_dir = dir.join("lease");
+    fs::create_dir(&lease_dir).unwrap();
+    fs::set_permissions(&lease_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let lease_path = lease_dir.join("active.lock");
+    let ledger_dir = dir.join("ledger");
+    let first_listen = unused_address();
+    let second_listen = unused_address();
+    let first_config =
+        write_file_lease_config(&dir, "first.yaml", &first_listen, &ledger_dir, &lease_path);
+    let second_config = write_file_lease_config(
+        &dir,
+        "second.yaml",
+        &second_listen,
+        &ledger_dir,
+        &lease_path,
+    );
+    let mut first = spawn_bowline(&first_config);
+    let mut second = spawn_bowline(&second_config);
+
+    let first_active =
+        wait_for_single_ready(&first_listen, &second_listen, &mut first, &mut second);
+    let (active, standby, active_listen, standby_listen) = if first_active {
+        (&mut first, &mut second, &first_listen, &second_listen)
+    } else {
+        (&mut second, &mut first, &second_listen, &first_listen)
+    };
+    assert!(health_is(active_listen, "/health/ready", "HTTP/1.1 200"));
+    let body = r#"{"model":"gpt-5-mini","messages":[]}"#;
+    let rejected = http_request(
+        standby_listen,
+        &format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nConnection: close\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+    assert!(
+        rejected.starts_with("HTTP/1.1 503") && rejected.contains(r#""code":"standby-no-lease""#),
+        "standby response: {rejected}"
+    );
+    assert_eq!(
+        RunStore::list_manifests(&ledger_dir)
+            .expect("active manifest list")
+            .len(),
+        1,
+        "standby must not create a run or writer"
+    );
+
+    let takeover_started = Instant::now();
+    assert!(Command::new("/bin/kill")
+        .args(["-KILL", &active.id().to_string()])
+        .status()
+        .expect("SIGKILL sent")
+        .success());
+    assert!(!active.wait().expect("killed active reaped").success());
+
+    wait_until_ready(standby_listen, standby);
+    assert!(
+        takeover_started.elapsed() <= Duration::from_millis(2_000),
+        "standby promotion exceeded takeover_timeout_ms"
+    );
+    assert!(Command::new("/bin/kill")
+        .args(["-TERM", &standby.id().to_string()])
+        .status()
+        .expect("SIGTERM sent")
+        .success());
+    assert!(standby.wait().expect("promoted standby exits").success());
+
+    let manifests = RunStore::list_manifests(&ledger_dir).expect("manifest list");
+    assert_eq!(manifests.len(), 2);
+    assert_eq!(
+        manifests
+            .iter()
+            .filter(|manifest| manifest.clean_shutdown)
+            .count(),
+        1
+    );
+    assert_eq!(
+        manifests
+            .iter()
+            .filter(|manifest| !manifest.clean_shutdown)
+            .count(),
+        1
+    );
+    assert_ne!(manifests[0].run_id, manifests[1].run_id);
+}
+
 fn spawn_bowline(config: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_bowline"))
         .args(["serve", "--config", config.to_str().expect("utf8 config")])
@@ -478,6 +570,58 @@ fn spawn_bowline(config: &Path) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("Bowline process starts")
+}
+
+fn wait_for_single_ready(
+    first_address: &str,
+    second_address: &str,
+    first: &mut Child,
+    second: &mut Child,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert_child_running(first, "first");
+        assert_child_running(second, "second");
+        let first_live = health_is(first_address, "/health/live", "HTTP/1.1 200");
+        let second_live = health_is(second_address, "/health/live", "HTTP/1.1 200");
+        let first_ready = health_is(first_address, "/health/ready", "HTTP/1.1 200");
+        let second_ready = health_is(second_address, "/health/ready", "HTTP/1.1 200");
+        if first_live && second_live && first_ready != second_ready {
+            return first_ready;
+        }
+        if Instant::now() >= deadline {
+            let _ = first.kill();
+            let _ = second.kill();
+            let _ = first.wait();
+            let _ = second.wait();
+            panic!(
+                "timed out waiting for one active gateway; first_live={first_live} \
+                 second_live={second_live} first_ready={first_ready} second_ready={second_ready}"
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn assert_child_running(child: &mut Child, label: &str) {
+    if let Some(status) = child.try_wait().expect("child status") {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .as_mut()
+            .expect("stderr pipe")
+            .read_to_string(&mut stderr)
+            .expect("stderr readable");
+        panic!("{label} Bowline exited before failover ({status}): {stderr}");
+    }
+}
+
+fn health_is(address: &str, path: &str, expected_status: &str) -> bool {
+    try_http_request(
+        address,
+        &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    )
+    .is_ok_and(|response| response.starts_with(expected_status))
 }
 
 fn wait_until_ready(address: &str, child: &mut Child) {
@@ -609,6 +753,45 @@ runtime:
         ),
     )
     .expect("process config written");
+    config
+}
+
+fn write_file_lease_config(
+    dir: &Path,
+    name: &str,
+    listen: &str,
+    ledger_dir: &Path,
+    lease_path: &Path,
+) -> PathBuf {
+    let root = bowline_root();
+    let config = dir.join(name);
+    fs::write(
+        &config,
+        format!(
+            r#"listen: {listen}
+upstream: http://127.0.0.1:9
+actual_supply_id: openai/gpt-5-mini
+policy_bundle: {}
+registry_feed: {}
+ledger_dir: {}
+state_backend:
+  version: 1
+  kind: file-lease
+  path: {}
+  poll_interval_ms: 25
+  takeover_timeout_ms: 2000
+trusted_proxy_cidrs:
+  - 127.0.0.1/32
+runtime:
+  shutdown_grace_ms: 2000
+"#,
+            root.join("policies/default.yaml").display(),
+            root.join("registry/feed.json").display(),
+            ledger_dir.display(),
+            lease_path.display(),
+        ),
+    )
+    .expect("file lease process config written");
     config
 }
 

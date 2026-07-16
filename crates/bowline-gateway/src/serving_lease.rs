@@ -1,3 +1,7 @@
+mod file;
+
+pub use file::FileServingLease;
+
 pub trait ServingLease: Send {
     fn try_acquire(&mut self) -> anyhow::Result<bool>;
 

@@ -9,8 +9,45 @@ header count, writer error, and last flush time. Do not expose status publicly.
 
 Alert on readiness false, any drop, writer error, sequence gap, truncation, unmapped/unpriceable
 growth, sustained queue depth, disk usage, upstream 502/504, and latency. Capacity is bounded by
-`ledger_segment_bytes * ledger_max_segments`; stop before exhausting it. Phase 1 supports one
-replica and one writer only.
+`ledger_segment_bytes * ledger_max_segments`; stop before exhausting it.
+
+## Active-passive file-lease operation
+
+The optional `file-lease` state backend supports active-passive replicas only inside one reliable
+POSIX lock domain. Both replicas bind their own listener and remain live. Exactly one lock holder
+creates the active runtime, opens the shared evidence-root writer, runs bounded startup probes,
+and admits inference. The standby does not open a run or writer and does not run startup probes.
+
+Use a private, operator-owned real directory for the lease parent. Bowline requires mode 0700 on
+that directory and opens or creates a mode-0600 regular lease file without following symlinks.
+Relative lease paths resolve from the configuration file:
+
+```yaml
+state_backend:
+  version: 1
+  kind: file-lease
+  path: /var/lib/bowline/lease/active.lock
+  poll_interval_ms: 250
+  takeover_timeout_ms: 15000
+```
+
+The OS lock is the sole ownership authority. Lease-file metadata is diagnostic and does not permit
+forced takeover. `takeover_timeout_ms` is an alert threshold; a paused holder that retains the lock
+continues to block promotion. Do not use this backend to claim multi-host or NFS failover unless
+the operator independently establishes equivalent lock semantics.
+
+In file-lease mode, `/health/status` adds `serving_state`: `standby`, `activating`, `active`, or
+`draining`. `/health/ready` is false with a stable reason while the instance cannot serve:
+`standby-no-lease`, `activation-in-progress`, or `draining`. Inference sent to those states returns
+HTTP 503 with the same code in the existing error envelope. `activation-failed` appears only as the
+sanitized `last_activation_reason` on status while the instance returns to standby and retries.
+
+On lease loss, the old active stops new admission, drains already accepted response streams,
+closes its writers, and releases ownership. A drain failure terminates the process without
+releasing the lease early; OS descriptor cleanup then permits takeover. Every successful
+activation creates a new run and fresh startup-open local circuit/admission state. A killed active
+therefore leaves an incomplete run, while the promoted standby creates a distinct run. Preserve
+both.
 
 ## Start, stop, bypass, rollback
 
