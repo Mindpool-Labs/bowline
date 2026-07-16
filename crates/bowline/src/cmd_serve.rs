@@ -11,7 +11,7 @@ use bowline_core::{
     supply::Registry,
 };
 use bowline_gateway::{
-    serve_with_shutdown,
+    serve_with_runtime_factory,
     writer::{spawn_managed_writer, ManagedWriterOptions},
     GatewayDeps,
 };
@@ -31,7 +31,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     config.attribution_resolver(&registry)?;
     let owned_costs = load_owned_costs(config.tco.as_deref(), &config.actual_supply_id, &registry)?;
     let attribution_digest = config.attribution_digest(&registry)?;
-    let writer = spawn_managed_writer(ManagedWriterOptions {
+    let writer_options = ManagedWriterOptions {
         directory: config.ledger_dir.clone(),
         policy_digest: policy.digest().to_string(),
         registry_digest,
@@ -42,29 +42,40 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         segment_bytes: config.runtime.ledger_segment_bytes,
         max_segments: config.runtime.ledger_max_segments,
         queue_capacity: config.runtime.writer_queue_capacity,
-    })?;
-    let deps = GatewayDeps::managed_with_provenance(
-        policy.clone(),
-        &registry_source,
-        config.floors.clone().unwrap_or_else(QualityFloors::default),
-        owned_costs,
-        writer.clone(),
-    )?;
+    };
 
     tracing_subscriber::fmt::try_init().ok();
-    print_startup_summary(&config, policy.digest(), &writer.health().snapshot().run_id);
 
-    let grace = config.runtime.shutdown_grace();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build gateway runtime")?
         .block_on(async move {
-            let serve_result = serve_with_shutdown(config, deps, shutdown_signal()).await;
-            let shutdown_result = writer.shutdown(grace).await;
-            serve_result?;
-            shutdown_result.context("failed to drain managed ledger writer")?;
-            Ok(())
+            let startup_config = config.clone();
+            serve_with_runtime_factory(
+                config,
+                move || {
+                    let writer = spawn_managed_writer(writer_options)?;
+                    let deps = GatewayDeps::managed_with_provenance(
+                        policy.clone(),
+                        &registry_source,
+                        startup_config
+                            .floors
+                            .clone()
+                            .unwrap_or_else(QualityFloors::default),
+                        owned_costs,
+                        writer.clone(),
+                    )?;
+                    print_startup_summary(
+                        &startup_config,
+                        policy.digest(),
+                        &writer.health().snapshot().run_id,
+                    );
+                    Ok(deps)
+                },
+                shutdown_signal(),
+            )
+            .await
         })
 }
 

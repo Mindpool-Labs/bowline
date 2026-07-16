@@ -552,6 +552,7 @@ fn parity_config(upstream: &str, root: &std::path::Path) -> Config {
         }),
         floors: None,
         enforcement: None,
+        state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
         runtime: RuntimeConfig::default(),
     }

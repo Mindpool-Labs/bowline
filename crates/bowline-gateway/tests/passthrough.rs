@@ -64,6 +64,7 @@ async fn enforcement_requires_active_provenance_from_injected_dependencies() {
         attribution: None,
         floors: None,
         enforcement: Some(temp.path().join("must-not-be-read.yaml")),
+        state_backend: None,
         trusted_proxy_cidrs: Vec::new(),
         runtime: RuntimeConfig::default(),
     };
@@ -1272,6 +1273,7 @@ async fn spawn_gateway_with_runtime(upstream: String, runtime: RuntimeConfig) ->
         attribution: None,
         floors: None,
         enforcement: None,
+        state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime,
     };
@@ -1324,6 +1326,7 @@ async fn spawn_gateway_with_shadow(upstream: String, ledger_dir: &std::path::Pat
         attribution: None,
         floors: None,
         enforcement: None,
+        state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime: RuntimeConfig::default(),
     };
@@ -1388,6 +1391,7 @@ async fn spawn_managed_gateway(
         attribution: None,
         floors: None,
         enforcement: None,
+        state_backend: None,
         trusted_proxy_cidrs,
         runtime,
     };
@@ -1450,6 +1454,7 @@ async fn spawn_managed_gateway_with_registry(
         attribution: None,
         floors: None,
         enforcement: None,
+        state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime: RuntimeConfig::default(),
     };

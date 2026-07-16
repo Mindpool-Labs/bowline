@@ -929,6 +929,7 @@ async fn startup_paths_reject_each_sealed_provenance_mutation_before_probe_or_bi
                 attribution: None,
                 floors: None,
                 enforcement: Some(enforcement_path),
+                state_backend: None,
                 trusted_proxy_cidrs: Vec::new(),
                 runtime: RuntimeConfig::default(),
             };

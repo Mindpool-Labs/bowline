@@ -1,9 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -17,9 +14,12 @@ use std::{
     task::{Context, Poll},
 };
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
-use crate::writer::AuthorizedDispatchHandle;
+use crate::{
+    state_backend::{AdmissionLeaseHandle, LocalStateBackend, StateBackend},
+    writer::AuthorizedDispatchHandle,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
@@ -125,11 +125,7 @@ pub fn validate_probe_response(
 
 #[derive(Clone)]
 pub struct ActuatorRegistry {
-    global: Arc<Semaphore>,
-    global_capacity: usize,
-    global_in_flight: Arc<AtomicUsize>,
-    candidate_acquisition_count: Arc<AtomicUsize>,
-    saturation_count: Arc<AtomicUsize>,
+    state_backend: Arc<dyn StateBackend>,
     actuators: Arc<BTreeMap<String, Arc<Actuator>>>,
 }
 
@@ -145,26 +141,14 @@ pub struct ActuatorSnapshot {
 
 struct Actuator {
     config: ActuatorConfig,
-    semaphore: Arc<Semaphore>,
     probe_semaphore: Arc<Semaphore>,
-    in_flight: Arc<AtomicUsize>,
-    circuit: Mutex<CircuitData>,
-}
-
-struct CircuitData {
-    state: CircuitState,
-    consecutive_failures: u32,
-    opened_at: Instant,
-    probe_in_flight: bool,
 }
 
 pub struct CandidatePermit {
-    _actuator: OwnedSemaphorePermit,
-    _global: OwnedSemaphorePermit,
-    actuator: Arc<Actuator>,
+    _admission: AdmissionLeaseHandle,
+    state_backend: Arc<dyn StateBackend>,
+    supply_id: String,
     breaker_failure_recorded: bool,
-    actuator_in_flight: Arc<AtomicUsize>,
-    global_in_flight: Arc<AtomicUsize>,
 }
 
 pub struct AuthorizedCandidateResponse {
@@ -333,7 +317,9 @@ impl<S> CandidateResponseStream<S> {
                 .as_ref()
                 .filter(|permit| !permit.breaker_failure_recorded)
             {
-                record_candidate_actuator(&permit.actuator, None, Instant::now());
+                permit
+                    .state_backend
+                    .record_candidate(&permit.supply_id, None, Instant::now());
             }
         }
         self.permit.take();
@@ -457,17 +443,11 @@ fn responses_sse_has_valid_completion(bytes: &[u8]) -> bool {
     })
 }
 
-impl Drop for CandidatePermit {
-    fn drop(&mut self) {
-        self.actuator_in_flight.fetch_sub(1, Ordering::AcqRel);
-        self.global_in_flight.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 impl CandidatePermit {
     fn record_failure_once(&mut self, failure: CandidateFailure) {
         if !self.breaker_failure_recorded {
-            record_candidate_actuator(&self.actuator, Some(failure), Instant::now());
+            self.state_backend
+                .record_candidate(&self.supply_id, Some(failure), Instant::now());
             self.breaker_failure_recorded = true;
         }
     }
@@ -478,34 +458,31 @@ impl ActuatorRegistry {
         global_candidate_in_flight: u32,
         configs: impl IntoIterator<Item = ActuatorConfig>,
     ) -> Result<Self, ActuatorError> {
-        if global_candidate_in_flight == 0 {
-            return Err(ActuatorError::InvalidConfiguration);
-        }
+        let configs = configs.into_iter().collect::<Vec<_>>();
+        let state_backend = Arc::new(LocalStateBackend::new(
+            global_candidate_in_flight,
+            configs.iter().cloned(),
+        )?);
+        Self::with_state_backend(configs, state_backend)
+    }
+
+    pub fn with_state_backend(
+        configs: impl IntoIterator<Item = ActuatorConfig>,
+        state_backend: Arc<dyn StateBackend>,
+    ) -> Result<Self, ActuatorError> {
         let mut actuators = BTreeMap::new();
         for config in configs {
             if config.concurrency == 0 || actuators.contains_key(&config.supply_id) {
                 return Err(ActuatorError::InvalidConfiguration);
             }
             let entry = Arc::new(Actuator {
-                semaphore: Arc::new(Semaphore::new(config.concurrency as usize)),
                 probe_semaphore: Arc::new(Semaphore::new(1)),
-                in_flight: Arc::new(AtomicUsize::new(0)),
-                circuit: Mutex::new(CircuitData {
-                    state: CircuitState::Open,
-                    consecutive_failures: 0,
-                    opened_at: Instant::now(),
-                    probe_in_flight: false,
-                }),
                 config,
             });
             actuators.insert(entry.config.supply_id.clone(), entry);
         }
         Ok(Self {
-            global: Arc::new(Semaphore::new(global_candidate_in_flight as usize)),
-            global_capacity: global_candidate_in_flight as usize,
-            global_in_flight: Arc::new(AtomicUsize::new(0)),
-            candidate_acquisition_count: Arc::new(AtomicUsize::new(0)),
-            saturation_count: Arc::new(AtomicUsize::new(0)),
+            state_backend,
             actuators: Arc::new(actuators),
         })
     }
@@ -515,149 +492,33 @@ impl ActuatorRegistry {
         supply_id: &str,
         wait: Duration,
     ) -> Result<CandidatePermit, ActuatorError> {
-        let actuator = self
-            .actuators
-            .get(supply_id)
-            .ok_or(ActuatorError::UnknownActuator)?;
-        if actuator
-            .circuit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .state
-            != CircuitState::Closed
-        {
-            return Err(ActuatorError::CircuitUnavailable);
-        }
-        let deadline = tokio::time::Instant::now() + wait;
-        let global =
-            match tokio::time::timeout_at(deadline, Arc::clone(&self.global).acquire_owned()).await
-            {
-                Ok(Ok(permit)) => permit,
-                _ => {
-                    self.saturation_count.fetch_add(1, Ordering::AcqRel);
-                    return Err(ActuatorError::Saturated);
-                }
-            };
-        let actuator_permit = match tokio::time::timeout_at(
-            deadline,
-            Arc::clone(&actuator.semaphore).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            _ => {
-                self.saturation_count.fetch_add(1, Ordering::AcqRel);
-                return Err(ActuatorError::Saturated);
-            }
-        };
-        if actuator
-            .circuit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .state
-            != CircuitState::Closed
-        {
-            return Err(ActuatorError::CircuitUnavailable);
-        }
-        self.global_in_flight.fetch_add(1, Ordering::AcqRel);
-        actuator.in_flight.fetch_add(1, Ordering::AcqRel);
-        self.candidate_acquisition_count
-            .fetch_add(1, Ordering::AcqRel);
+        let admission = self.state_backend.try_acquire(supply_id, wait).await?;
         Ok(CandidatePermit {
-            _actuator: actuator_permit,
-            _global: global,
-            actuator: Arc::clone(actuator),
+            _admission: admission,
+            state_backend: Arc::clone(&self.state_backend),
+            supply_id: supply_id.to_owned(),
             breaker_failure_recorded: false,
-            actuator_in_flight: Arc::clone(&actuator.in_flight),
-            global_in_flight: Arc::clone(&self.global_in_flight),
         })
     }
 
     pub fn in_flight(&self) -> (usize, usize) {
-        let actuator = self
-            .actuators
-            .values()
-            .map(|entry| entry.in_flight.load(Ordering::Acquire))
-            .sum();
-        (self.global_in_flight.load(Ordering::Acquire), actuator)
+        self.state_backend.in_flight()
     }
 
     pub fn candidate_acquisition_count(&self) -> usize {
-        self.candidate_acquisition_count.load(Ordering::Acquire)
+        self.state_backend.candidate_acquisition_count()
     }
 
     pub fn snapshot(&self) -> ActuatorSnapshot {
-        let mut closed = 0;
-        let mut open = 0;
-        let mut half_open = 0;
-        for actuator in self.actuators.values() {
-            match actuator
-                .circuit
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .state
-            {
-                CircuitState::Closed => closed += 1,
-                CircuitState::Open => open += 1,
-                CircuitState::HalfOpen => half_open += 1,
-            }
-        }
-        ActuatorSnapshot {
-            closed,
-            open,
-            half_open,
-            global_candidate_in_flight: self.global_in_flight.load(Ordering::Acquire),
-            global_candidate_capacity: self.global_capacity,
-            saturation_count: self.saturation_count.load(Ordering::Acquire),
-        }
+        self.state_backend.snapshot()
     }
 
     pub fn circuit(&self, supply_id: &str) -> Result<CircuitSnapshot, ActuatorError> {
-        let actuator = self
-            .actuators
-            .get(supply_id)
-            .ok_or(ActuatorError::UnknownActuator)?;
-        let state = actuator
-            .circuit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(match state.state {
-            CircuitState::Closed if state.consecutive_failures == 0 => CircuitSnapshot::Closed,
-            CircuitState::Closed => CircuitSnapshot::ClosedWithFailures(state.consecutive_failures),
-            CircuitState::Open => CircuitSnapshot::Open,
-            CircuitState::HalfOpen => CircuitSnapshot::HalfOpen,
-        })
+        self.state_backend.circuit(supply_id)
     }
 
     pub fn try_begin_probe(&self, supply_id: &str, now: Instant) -> Result<bool, ActuatorError> {
-        self.begin_probe(supply_id, now, false)
-    }
-
-    fn begin_probe(
-        &self,
-        supply_id: &str,
-        now: Instant,
-        startup: bool,
-    ) -> Result<bool, ActuatorError> {
-        let actuator = self
-            .actuators
-            .get(supply_id)
-            .ok_or(ActuatorError::UnknownActuator)?;
-        let mut state = actuator
-            .circuit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.state != CircuitState::Open
-            || state.probe_in_flight
-            || (!startup
-                && now.saturating_duration_since(state.opened_at)
-                    < Duration::from_millis(actuator.config.breaker_cooldown_ms))
-        {
-            return Ok(false);
-        }
-        state.state = CircuitState::HalfOpen;
-        state.probe_in_flight = true;
-        Ok(true)
+        self.state_backend.try_begin_probe(supply_id, now)
     }
 
     pub async fn run_startup_probe(
@@ -677,21 +538,7 @@ impl ActuatorRegistry {
     }
 
     pub fn finish_probe(&self, supply_id: &str, success: bool, now: Instant) {
-        let Some(actuator) = self.actuators.get(supply_id) else {
-            return;
-        };
-        let mut state = actuator
-            .circuit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.probe_in_flight = false;
-        if success {
-            state.state = CircuitState::Closed;
-            state.consecutive_failures = 0;
-        } else {
-            state.state = CircuitState::Open;
-            state.opened_at = now;
-        }
+        self.state_backend.finish_probe(supply_id, success, now);
     }
 
     pub async fn run_probe(
@@ -713,7 +560,12 @@ impl ActuatorRegistry {
         now: Instant,
         startup: bool,
     ) -> Result<bool, ActuatorError> {
-        if !self.begin_probe(supply_id, now, startup)? {
+        let began = if startup {
+            self.state_backend.try_begin_startup_probe(supply_id, now)?
+        } else {
+            self.state_backend.try_begin_probe(supply_id, now)?
+        };
+        if !began {
             return Ok(false);
         }
         let actuator = self
@@ -729,7 +581,8 @@ impl ActuatorRegistry {
         {
             Ok(Ok(permit)) => permit,
             _ => {
-                self.finish_probe(supply_id, false, Instant::now());
+                self.state_backend
+                    .finish_probe(supply_id, false, Instant::now());
                 return Ok(false);
             }
         };
@@ -775,7 +628,8 @@ impl ActuatorRegistry {
         };
         let success = matches!(tokio::time::timeout(timeout, result).await, Ok(Ok(())));
         drop(probe_permit);
-        self.finish_probe(supply_id, success, Instant::now());
+        self.state_backend
+            .finish_probe(supply_id, success, Instant::now());
         Ok(success)
     }
 
@@ -785,33 +639,7 @@ impl ActuatorRegistry {
         failure: Option<CandidateFailure>,
         now: Instant,
     ) {
-        let Some(actuator) = self.actuators.get(supply_id) else {
-            return;
-        };
-        record_candidate_actuator(actuator, failure, now);
-    }
-}
-
-fn record_candidate_actuator(actuator: &Actuator, failure: Option<CandidateFailure>, now: Instant) {
-    let mut state = actuator
-        .circuit
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if state.state != CircuitState::Closed {
-        return;
-    }
-    match failure {
-        None => {
-            state.state = CircuitState::Closed;
-            state.consecutive_failures = 0;
-        }
-        Some(_) => {
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-            if state.consecutive_failures >= actuator.config.breaker_consecutive_failures {
-                state.state = CircuitState::Open;
-                state.opened_at = now;
-            }
-        }
+        self.state_backend.record_candidate(supply_id, failure, now);
     }
 }
 
