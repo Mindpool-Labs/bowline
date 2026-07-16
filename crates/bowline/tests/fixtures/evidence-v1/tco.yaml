@@ -1,0 +1,7 @@
+version: 2
+supplies:
+  supply/selected:
+    monthly_amortization_usd: 40
+    monthly_power_usd: 0
+    monthly_ops_usd: 0
+    monthly_capacity_mtok: 100

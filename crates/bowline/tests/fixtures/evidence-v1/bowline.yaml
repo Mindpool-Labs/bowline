@@ -1,0 +1,9 @@
+listen: 127.0.0.1:8080
+upstream: https://SENTINEL-UPSTREAM.invalid
+actual_supply_id: supply/actual
+policy_bundle: policy.yaml
+registry_feed: registry.json
+ledger_dir: ledger
+tco: tco.yaml
+trusted_proxy_cidrs:
+  - 127.0.0.1/32

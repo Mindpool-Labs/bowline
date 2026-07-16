@@ -1,0 +1,14 @@
+version: 1
+identities:
+  - match:
+      app: SENTINEL-APP
+    tags:
+      - SENTINEL-POLICY-TAG
+rules:
+  - name: fixture
+    default: true
+    task_class: mechanical
+    require:
+      supply_class:
+        - public-api
+        - owned

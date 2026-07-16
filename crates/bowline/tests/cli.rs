@@ -39,6 +39,240 @@ fn bowline_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn materialize_evidence_fixture(source: &Path, destination: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir(destination).unwrap();
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["bowline.yaml", "policy.yaml", "registry.json", "tco.yaml"] {
+        let target = destination.join(name);
+        fs::copy(source.join(name), &target).unwrap();
+        fs::set_permissions(target, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let ledger = destination.join("ledger");
+    fs::create_dir(&ledger).unwrap();
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["run-fixture-run-000000.bwl", "run-fixture-run.json"] {
+        let target = ledger.join(name);
+        fs::copy(source.join("ledger").join(name), &target).unwrap();
+        fs::set_permissions(target, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[test]
+fn evidence_export_fixture_is_schema_valid_exact_and_fail_closed() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let root = bowline_root();
+    let dir = fs::canonicalize(tempdir("evidence-export")).unwrap();
+    let fixture = dir.join("fixture");
+    materialize_evidence_fixture(
+        &root.join("crates/bowline/tests/fixtures/evidence-v1"),
+        &fixture,
+    );
+    let config = fixture.join("bowline.yaml");
+    let out = dir.join("evidence.json");
+    let export = bowline()
+        .args([
+            "export",
+            "evidence",
+            "--config",
+            config.to_str().unwrap(),
+            "--run-id",
+            "fixture-run",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let bundle: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+    let schema: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("schemas/evidence-bundle-v1.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let validator = jsonschema::JSONSchema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .compile(&schema)
+        .unwrap();
+    if let Err(errors) = validator.validate(&bundle) {
+        panic!(
+            "fixture export failed schema validation: {}",
+            errors
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
+    let report = bowline()
+        .args([
+            "report",
+            "--config",
+            config.to_str().unwrap(),
+            "--run-id",
+            "fixture-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(bundle["aggregates"], report["report"]);
+    assert_eq!(
+        bundle["coverage"]["protocol_coverage"],
+        report["report"]["protocol_coverage"]
+    );
+    assert_eq!(bundle["decisions"][0]["decision_ref"], "fixture-run:1");
+    assert_eq!(bundle["decisions"][0].as_object().unwrap().len(), 13);
+    let encoded = serde_json::to_string(&bundle).unwrap();
+    for forbidden in [
+        "SENTINEL-REQUEST-ID",
+        "SENTINEL-ROUTE",
+        "SENTINEL-APP",
+        "SENTINEL-TAG",
+        "SENTINEL-POLICY-TAG",
+        "SENTINEL-API-KEY",
+        "SENTINEL-UPSTREAM",
+        "SENTINEL-MODEL",
+        "SENTINEL-ATTRIBUTION",
+        "SENTINEL-CONTENT",
+        "SENTINEL-AUTHORIZATION",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "fixture export leaked {forbidden}"
+        );
+    }
+
+    let symlink_target = dir.join("symlink-target");
+    fs::write(&symlink_target, b"preserve-me").unwrap();
+    let symlink_out = dir.join("symlink-out.json");
+    symlink(&symlink_target, &symlink_out).unwrap();
+    let symlink_export = bowline()
+        .args([
+            "export",
+            "evidence",
+            "--config",
+            config.to_str().unwrap(),
+            "--run-id",
+            "fixture-run",
+            "--out",
+            symlink_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(symlink_export.status.success());
+    assert_eq!(fs::read(&symlink_target).unwrap(), b"preserve-me");
+    assert!(fs::symlink_metadata(&symlink_out)
+        .unwrap()
+        .file_type()
+        .is_file());
+    assert_eq!(
+        fs::metadata(&symlink_out).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let unknown_out = dir.join("unknown.json");
+    let unknown = bowline()
+        .args([
+            "export",
+            "evidence",
+            "--config",
+            config.to_str().unwrap(),
+            "--run-id",
+            "missing-run",
+            "--out",
+            unknown_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert!(!unknown_out.exists());
+
+    let tampered_fixture = dir.join("tampered-fixture");
+    materialize_evidence_fixture(
+        &root.join("crates/bowline/tests/fixtures/evidence-v1"),
+        &tampered_fixture,
+    );
+    let tampered_segment = tampered_fixture
+        .join("ledger")
+        .join("run-fixture-run-000000.bwl");
+    let mut tampered_bytes = fs::read(&tampered_segment).unwrap();
+    let last = tampered_bytes.len() - 1;
+    tampered_bytes[last] ^= 1;
+    fs::write(&tampered_segment, tampered_bytes).unwrap();
+    fs::set_permissions(&tampered_segment, fs::Permissions::from_mode(0o600)).unwrap();
+    let tampered_out = dir.join("tampered.json");
+    let tampered = bowline()
+        .args([
+            "export",
+            "evidence",
+            "--config",
+            tampered_fixture.join("bowline.yaml").to_str().unwrap(),
+            "--run-id",
+            "fixture-run",
+            "--out",
+            tampered_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!tampered.status.success());
+    assert!(!tampered_out.exists());
+
+    let changed_policy = dir.join("policy.yaml");
+    let mut policy = fs::read_to_string(fixture.join("policy.yaml")).unwrap();
+    policy.push_str("\n# digest mismatch\n");
+    fs::write(&changed_policy, policy).unwrap();
+    let mismatched_config = dir.join("mismatched.yaml");
+    fs::write(
+        &mismatched_config,
+        format!(
+            "listen: 127.0.0.1:8080\nupstream: https://example.invalid\n\
+             actual_supply_id: supply/actual\npolicy_bundle: {}\nregistry_feed: {}\n\
+             ledger_dir: {}\ntco: {}\ntrusted_proxy_cidrs: [127.0.0.1/32]\n",
+            changed_policy.display(),
+            fixture.join("registry.json").display(),
+            fixture.join("ledger").display(),
+            fixture.join("tco.yaml").display(),
+        ),
+    )
+    .unwrap();
+    let mismatch_out = dir.join("mismatch.json");
+    let mismatch = bowline()
+        .args([
+            "export",
+            "evidence",
+            "--config",
+            mismatched_config.to_str().unwrap(),
+            "--run-id",
+            "fixture-run",
+            "--out",
+            mismatch_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!mismatch.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr).contains("policy digest mismatch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&mismatch.stderr)
+    );
+    assert!(!mismatch_out.exists());
+}
+
 #[test]
 fn economics_validate_is_offline_no_write_and_report_refuses_unbound_sources() {
     let dir = fs::canonicalize(tempdir("economics-cli-no-write")).unwrap();
