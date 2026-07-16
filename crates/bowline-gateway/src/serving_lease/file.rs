@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn wrong_owner_is_rejected_before_locking() {
-        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("lease");
         fs::create_dir(&parent).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
