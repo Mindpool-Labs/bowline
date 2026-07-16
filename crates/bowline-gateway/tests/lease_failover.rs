@@ -24,7 +24,7 @@ use tokio::{net::TcpListener, sync::oneshot};
 
 #[tokio::test]
 async fn file_lease_serve_promotes_standby_after_active_shutdown() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let lease_parent = root.path().join("lease");
     fs::create_dir(&lease_parent).unwrap();
     fs::set_permissions(&lease_parent, fs::Permissions::from_mode(0o700)).unwrap();
@@ -124,7 +124,7 @@ async fn file_lease_serve_promotes_standby_after_active_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_lease_server_stays_live_while_initial_activation_is_in_progress() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let lease_parent = root.path().join("lease");
     fs::create_dir(&lease_parent).unwrap();
     fs::set_permissions(&lease_parent, fs::Permissions::from_mode(0o700)).unwrap();
@@ -192,6 +192,11 @@ async fn file_lease_server_stays_live_while_initial_activation_is_in_progress() 
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+fn lease_tempdir() -> tempfile::TempDir {
+    let system_temp = std::env::temp_dir().canonicalize().unwrap();
+    tempfile::tempdir_in(system_temp).unwrap()
 }
 
 fn unused_address() -> std::net::SocketAddr {

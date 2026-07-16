@@ -25,6 +25,11 @@ use bowline_gateway::{
 use bytes::Bytes;
 use tokio::{net::TcpListener, sync::Notify};
 
+fn lease_tempdir() -> tempfile::TempDir {
+    let system_temp = std::env::temp_dir().canonicalize().unwrap();
+    tempfile::tempdir_in(system_temp).unwrap()
+}
+
 #[test]
 fn local_serving_lease_is_always_active() {
     let mut lease = LocalServingLease;
@@ -144,7 +149,7 @@ async fn standby_router_defers_runtime_until_local_activation() {
 
 #[tokio::test]
 async fn file_lease_allows_one_active_and_fresh_run_takeover() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let lease_parent = root.path().join("lease");
     std::fs::create_dir(&lease_parent).unwrap();
     std::fs::set_permissions(&lease_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -242,7 +247,7 @@ async fn file_lease_allows_one_active_and_fresh_run_takeover() {
 
 #[tokio::test]
 async fn activation_failure_releases_partial_writer_before_retry() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let lease_parent = root.path().join("lease");
     std::fs::create_dir(&lease_parent).unwrap();
     std::fs::set_permissions(&lease_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -360,7 +365,7 @@ async fn activation_failure_releases_partial_writer_before_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activating_is_unready_and_rejects_inference_until_runtime_is_complete() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let ledger_dir = root.path().join("ledger");
     let lease_path = root.path().join("unused.lock");
     let config = file_lease_config(&ledger_dir, &lease_path);
@@ -449,7 +454,7 @@ async fn activating_is_unready_and_rejects_inference_until_runtime_is_complete()
 
 #[tokio::test]
 async fn lease_loss_stops_new_admission_before_peer_activation() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let ledger_dir = root.path().join("ledger");
     let lease_path = root.path().join("unused.lock");
     let (upstream_address, started, release, upstream) = spawn_streaming_upstream().await;
@@ -551,7 +556,7 @@ async fn lease_loss_stops_new_admission_before_peer_activation() {
 
 #[tokio::test]
 async fn drain_timeout_keeps_serving_lease_held_until_process_cleanup() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let ledger_dir = root.path().join("ledger");
     let lease_path = root.path().join("unused.lock");
     let (upstream_address, started, release, upstream) = spawn_streaming_upstream().await;

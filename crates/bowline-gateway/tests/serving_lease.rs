@@ -5,9 +5,14 @@ use std::{
 
 use bowline_gateway::serving_lease::{FileServingLease, ServingLease};
 
+fn lease_tempdir() -> tempfile::TempDir {
+    let system_temp = std::env::temp_dir().canonicalize().unwrap();
+    tempfile::tempdir_in(system_temp).unwrap()
+}
+
 #[test]
 fn file_lease_is_exclusive_and_released_for_takeover() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let parent = root.path().join("lease");
     fs::create_dir(&parent).unwrap();
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
@@ -32,7 +37,7 @@ fn file_lease_is_exclusive_and_released_for_takeover() {
 
 #[test]
 fn file_lease_rejects_unsafe_parent_and_file_shapes() {
-    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = lease_tempdir();
     let loose = root.path().join("loose");
     fs::create_dir(&loose).unwrap();
     fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
