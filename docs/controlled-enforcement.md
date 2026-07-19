@@ -73,6 +73,70 @@ Reordered equivalent tags are canonicalized; duplicate, missing, extra, or reser
 closed. A trusted declared task overrides the current policy task only when it still exactly matches
 the route and grant.
 
+## Optional authority signing
+
+The authorization sidecar can optionally require a standard, bring-your-own-key
+[Minisign](https://jedisct1.github.io/minisign/) signature. This is off by default and does not
+change the sidecar's binding semantics above; it adds one more precondition before a route's
+promotion grant is trusted.
+
+Configure it in the gateway config, never in the enforcement bundle:
+
+```yaml
+authority_signing:
+  version: 1
+  required: true
+  verify_keys:
+    - |
+      untrusted comment: minisign public key <KEY-ID>
+      <standard minisign public key, base64>
+```
+
+`verify_keys` names one or more standard minisign public keys in their usual two-line
+`minisign.pub` format. Bowline never generates or holds a secret signing key; produce the
+signature with the standard `minisign` tool (or any implementation of the format) as part of your
+own promotion pipeline, after `bowline promotion seal` writes the authorization file:
+
+```sh
+minisign -Sm /etc/bowline/authorization/support-chat.json -s /path/to/signing.key
+```
+
+The resulting envelope is a small JSON document at the deterministic sidecar path
+`<authorization_path>.signature.json` (for example
+`authorization/support-chat.json.signature.json`), containing the envelope version, algorithm,
+signing key id, a SHA-256 digest of the exact authorization bytes, and the complete `.minisig`
+text:
+
+```json
+{
+  "envelope_version": 1,
+  "algorithm": "minisign-ed25519",
+  "key_id": "<minisign-key-id>",
+  "payload_sha256": "sha256:...",
+  "minisign_signature": "<complete .minisig text>"
+}
+```
+
+Verification recomputes the digest over the exact authorization bytes, decodes the standard
+Minisign signature, and checks it against the configured `verify_keys` only; no key or key
+identifier the envelope itself supplies is ever trusted. The envelope file is subject to the same
+private-regular-file, no-symlink, and byte-bound safety checks as every other piece of evidence,
+so an unsafe, oversized, or wrong-permission envelope retains ordinary startup refusal. Only two
+outcomes are soft (the gateway keeps running and the route falls to its configured pre-dispatch
+fallback with zero allocation authority, durably recorded): the envelope is absent when
+`required: true`, or the envelope is present but does not verify (tampered payload or a key
+outside `verify_keys`). With `required: false`, an absent envelope is legacy behavior — the grant
+still requires every check described above, just not a signature.
+
+A verifying signature attests only that the exact bytes of the sealed authorization file were
+signed by one of the configured keys at some point. It does not attest that the underlying
+economics or quality evidence is correct, current, or was produced honestly; that the signer was
+authorized to promote this route; or that the sidecar's own binding checks (workload, task,
+protocol, digests) still hold, since those are verified independently as described above. Signing
+does not change the deployment trust boundary: promotion configuration, organizational approval,
+and privileged administrators inside the deployment security domain remain trusted exactly as
+without signing.
+
 ## Model authority
 
 `model_authority: preserve` selects the configured pre-dispatch fallback unless the requested model

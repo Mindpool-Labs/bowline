@@ -64,6 +64,12 @@ enum EvidenceSetup {
     Verified,
     Missing,
     Stale,
+    /// A configured `authority_signing` policy rejected the route's promotion authorization
+    /// because no signature envelope was present.
+    SignatureMissing,
+    /// A configured `authority_signing` policy rejected the route's promotion authorization
+    /// because the signature envelope did not verify (tampered payload or an unconfigured key).
+    SignatureInvalid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +222,8 @@ async fn production_proxy_handler_enforcement_matrix_is_single_dispatch_and_evid
         fallback_case("selector-miss", SelectionVariant::SelectorMiss),
         declared_task_mismatch_case(),
         fallback_case("stale-grant", SelectionVariant::StaleGrant),
+        fallback_case("signature-missing", SelectionVariant::SignatureMissing),
+        fallback_case("signature-invalid", SelectionVariant::SignatureInvalid),
         fallback_case("pinned-preserve", SelectionVariant::PinnedPreserve),
         fallback_case("rewrite-failure", SelectionVariant::RewriteFailure),
         fallback_case("kill-bypass", SelectionVariant::KillBypass),
@@ -475,6 +483,8 @@ enum SelectionVariant {
     CanaryOut,
     SelectorMiss,
     StaleGrant,
+    SignatureMissing,
+    SignatureInvalid,
     PinnedPreserve,
     RewriteFailure,
     KillBypass,
@@ -552,6 +562,7 @@ fn parity_config(upstream: &str, root: &std::path::Path) -> Config {
         }),
         floors: None,
         enforcement: None,
+        authority_signing: None,
         state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
         runtime: RuntimeConfig::default(),
@@ -944,6 +955,14 @@ fn fallback_case(name: &'static str, variant: SelectionVariant) -> MatrixCase {
         }
         SelectionVariant::SelectorMiss => case.app = "other",
         SelectionVariant::StaleGrant => case.evidence = EvidenceSetup::Stale,
+        SelectionVariant::SignatureMissing => {
+            case.evidence = EvidenceSetup::SignatureMissing;
+            case.expected_reason = Some(SelectionReason::SignatureMissing);
+        }
+        SelectionVariant::SignatureInvalid => {
+            case.evidence = EvidenceSetup::SignatureInvalid;
+            case.expected_reason = Some(SelectionReason::SignatureInvalid);
+        }
         SelectionVariant::PinnedPreserve => {
             case.model_authority = bowline_core::enforcement::ModelAuthority::Preserve;
         }
@@ -1166,13 +1185,32 @@ async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
         .promotion
         .as_ref()
         .map(|_| promotion_validation(&validated, case.protocol, evidence_now, expires_at_ms));
-    let grant =
-        (case.mode.grants_authority() && case.evidence != EvidenceSetup::Missing).then(|| {
-            crate::enforcement_loader::test_verified_promotion_grant_for_task(
-                validation.clone().unwrap(),
-                case.grant_task,
-            )
-        });
+    let grant = (case.mode.grants_authority()
+        && !matches!(
+            case.evidence,
+            EvidenceSetup::Missing
+                | EvidenceSetup::SignatureMissing
+                | EvidenceSetup::SignatureInvalid
+        ))
+    .then(|| {
+        crate::enforcement_loader::test_verified_promotion_grant_for_task(
+            validation.clone().unwrap(),
+            case.grant_task,
+        )
+    });
+    let grant_signature_rejections = if case.mode.grants_authority() {
+        match case.evidence {
+            EvidenceSetup::SignatureMissing => {
+                BTreeMap::from([("route".to_owned(), SelectionReason::SignatureMissing)])
+            }
+            EvidenceSetup::SignatureInvalid => {
+                BTreeMap::from([("route".to_owned(), SelectionReason::SignatureInvalid)])
+            }
+            _ => BTreeMap::new(),
+        }
+    } else {
+        BTreeMap::new()
+    };
     let recommendation = (case.mode == RouteMode::Recommend
         && case.protocol != AuthorityProtocol::Embeddings
         && case.evidence != EvidenceSetup::Missing)
@@ -1234,6 +1272,7 @@ async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
             .into_iter()
             .map(|grant| ("route".into(), grant))
             .collect(),
+        grant_signature_rejections,
         recommendations: recommendation
             .into_iter()
             .map(|evidence| ("route".into(), evidence))

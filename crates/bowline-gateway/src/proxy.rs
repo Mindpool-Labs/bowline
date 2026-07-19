@@ -63,10 +63,11 @@ use crate::{
         CircuitSnapshot, RedirectFreeClient,
     },
     enforcement_loader::{
-        load_verified_promotion_grant, load_verified_recommendation_evidence,
-        select_enforcement_target, select_enforcement_target_without_grant,
-        select_recommendation_target, BoundedKillStateReader, KillStateReader,
-        VerifiedPromotionGrant, VerifiedRecommendationEvidence,
+        load_verified_promotion_grant_signed, load_verified_recommendation_evidence,
+        select_enforcement_target, select_enforcement_target_with_signature_rejection,
+        select_enforcement_target_without_grant, select_recommendation_target,
+        BoundedKillStateReader, KillStateReader, PromotionGrantLoad, VerifiedPromotionGrant,
+        VerifiedRecommendationEvidence,
     },
     identity::{extract_identity, resolve_request_context, ResolvedRequestContext},
     observation::{
@@ -290,6 +291,10 @@ struct EnforcementRuntime {
     validated: ValidatedEnforcement,
     route_ids: Vec<String>,
     grants: BTreeMap<String, VerifiedPromotionGrant>,
+    /// Routes whose promotion authorization signature was rejected (missing or invalid) under a
+    /// configured `authority_signing` policy. Disjoint from `grants`; populated only when the
+    /// route otherwise has no verified grant. Never populated when `authority_signing` is unset.
+    grant_signature_rejections: BTreeMap<String, SelectionReason>,
     recommendations: BTreeMap<String, VerifiedRecommendationEvidence>,
     kill_reader: BoundedKillStateReader,
     actuators: ActuatorRegistry,
@@ -1278,14 +1283,21 @@ async fn controlled_enforcement_response(
     let gateway_plan = match (
         runtime.grants.get(&route.route_id),
         runtime.recommendations.get(&route.route_id),
+        runtime.grant_signature_rejections.get(&route.route_id),
     ) {
-        (Some(grant), _) => {
+        (Some(grant), _, _) => {
             select_enforcement_target(&runtime.validated, &route.route_id, &facts, grant)
         }
-        (None, Some(evidence)) => {
+        (None, Some(evidence), _) => {
             select_recommendation_target(&runtime.validated, &route.route_id, &facts, evidence)
         }
-        (None, None) => {
+        (None, None, Some(reason)) => select_enforcement_target_with_signature_rejection(
+            &runtime.validated,
+            &route.route_id,
+            &facts,
+            *reason,
+        ),
+        (None, None, None) => {
             select_enforcement_target_without_grant(&runtime.validated, &route.route_id, &facts)
         }
     };
@@ -2820,13 +2832,15 @@ fn load_enforcement_runtime(
         .context("failed to validate enforcement bundle")?;
     let evidence_root = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let mut grants = BTreeMap::new();
+    let mut grant_signature_rejections = BTreeMap::new();
     for route in validated.authority_routes() {
-        let grant = load_verified_promotion_grant(
+        let outcome = load_verified_promotion_grant_signed(
             &validated,
             &route.route_id,
             evidence_root,
             active,
             now_ms(),
+            config.authority_signing.as_ref(),
         )
         .with_context(|| {
             format!(
@@ -2834,7 +2848,19 @@ fn load_enforcement_runtime(
                 operator_safe_route_id(&route.route_id)
             )
         })?;
-        grants.insert(route.route_id.clone(), grant);
+        match outcome {
+            PromotionGrantLoad::Verified(grant) => {
+                grants.insert(route.route_id.clone(), *grant);
+            }
+            PromotionGrantLoad::SignatureMissing => {
+                grant_signature_rejections
+                    .insert(route.route_id.clone(), SelectionReason::SignatureMissing);
+            }
+            PromotionGrantLoad::SignatureInvalid => {
+                grant_signature_rejections
+                    .insert(route.route_id.clone(), SelectionReason::SignatureInvalid);
+            }
+        }
     }
     let mut recommendations = BTreeMap::new();
     for route in validated.routes().filter(|route| {
@@ -2938,6 +2964,7 @@ fn load_enforcement_runtime(
         validated,
         route_ids,
         grants,
+        grant_signature_rejections,
         recommendations,
         kill_reader,
         actuators,
@@ -3079,6 +3106,7 @@ rules:
             attribution: None,
             floors: None,
             enforcement: Some(root.path().join("enforcement.yaml")),
+            authority_signing: None,
             state_backend: None,
             trusted_proxy_cidrs: vec![],
             runtime: RuntimeConfig::default(),
@@ -3372,6 +3400,7 @@ routes:
             validated,
             route_ids,
             grants: BTreeMap::from([("responses-closed".to_owned(), grant)]),
+            grant_signature_rejections: BTreeMap::new(),
             recommendations: BTreeMap::new(),
             kill_reader: BoundedKillStateReader::new(
                 KillStateReader::open(&kill_root.canonicalize().unwrap(), "state").unwrap(),

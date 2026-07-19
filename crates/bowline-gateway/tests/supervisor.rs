@@ -824,6 +824,7 @@ fn test_config(ledger_dir: &std::path::Path) -> Config {
         attribution: None,
         floors: None,
         enforcement: None,
+        authority_signing: None,
         state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().unwrap()],
         runtime: RuntimeConfig::default(),

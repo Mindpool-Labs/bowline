@@ -39,11 +39,26 @@ pub struct Config {
     #[serde(default)]
     pub enforcement: Option<PathBuf>,
     #[serde(default)]
+    pub authority_signing: Option<AuthoritySigningConfig>,
+    #[serde(default)]
     pub state_backend: Option<StateBackendConfig>,
     #[serde(default = "default_trusted_proxy_cidrs")]
     pub trusted_proxy_cidrs: Vec<IpNet>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+}
+
+/// Optional, bring-your-own-key signing policy for promotion/authority evidence. When absent,
+/// signature verification is entirely inert and evidence loads exactly as it did before this
+/// section existed. When present, every promotion authorization file loaded under the
+/// enforcement bundle is checked against `<authorization_path>.signature.json` (see
+/// `bowline_core::envelope`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritySigningConfig {
+    pub version: u32,
+    pub required: bool,
+    pub verify_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +373,28 @@ impl Config {
                 "enforcement",
                 "must name an enforcement bundle when present",
             ));
+        }
+        if let Some(signing) = self.authority_signing.as_ref() {
+            if signing.version != 1 {
+                return Err(ConfigError::invalid(
+                    "authority_signing.version",
+                    "must equal 1",
+                ));
+            }
+            if signing.verify_keys.is_empty() {
+                return Err(ConfigError::invalid(
+                    "authority_signing.verify_keys",
+                    "must name at least one standard minisign public key",
+                ));
+            }
+            for key in &signing.verify_keys {
+                crate::envelope::validate_configured_key(key).map_err(|_| {
+                    ConfigError::invalid(
+                        "authority_signing.verify_keys",
+                        "must be a standard minisign public key",
+                    )
+                })?;
+            }
         }
         if let Some(state_backend) = self.state_backend.as_ref() {
             let version = match state_backend {
@@ -899,6 +936,84 @@ supplies:
                 assert!(config.validate().is_err(), "{name} must fail validation");
             }
         }
+    }
+
+    #[test]
+    fn authority_signing_is_absent_by_default_and_inert() {
+        let config = Config::from_yaml(&valid_yaml()).expect("fixture parses");
+        assert_eq!(config.authority_signing, None);
+        assert!(config.validate().is_ok());
+    }
+
+    fn signing_test_key() -> &'static str {
+        "untrusted comment: minisign public key 7D993CA9D5D0C222\nRWQiwtDVqTyZfVHo3bp+lvtyh0CIvHkliMEzW6bESmSglCOlNnEB5Fxq\n"
+    }
+
+    #[test]
+    fn authority_signing_parses_and_validates_when_present() {
+        let yaml = format!(
+            "{}\nauthority_signing:\n  version: 1\n  required: true\n  verify_keys:\n    - {:?}\n",
+            valid_yaml(),
+            signing_test_key(),
+        );
+        let config = Config::from_yaml(&yaml).expect("fixture parses");
+        let signing = config
+            .authority_signing
+            .as_ref()
+            .expect("authority_signing section present");
+        assert_eq!(signing.version, 1);
+        assert!(signing.required);
+        assert_eq!(signing.verify_keys.len(), 1);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn authority_signing_rejects_unsupported_version() {
+        let yaml = format!(
+            "{}\nauthority_signing:\n  version: 2\n  required: true\n  verify_keys:\n    - {:?}\n",
+            valid_yaml(),
+            signing_test_key(),
+        );
+        let config = Config::from_yaml(&yaml).expect("fixture parses");
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "authority_signing.version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authority_signing_rejects_empty_verify_keys() {
+        let yaml = format!(
+            "{}\nauthority_signing:\n  version: 1\n  required: true\n  verify_keys: []\n",
+            valid_yaml(),
+        );
+        let config = Config::from_yaml(&yaml).expect("fixture parses");
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "authority_signing.verify_keys",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authority_signing_rejects_malformed_verify_key() {
+        let yaml = format!(
+            "{}\nauthority_signing:\n  version: 1\n  required: true\n  verify_keys:\n    - \"not a minisign key\"\n",
+            valid_yaml(),
+        );
+        let config = Config::from_yaml(&yaml).expect("fixture parses");
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "authority_signing.verify_keys",
+                ..
+            })
+        ));
     }
 
     #[test]

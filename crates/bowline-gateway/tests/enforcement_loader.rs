@@ -7,7 +7,9 @@ use std::{
 };
 
 use bowline_core::{
-    config::{load_owned_cost_catalog, Config, OwnedCostCatalog, RuntimeConfig},
+    config::{
+        load_owned_cost_catalog, AuthoritySigningConfig, Config, OwnedCostCatalog, RuntimeConfig,
+    },
     economics::{
         canonical_quality_projection_digest, ActionableEconomicsReport, AnalysisMode, Blocker,
         BuildProvenance, OpportunityKey, OpportunityRow, QualityEvidenceSummary,
@@ -37,10 +39,11 @@ use bowline_core::{
 };
 use bowline_gateway::enforcement_loader::{
     load_verified_promotion_grant as load_verified_promotion_grant_with_active,
+    load_verified_promotion_grant_signed,
     load_verified_recommendation_evidence as load_verified_recommendation_evidence_with_active,
     read_private_bundle_file, seal_promotion_authorization_for_route, select_enforcement_target,
     select_enforcement_target_without_grant, select_recommendation_target, BoundedKillStateReader,
-    EnforcementLoadError, GatewayEvidenceState, KillStateReader,
+    EnforcementLoadError, GatewayEvidenceState, KillStateReader, PromotionGrantLoad,
 };
 use bowline_gateway::observation::{
     prepare_candidate_authority_decision_v2, CandidatePreparationV2,
@@ -929,6 +932,7 @@ async fn startup_paths_reject_each_sealed_provenance_mutation_before_probe_or_bi
                 attribution: None,
                 floors: None,
                 enforcement: Some(enforcement_path),
+                authority_signing: None,
                 state_backend: None,
                 trusted_proxy_cidrs: Vec::new(),
                 runtime: RuntimeConfig::default(),
@@ -2301,5 +2305,258 @@ fn authority_and_recommendation_evidence_are_route_mode_confined() {
     );
     assert!(
         !gateway.contains("impl Into<VerifiedPromotionGrant> for VerifiedRecommendationEvidence")
+    );
+}
+
+// --- authority_signing: standard-Minisign envelope verification on promotion evidence ---
+//
+// The signing key below is a throwaway test-only Minisign key pair generated solely to produce
+// these fixtures; it authenticates nothing outside this test suite. `GATEWAY_AUTHORIZATION_JSON`
+// is the exact, deterministic bytes `PositiveFixture::create()` seals for `ROUTE_ID` (fixed
+// digests, fixed timestamps, no wall-clock or random input), so a signature computed over it
+// once, offline, verifies identically on every test run.
+
+const TEST_VERIFY_KEY: &str = "untrusted comment: minisign public key 7D993CA9D5D0C222\nRWQiwtDVqTyZfVHo3bp+lvtyh0CIvHkliMEzW6bESmSglCOlNnEB5Fxq\n";
+
+const GATEWAY_AUTHORIZATION_JSON: &str = "{\"schema_version\":1,\"route_id\":\"support-chat\",\"created_at_ms\":1000,\"economics_bundle_digest\":\"sha256:2933c7f784c974a4b1191d55ff89ae1d5df71ddaad0dd62417c8ced1d1b6a71a\",\"economics_report_digest\":\"sha256:2cc45e34338d7f6d20fe94c052d1811668d0af8407e0e96ca071d24c5307f033\",\"opportunity_digest\":\"sha256:b9622c09fffe22f929e0e48e2d4bc67b79682643ab86ff2ad0082771b2872e25\",\"quality_source_digest\":\"sha256:5bed4d2721fb8c31a23090ce2b3b53fe153f47f73e9b7152355aaac6a46fe6fa\",\"quality_run_id\":\"00000000-0000-0000-0000-000000000001\",\"quality_report_digest\":\"sha256:7dd077d47f35c26588cc5685927028bbafb6255468a157c1b5a67a062e188bf5\",\"policy_digest\":\"sha256:fa866bbe091a221af281781243aa63e586d8e22328faa1c63c8b252c99e262b7\",\"registry_digest\":\"sha256:aadab12c615bee889d2a20396d5ce3751575a1172f528295c72126871c1b68fd\",\"owned_cost_digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"enforcement_digest\":\"sha256:bd9b70a562b3d4e78826abfc739d90071d4051244ee23644e5da5c5d88efc81c\",\"actuator_digest\":\"sha256:5696131a3e30cb82dfa6baddc9cff47db2101b447c55f950ce93a0b9c17844ec\",\"route_digest\":\"sha256:59101e0cf72b9fe7929f5db190b6778bc06a1313566d508445ef207b0a775d86\",\"workload_identity_digest\":\"sha256:8ad64415d5c48cbf357a640f5ada080cb6705dba82d46edf743ebb960d682ca7\",\"task_class\":\"mechanical\",\"protocol\":\"chat-completions\",\"actual_supply_id\":\"public/openai\",\"candidate_supply_id\":\"owned/llama\",\"authorization_digest\":\"sha256:4377d1eca4e7292cacb2380150e3a3ffa1ea102a9eec0ac01b1ab4a53b8634cd\"}\n";
+
+const GATEWAY_ENVELOPE_VALID_JSON: &str = "{\"envelope_version\":1,\"algorithm\":\"minisign-ed25519\",\"key_id\":\"7D993CA9D5D0C222\",\"payload_sha256\":\"sha256:62789f126dbab1e4228cec4269d71efaf85f122560153c9aa7f720ced117653d\",\"minisign_signature\":\"untrusted comment: signature from minisign secret key\\nRUQiwtDVqTyZfXua/0WIqS12Qzk7vIkuzCpNSL5xV8JSvqgFlAgxYkMahKubhURuovgmlmrTEvKKOhwn8YIZcyB4dq+9kwsosA8=\\ntrusted comment: bowline gateway fixture\\nGPkV60C8KcbEAiEXoxnC0p4r3N/Zq9o/9K1zfxZerwTeLrxBejwp7LgWDwfMeKhack6V6erHq0kLit0KuFp6Cw==\\n\"}";
+
+/// Signed by a *different* throwaway key than `TEST_VERIFY_KEY`, over the same exact payload.
+/// Models an operator whose configured `verify_keys` do not include the key that actually signed
+/// this evidence.
+const GATEWAY_ENVELOPE_WRONG_KEY_JSON: &str = "{\"envelope_version\":1,\"algorithm\":\"minisign-ed25519\",\"key_id\":\"041164092885E85E\",\"payload_sha256\":\"sha256:62789f126dbab1e4228cec4269d71efaf85f122560153c9aa7f720ced117653d\",\"minisign_signature\":\"untrusted comment: signature from minisign secret key\\nRURe6IUoCWQRBBcvBdXPbYLay0vCxVO8/aXUoKnWZUsXk2SJteg58InDoMyNBIo33a7V3nRWI8chUGIenk0ctCa2aRFWVDlUiwY=\\ntrusted comment: bowline gateway fixture (wrong key)\\n7j/bzJYW7cAbPAM/PiFk9N1AbNE5RCcksdxi56seRJFBYv1oxgBjS1ifvi88AprF+id9O2uYcWKmXArUActpAQ==\\n\"}";
+
+/// The *same* signature bytes as `GATEWAY_ENVELOPE_WRONG_KEY_JSON` (produced by the other
+/// throwaway key), but with `key_id` relabeled to `TEST_VERIFY_KEY`'s id. Models a forged
+/// attribution: the claimed signer matches a configured key, so key lookup succeeds, but the
+/// signature was never produced by that key, so cryptographic verification must still fail.
+const GATEWAY_ENVELOPE_FORGED_KEY_ID_JSON: &str = "{\"envelope_version\":1,\"algorithm\":\"minisign-ed25519\",\"key_id\":\"7D993CA9D5D0C222\",\"payload_sha256\":\"sha256:62789f126dbab1e4228cec4269d71efaf85f122560153c9aa7f720ced117653d\",\"minisign_signature\":\"untrusted comment: signature from minisign secret key\\nRURe6IUoCWQRBBcvBdXPbYLay0vCxVO8/aXUoKnWZUsXk2SJteg58InDoMyNBIo33a7V3nRWI8chUGIenk0ctCa2aRFWVDlUiwY=\\ntrusted comment: bowline gateway fixture (wrong key)\\n7j/bzJYW7cAbPAM/PiFk9N1AbNE5RCcksdxi56seRJFBYv1oxgBjS1ifvi88AprF+id9O2uYcWKmXArUActpAQ==\\n\"}";
+
+fn signature_sidecar_path(fixture: &PositiveFixture) -> PathBuf {
+    fixture
+        .root
+        .join("authorization/support-chat.json.signature.json")
+}
+
+fn required_signing_config() -> AuthoritySigningConfig {
+    AuthoritySigningConfig {
+        version: 1,
+        required: true,
+        verify_keys: vec![TEST_VERIFY_KEY.to_owned()],
+    }
+}
+
+#[test]
+fn authority_signing_absent_matches_legacy_grant_loading_exactly() {
+    let fixture = PositiveFixture::create();
+    let legacy = load_verified_promotion_grant_with_active(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+    )
+    .unwrap();
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+    )
+    .unwrap();
+    let PromotionGrantLoad::Verified(signed) = outcome else {
+        panic!("expected a verified grant when authority_signing is unconfigured");
+    };
+    assert_eq!(signed.grant_digest(), legacy.grant_digest());
+    assert_eq!(signed.route_id(), legacy.route_id());
+}
+
+#[test]
+fn authority_signing_required_and_missing_envelope_is_signature_missing_not_a_hard_error() {
+    let fixture = PositiveFixture::create();
+    assert!(!signature_sidecar_path(&fixture).exists());
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::SignatureMissing));
+}
+
+#[test]
+fn authority_signing_not_required_and_missing_envelope_falls_back_to_verified_grant() {
+    let fixture = PositiveFixture::create();
+    let signing = AuthoritySigningConfig {
+        version: 1,
+        required: false,
+        verify_keys: vec![TEST_VERIFY_KEY.to_owned()],
+    };
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&signing),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::Verified(_)));
+}
+
+#[test]
+fn authority_signing_valid_envelope_verifies_and_grants() {
+    let fixture = PositiveFixture::create();
+    let sidecar = fixture.root.join("authorization/support-chat.json");
+    assert_eq!(
+        fs::read(&sidecar).unwrap(),
+        GATEWAY_AUTHORIZATION_JSON.as_bytes(),
+        "fixture authorization bytes drifted from the pre-signed test vector"
+    );
+    write_private(
+        &signature_sidecar_path(&fixture),
+        GATEWAY_ENVELOPE_VALID_JSON.as_bytes(),
+    );
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    )
+    .unwrap();
+    let PromotionGrantLoad::Verified(grant) = outcome else {
+        panic!("expected a verified grant for a valid signature envelope");
+    };
+    assert_eq!(grant.route_id(), ROUTE_ID);
+}
+
+#[test]
+fn authority_signing_wrong_configured_key_is_signature_invalid() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &signature_sidecar_path(&fixture),
+        GATEWAY_ENVELOPE_WRONG_KEY_JSON.as_bytes(),
+    );
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::SignatureInvalid));
+}
+
+#[test]
+fn authority_signing_forged_key_id_attribution_is_signature_invalid() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &signature_sidecar_path(&fixture),
+        GATEWAY_ENVELOPE_FORGED_KEY_ID_JSON.as_bytes(),
+    );
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::SignatureInvalid));
+}
+
+#[test]
+fn authority_signing_tampered_payload_is_signature_invalid() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &signature_sidecar_path(&fixture),
+        GATEWAY_ENVELOPE_VALID_JSON.as_bytes(),
+    );
+    // Flip one hex digit of a digest field: still syntactically valid JSON, but the exact bytes
+    // no longer match what was signed.
+    let sidecar = fixture.root.join("authorization/support-chat.json");
+    let tampered = GATEWAY_AUTHORIZATION_JSON.replacen("owned/llama", "owned/llamb", 1);
+    write_private(&sidecar, tampered.as_bytes());
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::SignatureInvalid));
+}
+
+#[test]
+fn authority_signing_envelope_symlink_retains_startup_refusal() {
+    let fixture = PositiveFixture::create();
+    let replacement = fixture.root.join("replacement-envelope.json");
+    write_private(&replacement, GATEWAY_ENVELOPE_VALID_JSON.as_bytes());
+    symlink(replacement, signature_sidecar_path(&fixture)).unwrap();
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    );
+    assert!(
+        outcome.is_err(),
+        "a symlinked envelope must retain startup refusal"
+    );
+}
+
+#[test]
+fn authority_signing_envelope_wrong_mode_retains_startup_refusal() {
+    let fixture = PositiveFixture::create();
+    let sidecar = signature_sidecar_path(&fixture);
+    write_private(&sidecar, GATEWAY_ENVELOPE_VALID_JSON.as_bytes());
+    fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    );
+    assert!(
+        outcome.is_err(),
+        "a world-readable envelope must retain startup refusal"
+    );
+}
+
+#[test]
+fn authority_signing_envelope_oversized_retains_startup_refusal() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &signature_sidecar_path(&fixture),
+        &vec![b' '; 64 * 1024 + 1],
+    );
+    let outcome = load_verified_promotion_grant_signed(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    );
+    assert!(
+        outcome.is_err(),
+        "an oversized envelope must retain startup refusal"
     );
 }

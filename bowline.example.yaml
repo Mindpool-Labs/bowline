@@ -14,6 +14,15 @@ attribution:
 trusted_proxy_cidrs:
   - 127.0.0.0/8
   - ::1/128
+# Optional bring-your-own-key standard-Minisign signature requirement for promotion/authority
+# evidence. Off by default (omit this section entirely). See docs/controlled-enforcement.md.
+# authority_signing:
+#   version: 1
+#   required: true
+#   verify_keys:
+#     - |
+#       untrusted comment: minisign public key <KEY-ID>
+#       <standard minisign public key, base64>
 state_backend:
   version: 1
   kind: local

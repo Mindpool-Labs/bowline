@@ -169,6 +169,7 @@ async fn spawn_gateway_with_shadow(
         attribution: None,
         floors: None,
         enforcement: None,
+        authority_signing: None,
         state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime: RuntimeConfig::default(),
