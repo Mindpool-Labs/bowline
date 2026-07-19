@@ -122,7 +122,9 @@ Verification recomputes the digest over the exact authorization bytes, decodes t
 Minisign signature, and checks it against the configured `verify_keys` only; no key or key
 identifier the envelope itself supplies is ever trusted. The envelope file is subject to the same
 private-regular-file, no-symlink, and byte-bound safety checks as every other piece of evidence,
-so an unsafe, oversized, or wrong-permission envelope retains ordinary startup refusal. Only two
+so on authority routes an unsafe, oversized, or wrong-permission envelope retains ordinary
+startup refusal (on recommend-mode routes every evidence failure, these included, softens to
+unverified as described below). Only two
 outcomes are soft (the gateway keeps running and the route falls to its configured pre-dispatch
 fallback with zero allocation authority, durably recorded): the envelope is absent when
 `required: true`, or the envelope is present but does not verify (tampered payload or a key
