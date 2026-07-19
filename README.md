@@ -119,6 +119,8 @@ for the exact authority, fallback, and safe-start contract.
   [`docs/limitations.md`](docs/limitations.md) - trust boundary and non-claims.
 - [`docs/positioning.md`](docs/positioning.md) - layer ownership, system boundaries, current
   behavior, and supply neutrality.
+- [`docs/neutrality-charter.md`](docs/neutrality-charter.md) - the binding neutrality commitments
+  and how to verify them.
 - [`docs/methodology.md`](docs/methodology.md) - floors, ratings provenance, confidence labels, TCO, sovereignty ratio.
 - [`docs/customer-quality.md`](docs/customer-quality.md) - strict canary inputs, evaluators,
   content flow, bounds, statistics, verdicts, and non-claims.
