@@ -3,7 +3,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-required='CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md SUPPORT.md CHANGELOG.md RELEASE.md
+required='CONTRIBUTING.md CLA.md CODE_OF_CONDUCT.md SECURITY.md SUPPORT.md CHANGELOG.md RELEASE.md
 .github/ISSUE_TEMPLATE/bug.yml .github/ISSUE_TEMPLATE/config.yml
 .github/pull_request_template.md .github/workflows/ci.yml .github/workflows/security.yml
 scripts/check-security-workflow.sh'
@@ -27,7 +27,9 @@ require() {
 }
 
 require 'Apache-2.0' CONTRIBUTING.md
-require 'without a Contributor License Agreement' CONTRIBUTING.md
+require '[Contributor License Agreement](CLA.md)' CONTRIBUTING.md
+require 'Version 1.0' CLA.md
+require 'made under its terms' .github/pull_request_template.md
 require 'Contributor Covenant' CODE_OF_CONDUCT.md
 require '2.1' CODE_OF_CONDUCT.md
 require 'security@mindpool.io' SECURITY.md
