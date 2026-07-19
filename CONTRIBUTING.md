@@ -29,9 +29,11 @@ generated `target`/ledger artifacts.
 
 ## License and inbound contributions
 
-The project is Apache-2.0. Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion is provided under Apache-2.0, without a Contributor License Agreement.
-You represent that you have the right to submit it. Sign-off is not currently required.
+The project is Apache-2.0. Every contribution requires agreement to the
+[Contributor License Agreement](CLA.md). Agreement is recorded per pull request: check the CLA box
+in the pull request template, which affirms that you have read the CLA and that your contribution
+is made under its terms — on your own behalf or, where applicable, your employer's. Pull requests
+without a recorded agreement are not merged.
 
 Follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately using
 [SECURITY](SECURITY.md), not through a public issue.

@@ -10,3 +10,4 @@
 - [ ] Docker smoke passes when runtime/deployment behavior changes.
 - [ ] No secrets, customer data, partner names, internal paths, or generated evidence are included.
 - [ ] Phase 1 remains byte-faithful and shadow-only, or an approved design change is linked.
+- [ ] I have read [CLA.md](../CLA.md) and this contribution is made under its terms.
