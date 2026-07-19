@@ -22,7 +22,8 @@
     "event_id": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 256
+      "maxLength": 256,
+      "pattern": "\\S"
     },
     "observed_at_ms": {
       "type": "integer",
@@ -116,12 +117,14 @@
         "namespace": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 256
+          "maxLength": 256,
+          "pattern": "\\S"
         },
         "value": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 256
+          "maxLength": 256,
+          "pattern": "\\S"
         }
       }
     },

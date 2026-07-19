@@ -31,13 +31,20 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Several call sites share one literal `name` (for example every case in
+/// `assert_collector_rejection_matches_import`), and cargo test runs test functions on multiple
+/// threads by default; nanosecond timestamps alone are not guaranteed unique across threads on
+/// every platform's clock resolution, so an atomic counter disambiguates same-name, same-instant
+/// callers deterministically.
 fn tempdir(name: &str) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time moves forward")
         .as_nanos();
     let dir = env::temp_dir().join(format!(
-        "bowline-conformance-{name}-{}-{nanos}",
+        "bowline-conformance-{name}-{}-{nanos}-{sequence}",
         std::process::id()
     ));
     fs::create_dir_all(&dir).expect("tempdir created");
@@ -364,6 +371,41 @@ fn published_schema_accepts_valid_events_and_rejects_the_schema_invalid_fixture(
         validator.validate(&event).is_err(),
         "out-of-range status should fail schema validation"
     );
+
+    // A whitespace-only event_id passes a bare `minLength: 1` check but is rejected by the real
+    // validator's `trim().is_empty()` rule (`validate_required` in bowline-gateway::passive). The
+    // schema's `pattern: "\\S"` must reject it too, and the CLI (which shares the real validator)
+    // must reject the same line for the same reason — three independent checkers, one verdict.
+    let whitespace_line = valid
+        .lines()
+        .next()
+        .expect("valid fixture has a first line")
+        .replace("\"chat-1\"", "\"   \"");
+    let whitespace_event: serde_json::Value =
+        serde_json::from_str(&whitespace_line).expect("whitespace event line is JSON");
+    assert!(
+        validator.validate(&whitespace_event).is_err(),
+        "whitespace-only event_id should fail schema validation"
+    );
+
+    let direct_error = parse_canonical_jsonl_named(&whitespace_line, "<memory>")
+        .expect_err("whitespace-only event_id should fail the real validator");
+    assert!(
+        direct_error.to_string().contains("event_id"),
+        "{direct_error}"
+    );
+
+    let dir = tempdir("schema-whitespace-event-id");
+    let input = dir.join("whitespace.jsonl");
+    fs::write(&input, format!("{whitespace_line}\n")).expect("whitespace fixture written");
+    let output = run_conformance_canonical(&input);
+    assert!(!output.status.success());
+    let result = parse_result(&output);
+    let error = result
+        .error
+        .expect("whitespace-only event_id should be rejected by conformance");
+    assert_eq!(error.reason_code, "invalid-event");
+    assert_eq!(error.line, Some(1));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -625,6 +667,23 @@ fn collector_nonregular_profile_matches_import_rejection_without_blocking() {
     let result = parse_result(&conformance_output);
     assert_eq!(
         result.error.expect("symlink profile rejected").reason_code,
+        "unsafe-profile-path"
+    );
+
+    fs::remove_file(&fixture.profile).expect("remove symlinked profile");
+    fs::create_dir(&fixture.profile).expect("directory profile created");
+
+    let import_output = run_import_prevalidation(&fixture.input, &fixture.profile);
+    assert!(!import_output.status.success());
+
+    let conformance_output = run_conformance_collector(&fixture.profile, &fixture.input);
+    assert!(!conformance_output.status.success());
+    let result = parse_result(&conformance_output);
+    assert_eq!(
+        result
+            .error
+            .expect("directory profile rejected")
+            .reason_code,
         "unsafe-profile-path"
     );
 }
