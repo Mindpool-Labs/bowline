@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bowline Passive Canonical Event v1",
+  "description": "The canonical passive-event contract consumed by `bowline import observations` and validated offline by `bowline conformance canonical`/`bowline conformance collector`. This schema captures every structural, type, and bounds rule enforced by bowline-gateway's strict Serde struct and `validate_event`. It cannot express the inference-protocol catalog membership check (method must be POST and route must be one of the catalogued inference paths); the `route` enum below is that exact catalog. A file that validates against this schema is not guaranteed to be accepted end to end — attribution/policy/registry resolution happens after schema validation and is out of scope here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "observed_at_ms",
+    "method",
+    "route",
+    "status",
+    "streamed",
+    "latency_ms",
+    "dimensions"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "observed_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "method": {
+      "const": "POST"
+    },
+    "route": {
+      "enum": [
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/embeddings",
+        "/v1/completions",
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+        "/v1/audio/speech",
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/images/variations",
+        "/v1/moderations",
+        "/v1/rerank"
+      ]
+    },
+    "model": {
+      "$ref": "#/$defs/nullableBoundedString"
+    },
+    "actual_supply_ref": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/attributionRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "status": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 599
+    },
+    "streamed": {
+      "type": "boolean"
+    },
+    "latency_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "input_tokens": {
+      "$ref": "#/$defs/nullableNonNegativeInteger"
+    },
+    "output_tokens": {
+      "$ref": "#/$defs/nullableNonNegativeInteger"
+    },
+    "dimensions": {
+      "$ref": "#/$defs/dimensions"
+    }
+  },
+  "$defs": {
+    "nullableBoundedString": {
+      "anyOf": [
+        {
+          "type": "string",
+          "maxLength": 256
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableNonNegativeInteger": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "attributionRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namespace",
+        "value"
+      ],
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "\\S"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "taskClass": {
+      "enum": [
+        "mechanical",
+        "heavy-lifting",
+        "taste-sensitive",
+        "judgment",
+        "unclassified"
+      ]
+    },
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "$ref": "#/$defs/nullableBoundedString"
+        },
+        "team": {
+          "$ref": "#/$defs/nullableBoundedString"
+        },
+        "environment": {
+          "$ref": "#/$defs/nullableBoundedString"
+        },
+        "cost_center": {
+          "$ref": "#/$defs/nullableBoundedString"
+        },
+        "task_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/taskClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -81,8 +81,14 @@ pub enum AuthorityFallbackReasonV2 {
     UntrustedIdentity,
     UnsupportedShape,
     GrantMissing,
+    SignatureMissing,
+    SignatureInvalid,
     GrantMismatch,
     GrantStale,
+    ApprovalMissing,
+    ApprovalSignatureInvalid,
+    ApprovalUnbound,
+    ApprovalExpired,
     WorkloadMismatch,
     AllowlistMiss,
     RolloutMiss,
@@ -103,8 +109,14 @@ impl TryFrom<SelectionReason> for AuthorityFallbackReasonV2 {
             SelectionReason::UntrustedIdentity => Self::UntrustedIdentity,
             SelectionReason::UnsupportedShape => Self::UnsupportedShape,
             SelectionReason::GrantMissing => Self::GrantMissing,
+            SelectionReason::SignatureMissing => Self::SignatureMissing,
+            SelectionReason::SignatureInvalid => Self::SignatureInvalid,
             SelectionReason::GrantMismatch => Self::GrantMismatch,
             SelectionReason::GrantStale => Self::GrantStale,
+            SelectionReason::ApprovalMissing => Self::ApprovalMissing,
+            SelectionReason::ApprovalSignatureInvalid => Self::ApprovalSignatureInvalid,
+            SelectionReason::ApprovalUnbound => Self::ApprovalUnbound,
+            SelectionReason::ApprovalExpired => Self::ApprovalExpired,
             SelectionReason::WorkloadMismatch => Self::WorkloadMismatch,
             SelectionReason::AllowlistMiss => Self::AllowlistMiss,
             SelectionReason::RolloutMiss => Self::RolloutMiss,
@@ -130,8 +142,14 @@ impl From<AuthorityFallbackReasonV2> for SelectionReason {
             AuthorityFallbackReasonV2::UntrustedIdentity => Self::UntrustedIdentity,
             AuthorityFallbackReasonV2::UnsupportedShape => Self::UnsupportedShape,
             AuthorityFallbackReasonV2::GrantMissing => Self::GrantMissing,
+            AuthorityFallbackReasonV2::SignatureMissing => Self::SignatureMissing,
+            AuthorityFallbackReasonV2::SignatureInvalid => Self::SignatureInvalid,
             AuthorityFallbackReasonV2::GrantMismatch => Self::GrantMismatch,
             AuthorityFallbackReasonV2::GrantStale => Self::GrantStale,
+            AuthorityFallbackReasonV2::ApprovalMissing => Self::ApprovalMissing,
+            AuthorityFallbackReasonV2::ApprovalSignatureInvalid => Self::ApprovalSignatureInvalid,
+            AuthorityFallbackReasonV2::ApprovalUnbound => Self::ApprovalUnbound,
+            AuthorityFallbackReasonV2::ApprovalExpired => Self::ApprovalExpired,
             AuthorityFallbackReasonV2::WorkloadMismatch => Self::WorkloadMismatch,
             AuthorityFallbackReasonV2::AllowlistMiss => Self::AllowlistMiss,
             AuthorityFallbackReasonV2::RolloutMiss => Self::RolloutMiss,
@@ -199,7 +217,16 @@ impl AuthoritySelectionFactsV2 {
         if !facts.shape_supported {
             return facts;
         }
-        facts.grant_present = reason != AuthorityFallbackReasonV2::GrantMissing;
+        facts.grant_present = !matches!(
+            reason,
+            AuthorityFallbackReasonV2::GrantMissing
+                | AuthorityFallbackReasonV2::SignatureMissing
+                | AuthorityFallbackReasonV2::SignatureInvalid
+                | AuthorityFallbackReasonV2::ApprovalMissing
+                | AuthorityFallbackReasonV2::ApprovalSignatureInvalid
+                | AuthorityFallbackReasonV2::ApprovalUnbound
+                | AuthorityFallbackReasonV2::ApprovalExpired
+        );
         if !facts.grant_present {
             return facts;
         }

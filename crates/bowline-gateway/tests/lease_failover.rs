@@ -224,6 +224,8 @@ fn file_config(
         attribution: None,
         floors: None,
         enforcement: None,
+        authority_signing: None,
+        promotion_approval: None,
         state_backend: Some(StateBackendConfig::FileLease {
             version: 1,
             path: lease_path.to_path_buf(),

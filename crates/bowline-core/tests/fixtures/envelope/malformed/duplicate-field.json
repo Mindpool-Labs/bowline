@@ -1,0 +1,7 @@
+{
+  "envelope_version": 1, "envelope_version": 1,
+  "algorithm": "minisign-ed25519",
+  "key_id": "7D993CA9D5D0C222",
+  "payload_sha256": "sha256:5600d5197b1decb5c9369e82f12cc901cba7629a39e3b0890ecc2ed88cd53fa8",
+  "minisign_signature": "untrusted comment: signature from minisign secret key\nRUQiwtDVqTyZfe8Nn6D/MubNSVBZIgV4REKCNT6DMBV5NK9Mfn6sM2F4gcc7KArf7GKcLDjg7DNtHot6VrMtjltURZabF4gFhAo=\ntrusted comment: bowline promotion authorization fixture\n1aRg3EB5HBC27OFP4PxtnCGxXb1xEg/8bbEaeu9aBP6ctwHfvuQ7r7CQFHYAUDs+7yfJL5NY5wG7jCbnXL4QAA==\n"
+}

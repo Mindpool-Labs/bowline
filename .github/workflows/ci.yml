@@ -26,6 +26,12 @@ jobs:
       - run: cargo +1.95.0 check --workspace --all-targets
       - run: cargo test --workspace
       - run: python3 -m unittest integrations/litellm/test_bowline_callback.py -v
+      # Reference conformance checks: prove the shipped collector profile/fixture pairs validate
+      # via the same offline runner a third-party collector author would use. This is a
+      # serializer/formatter-output contract check against a synthetic fixture, not a live
+      # LiteLLM or Envoy integration test (see integrations/*/README.md).
+      - run: cargo run -p bowline -- conformance collector --profile integrations/litellm/profile.yaml --input integrations/litellm/fixture.jsonl
+      - run: cargo run -p bowline -- conformance collector --profile integrations/envoy/profile.yaml --input integrations/envoy/fixture.jsonl
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
       - run: cargo install cargo-audit --locked

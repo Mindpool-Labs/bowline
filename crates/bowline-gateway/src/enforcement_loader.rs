@@ -16,19 +16,22 @@ use std::{
 };
 
 use bowline_core::{
+    approval::{verify_approval_artifact, ApprovalBindingExpectation, ApprovalError},
+    config::{AuthoritySigningConfig, PromotionApprovalConfig},
     economics::{
         canonical_quality_projection_digest, ActionableEconomicsReport, AnalysisMode,
         QualityJoinEvidence, SelectedEvidence, SourceBindingCheck,
     },
     enforcement::{
         economics_opportunity_digest, select_enforcement_plan,
-        select_enforcement_plan_without_grant, validate_promotion_documents,
-        validate_recommendation_documents, ActiveRuntimeProvenance, AuthorityProtocol,
-        EconomicsPromotionSource, EnforcementPlan, EnforcementRoute, EvidenceState, KillReadResult,
-        PlanTarget, PromotionAuthorizationV1, PromotionGrantSnapshot, PromotionOpportunityEvidence,
-        QualityPromotionSource, RouteMode, SelectionInput, SelectionReason, SelectionRequestFacts,
-        ValidatedEnforcement,
+        select_enforcement_plan_with_grant_rejection, select_enforcement_plan_without_grant,
+        validate_promotion_documents, validate_recommendation_documents, ActiveRuntimeProvenance,
+        AuthorityProtocol, EconomicsPromotionSource, EnforcementPlan, EnforcementRoute,
+        EvidenceState, KillReadResult, PlanTarget, PromotionAuthorizationV1,
+        PromotionGrantSnapshot, PromotionOpportunityEvidence, QualityPromotionSource, RouteMode,
+        SelectionInput, SelectionReason, SelectionRequestFacts, ValidatedEnforcement,
     },
+    envelope::{verify_envelope, MAX_ENVELOPE_BYTES},
     quality_report::{
         parse_quality_report_document, quality_report_v2_digest, validate_quality_report_evidence,
         validate_quality_report_v2_evidence, QualityReportDocument,
@@ -68,6 +71,7 @@ const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_QUALITY_LEDGER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROMOTION_AUTHORIZATION_BYTES: usize = 64 * 1024;
+const MAX_APPROVAL_ARTIFACT_BYTES: usize = 64 * 1024;
 const MAX_QUALITY_RECORDS: u64 = bowline_core::quality::MAX_CASES as u64;
 
 /// Allocation authority is obtainable only by descriptor-safe source loading in this module.
@@ -135,6 +139,9 @@ impl VerifiedPromotionGrant {
     }
     pub fn quality_source_digest(&self) -> &str {
         self.validation.quality_source_digest()
+    }
+    pub fn authorization_digest(&self) -> &str {
+        self.validation.authorization_digest()
     }
     pub fn config_digest(&self) -> &str {
         self.validation.config_digest()
@@ -408,6 +415,37 @@ pub fn select_enforcement_target_without_grant(
     })
 }
 
+/// Selects a fallback plan for a route whose promotion grant was rejected wholesale — a missing
+/// or invalid `authority_signing` signature, or a missing, invalid, unbound, or expired
+/// `promotion_approval` artifact. `reason` must be one of `SelectionReason::SignatureMissing`,
+/// `SignatureInvalid`, `ApprovalMissing`, `ApprovalSignatureInvalid`, `ApprovalUnbound`, or
+/// `ApprovalExpired`.
+pub fn select_enforcement_target_with_grant_rejection(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    facts: &SelectionRequestFacts,
+    reason: SelectionReason,
+) -> Result<GatewayEnforcementPlan, EnforcementLoadError> {
+    let route = validated
+        .route(route_id)
+        .ok_or_else(|| EnforcementLoadError::Invalid("unknown enforcement route".into()))?;
+    let mut plan = select_enforcement_plan_with_grant_rejection(
+        &SelectionInput::from_validated_route(route, facts),
+        reason,
+    );
+    bind_validated_plan(validated, route_id, &mut plan)?;
+    let evidence_state = if plan.evidence_state == EvidenceState::NotRequired {
+        GatewayEvidenceState::NotRequired
+    } else {
+        GatewayEvidenceState::Unverified
+    };
+    Ok(GatewayEnforcementPlan {
+        selection_binding: exact_selection_binding(route_id, facts, plan.bucket),
+        plan,
+        evidence_state,
+    })
+}
+
 fn bind_validated_plan(
     validated: &ValidatedEnforcement,
     route_id: &str,
@@ -473,22 +511,228 @@ fn load_unsealed_promotion_sources(
     Ok((economics, quality))
 }
 
+/// The route's configured authorization path, with no filesystem access. Pure metadata lookup:
+/// safe to call as often as needed without touching any evidence bytes.
+fn promotion_authorization_relative_path(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+) -> Result<String, EnforcementLoadError> {
+    validated
+        .route(route_id)
+        .and_then(|route| route.promotion.as_ref())
+        .map(|promotion| promotion.authorization_path.clone())
+        .ok_or_else(|| EnforcementLoadError::Invalid("route has no promotion evidence".into()))
+}
+
+fn read_promotion_authorization_bytes(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+) -> Result<(String, Vec<u8>), EnforcementLoadError> {
+    let authorization_path = promotion_authorization_relative_path(validated, route_id)?;
+    let bytes = read_private_bundle_file(
+        evidence_root,
+        &authorization_path,
+        MAX_PROMOTION_AUTHORIZATION_BYTES,
+    )?;
+    Ok((authorization_path, bytes))
+}
+
 fn load_promotion_authorization(
     validated: &ValidatedEnforcement,
     route_id: &str,
     evidence_root: &Path,
 ) -> Result<PromotionAuthorizationV1, EnforcementLoadError> {
-    let authorization_path = &validated
-        .route(route_id)
-        .and_then(|route| route.promotion.as_ref())
-        .ok_or_else(|| EnforcementLoadError::Invalid("route has no promotion evidence".into()))?
-        .authorization_path;
-    let bytes = read_private_bundle_file(
-        evidence_root,
-        authorization_path,
-        MAX_PROMOTION_AUTHORIZATION_BYTES,
-    )?;
+    let (_, bytes) = read_promotion_authorization_bytes(validated, route_id, evidence_root)?;
     serde_json::from_slice(&bytes).map_err(EnforcementLoadError::Json)
+}
+
+/// The deterministic path a promotion authorization's signature envelope lives at, relative to
+/// the same evidence root as the authorization file itself.
+fn signature_envelope_path(authorization_path: &str) -> String {
+    format!("{authorization_path}.signature.json")
+}
+
+/// The deterministic path an authorization's external-approval artifact lives at, relative to
+/// the same evidence root as the authorization file itself.
+fn approval_artifact_path(authorization_path: &str) -> String {
+    format!("{authorization_path}.approval.json")
+}
+
+/// The deterministic path an approval artifact's own signature envelope lives at.
+fn approval_envelope_path(approval_path: &str) -> String {
+    format!("{approval_path}.signature.json")
+}
+
+/// Outcome of loading a route's promotion grant under configured `authority_signing` and/or
+/// `promotion_approval` policies. Rejections are typed and deliberately never fail startup;
+/// every other evidence problem (missing base evidence, unsafe files, oversized files, malformed
+/// documents, binding mismatches) retains the existing hard startup refusal via `Err`.
+#[derive(Debug)]
+pub enum PromotionGrantLoad {
+    Verified(Box<VerifiedPromotionGrant>),
+    SignatureMissing,
+    SignatureInvalid,
+    ApprovalMissing,
+    ApprovalSignatureInvalid,
+    ApprovalUnbound,
+    ApprovalExpired,
+}
+
+/// Loads a route's verified promotion grant, applying an optional bring-your-own-key signing
+/// policy. When `authority_signing` is `None` this is byte-for-byte the same call as
+/// `load_verified_promotion_grant` (zero default-behavior drift). When configured, a missing or
+/// cryptographically invalid signature envelope is reported as a typed `PromotionGrantLoad`
+/// variant instead of failing startup; the signature envelope file itself is still subject to
+/// the same private-regular-file, no-symlink, and byte-bound safety checks as every other piece
+/// of evidence, and those failures continue to retain startup refusal.
+pub fn load_verified_promotion_grant_signed(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+    active: &ActiveRuntimeProvenance,
+    now_ms: u64,
+    authority_signing: Option<&AuthoritySigningConfig>,
+) -> Result<PromotionGrantLoad, EnforcementLoadError> {
+    let Some(signing) = authority_signing else {
+        return load_verified_promotion_grant(validated, route_id, evidence_root, active, now_ms)
+            .map(Box::new)
+            .map(PromotionGrantLoad::Verified);
+    };
+    let (authorization_path, payload_bytes) =
+        read_promotion_authorization_bytes(validated, route_id, evidence_root)?;
+    let envelope_path = signature_envelope_path(&authorization_path);
+    let envelope_bytes =
+        match read_private_bundle_file(evidence_root, &envelope_path, MAX_ENVELOPE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(EnforcementLoadError::Io(io_error))
+                if io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                if signing.required {
+                    return Ok(PromotionGrantLoad::SignatureMissing);
+                }
+                return load_verified_promotion_grant(
+                    validated,
+                    route_id,
+                    evidence_root,
+                    active,
+                    now_ms,
+                )
+                .map(Box::new)
+                .map(PromotionGrantLoad::Verified);
+            }
+            Err(error) => return Err(error),
+        };
+    if verify_envelope(&payload_bytes, &envelope_bytes, &signing.verify_keys).is_err() {
+        return Ok(PromotionGrantLoad::SignatureInvalid);
+    }
+    // Parse the exact bytes the signature was just verified against — never re-read the
+    // authorization file here. A second read would open a TOCTOU window: a writer with access to
+    // the evidence root could swap the file between the verifying read and a later one, and the
+    // grant would then be built from bytes no signature ever covered.
+    let authorization: PromotionAuthorizationV1 =
+        serde_json::from_slice(&payload_bytes).map_err(EnforcementLoadError::Json)?;
+    build_verified_promotion_grant(
+        validated,
+        route_id,
+        evidence_root,
+        active,
+        now_ms,
+        authorization,
+    )
+    .map(Box::new)
+    .map(PromotionGrantLoad::Verified)
+}
+
+/// Loads a route's verified promotion grant, applying an optional bring-your-own-key signing
+/// policy and an optional, independent bring-your-own-approval-workflow binding policy. When
+/// both `authority_signing` and `promotion_approval` are `None` this is byte-for-byte the same
+/// call as `load_verified_promotion_grant` (zero default-behavior drift).
+///
+/// Approval binding is checked only once a grant has already been built by
+/// `load_verified_promotion_grant_signed` above — whether via a verified signature, or, when
+/// signing is unconfigured, the unsigned path. A missing, cryptographically invalid, unbound, or
+/// expired approval artifact is reported as a typed `PromotionGrantLoad` variant instead of
+/// failing startup, exactly like a rejected signature; the approval artifact and its own
+/// signature envelope are still subject to the same private-regular-file, no-symlink, and
+/// byte-bound safety checks as every other piece of evidence, and those failures continue to
+/// retain startup refusal. The evidence digests an approval artifact is checked against come
+/// from the already-verified grant, never from a fresh read of the authorization file.
+pub fn load_verified_promotion_grant_with_approval(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+    active: &ActiveRuntimeProvenance,
+    now_ms: u64,
+    authority_signing: Option<&AuthoritySigningConfig>,
+    promotion_approval: Option<&PromotionApprovalConfig>,
+) -> Result<PromotionGrantLoad, EnforcementLoadError> {
+    let grant = match load_verified_promotion_grant_signed(
+        validated,
+        route_id,
+        evidence_root,
+        active,
+        now_ms,
+        authority_signing,
+    )? {
+        PromotionGrantLoad::Verified(grant) => grant,
+        rejection => return Ok(rejection),
+    };
+    let Some(approval) = promotion_approval else {
+        return Ok(PromotionGrantLoad::Verified(grant));
+    };
+    let authorization_path = promotion_authorization_relative_path(validated, route_id)?;
+    let approval_path = approval_artifact_path(&authorization_path);
+    let envelope_path = approval_envelope_path(&approval_path);
+    let approval_bytes = match read_private_bundle_file(
+        evidence_root,
+        &approval_path,
+        MAX_APPROVAL_ARTIFACT_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(EnforcementLoadError::Io(io_error))
+            if io_error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(if approval.required {
+                PromotionGrantLoad::ApprovalMissing
+            } else {
+                PromotionGrantLoad::Verified(grant)
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let envelope_bytes =
+        match read_private_bundle_file(evidence_root, &envelope_path, MAX_ENVELOPE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(EnforcementLoadError::Io(io_error))
+                if io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(if approval.required {
+                    PromotionGrantLoad::ApprovalMissing
+                } else {
+                    PromotionGrantLoad::Verified(grant)
+                });
+            }
+            Err(error) => return Err(error),
+        };
+    let expected = ApprovalBindingExpectation {
+        descriptor_sha256: grant.authorization_digest().to_owned(),
+        economics_source_digest: grant.economics_source_digest().to_owned(),
+        quality_source_digest: grant.quality_source_digest().to_owned(),
+    };
+    match verify_approval_artifact(
+        &approval_bytes,
+        &envelope_bytes,
+        &approval.verify_keys,
+        &expected,
+        approval.max_age_seconds,
+        now_ms,
+    ) {
+        Ok(_artifact) => Ok(PromotionGrantLoad::Verified(grant)),
+        Err(ApprovalError::SignatureInvalid) => Ok(PromotionGrantLoad::ApprovalSignatureInvalid),
+        Err(ApprovalError::Unbound) => Ok(PromotionGrantLoad::ApprovalUnbound),
+        Err(ApprovalError::Expired) => Ok(PromotionGrantLoad::ApprovalExpired),
+    }
 }
 
 pub fn seal_promotion_authorization_for_route(
@@ -537,8 +781,32 @@ pub fn load_verified_promotion_grant(
     active: &ActiveRuntimeProvenance,
     now_ms: u64,
 ) -> Result<VerifiedPromotionGrant, EnforcementLoadError> {
-    let (economics, quality) = load_unsealed_promotion_sources(validated, route_id, evidence_root)?;
     let authorization = load_promotion_authorization(validated, route_id, evidence_root)?;
+    build_verified_promotion_grant(
+        validated,
+        route_id,
+        evidence_root,
+        active,
+        now_ms,
+        authorization,
+    )
+}
+
+/// Builds a verified promotion grant from an already-loaded `authorization` document, without
+/// re-reading the authorization file from disk. Callers that must bind a grant to signature-
+/// verified bytes (see `load_verified_promotion_grant_signed`) parse the exact verified bytes
+/// once and pass the result here, so the bytes a signature was checked against are provably the
+/// same bytes the grant is built from — there is no second read for a concurrent writer to win a
+/// race against.
+fn build_verified_promotion_grant(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+    active: &ActiveRuntimeProvenance,
+    now_ms: u64,
+    authorization: PromotionAuthorizationV1,
+) -> Result<VerifiedPromotionGrant, EnforcementLoadError> {
+    let (economics, quality) = load_unsealed_promotion_sources(validated, route_id, evidence_root)?;
     if !economics
         .selected_quality_digests
         .iter()
@@ -577,6 +845,96 @@ pub fn load_verified_recommendation_evidence(
     active: &ActiveRuntimeProvenance,
     now_ms: u64,
 ) -> Result<VerifiedRecommendationEvidence, EnforcementLoadError> {
+    let authorization = load_promotion_authorization(validated, route_id, evidence_root)?;
+    build_verified_recommendation_evidence(
+        validated,
+        route_id,
+        evidence_root,
+        active,
+        now_ms,
+        authorization,
+    )
+}
+
+/// Loads a route's verified recommendation evidence, applying the same optional bring-your-own-key
+/// signing policy used for promotion grants over the identical `<authorization_path>.signature.json`
+/// descriptor. When `authority_signing` is `None` this is byte-for-byte the same call as
+/// `load_verified_recommendation_evidence` (zero default-behavior drift). When configured, a
+/// missing or cryptographically invalid signature is reported as a typed `Err` whose message uses
+/// the same `signature-missing` / `signature-invalid` vocabulary the authority-route path records
+/// in `SelectionReason::SignatureMissing`/`SignatureInvalid`. Recommendation evidence is always
+/// advisory and never gains candidate authority, so — exactly like every other recommendation
+/// evidence load error today — the caller (`optional_recommendation_evidence`) treats this `Err`
+/// as evidence simply being unverified rather than a startup failure; there is no separate hard
+/// vs. soft split to make here, because that caller already softens every error uniformly.
+pub fn load_verified_recommendation_evidence_signed(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+    active: &ActiveRuntimeProvenance,
+    now_ms: u64,
+    authority_signing: Option<&AuthoritySigningConfig>,
+) -> Result<VerifiedRecommendationEvidence, EnforcementLoadError> {
+    let Some(signing) = authority_signing else {
+        return load_verified_recommendation_evidence(
+            validated,
+            route_id,
+            evidence_root,
+            active,
+            now_ms,
+        );
+    };
+    let (authorization_path, payload_bytes) =
+        read_promotion_authorization_bytes(validated, route_id, evidence_root)?;
+    let envelope_path = signature_envelope_path(&authorization_path);
+    let envelope_bytes =
+        match read_private_bundle_file(evidence_root, &envelope_path, MAX_ENVELOPE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(EnforcementLoadError::Io(io_error))
+                if io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                if signing.required {
+                    return Err(EnforcementLoadError::Invalid("signature-missing".into()));
+                }
+                return load_verified_recommendation_evidence(
+                    validated,
+                    route_id,
+                    evidence_root,
+                    active,
+                    now_ms,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+    if verify_envelope(&payload_bytes, &envelope_bytes, &signing.verify_keys).is_err() {
+        return Err(EnforcementLoadError::Invalid("signature-invalid".into()));
+    }
+    // Parse the exact bytes the signature was just verified against — never re-read the
+    // authorization file here, for the same TOCTOU reason `load_verified_promotion_grant_signed`
+    // does not.
+    let authorization: PromotionAuthorizationV1 =
+        serde_json::from_slice(&payload_bytes).map_err(EnforcementLoadError::Json)?;
+    build_verified_recommendation_evidence(
+        validated,
+        route_id,
+        evidence_root,
+        active,
+        now_ms,
+        authorization,
+    )
+}
+
+/// Builds verified recommendation evidence from an already-loaded `authorization` document,
+/// without re-reading the authorization file from disk (see `build_verified_promotion_grant` for
+/// why this matters when the caller has already verified a signature over specific bytes).
+fn build_verified_recommendation_evidence(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+    active: &ActiveRuntimeProvenance,
+    now_ms: u64,
+    authorization: PromotionAuthorizationV1,
+) -> Result<VerifiedRecommendationEvidence, EnforcementLoadError> {
     let route = validated
         .route(route_id)
         .ok_or_else(|| EnforcementLoadError::Invalid("unknown enforcement route".into()))?;
@@ -586,7 +944,6 @@ pub fn load_verified_recommendation_evidence(
         ));
     }
     let (economics, quality) = load_unsealed_promotion_sources(validated, route_id, evidence_root)?;
-    let authorization = load_promotion_authorization(validated, route_id, evidence_root)?;
     if !economics
         .selected_quality_digests
         .iter()

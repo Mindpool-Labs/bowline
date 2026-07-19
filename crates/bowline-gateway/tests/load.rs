@@ -52,6 +52,8 @@ async fn five_thousand_requests_leave_reconcilable_durable_evidence() {
         attribution: None,
         floors: None,
         enforcement: None,
+        authority_signing: None,
+        promotion_approval: None,
         state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime: RuntimeConfig {
