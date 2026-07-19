@@ -41,8 +41,11 @@ how long a validity window it may claim for itself (see [Freshness](#freshness) 
 
 With `required: true`, a route with promotion evidence but no approval artifact present is a soft,
 typed, durably recorded rejection — the gateway keeps running and the route falls to its
-configured pre-dispatch fallback with zero allocation authority. With `required: false`, an absent
-artifact is legacy behavior: the grant still requires every other check, just not an approval.
+configured pre-dispatch fallback with zero allocation authority. With `required: false`, an
+*absent* artifact is legacy behavior: the grant still requires every other check, just not an
+approval. `required: false` only relaxes what happens when the artifact is missing — it never
+relaxes verification of one that is present: a *present* artifact is always fully verified, and an
+invalid, unbound, or expired one still produces the matching typed rejection either way.
 
 ## Producing an artifact
 

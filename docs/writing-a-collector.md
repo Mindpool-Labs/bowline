@@ -161,5 +161,5 @@ purely to let a collector author check a file before handing it to import.
 `integrations/litellm/` and `integrations/envoy/` each ship a profile and a synthetic fixture that
 validate with `bowline conformance collector`. As their own READMEs state, the LiteLLM serializer
 is tested only against Bowline synthetic callback objects, and Envoy verification covers
-formatter, fixture, and profile key/type parity — neither is a live LiteLLM or Envoy integration
-test, and neither is a universal or provider-native log schema.
+formatter, fixture, and profile key/type parity. Neither is a live LiteLLM or Envoy integration
+test. Neither claims a universal log schema, and neither claims a provider-native one.

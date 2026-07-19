@@ -3165,6 +3165,130 @@ rules:
     }
 
     #[tokio::test]
+    async fn approval_rejection_leaves_the_route_ungranted_and_counts_as_unverified() {
+        // Regression lock for the propagation `grant_rejections` relies on: a route with any
+        // grant rejection (signature or approval) is simply absent from `grants`, and
+        // `public_enforcement_health` already treats an absent grant as `unverified` for any
+        // reason, without ever consulting `grant_rejections` itself.
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let kill_root = root.path().join("kill");
+        fs::create_dir(&kill_root).unwrap();
+        fs::set_permissions(&kill_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(kill_root.join("state"), b"armed\n").unwrap();
+        fs::set_permissions(kill_root.join("state"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let source = format!(
+            r#"
+version: 1
+global_candidate_in_flight: 1
+kill_switch: {{trust_root: {}, relative_path: state}}
+actuators:
+  - supply_id: candidate
+    base_url: http://127.0.0.1:9
+    authorization_env: TEST_CANDIDATE_TOKEN
+    health_path: /v1/models
+    connect_timeout_ms: 100
+    response_header_timeout_ms: 100
+    stream_idle_timeout_ms: 100
+    concurrency: 1
+    probe_timeout_ms: 100
+    probe_max_bytes: 1024
+    breaker_consecutive_failures: 1
+    breaker_cooldown_ms: 100
+routes:
+  - route_id: responses-closed
+    method: POST
+    path: /v1/responses
+    protocol: responses
+    workload: {{app: support, resolved_tags: [production]}}
+    mode: enforce
+    rollout_ppm: 0
+    promoted_supply_id: candidate
+    actual_supply_id: baseline
+    task_class: heavy-lifting
+    model_authority: rewrite-to-canonical
+    fallback: bypass
+    promotion:
+      economics_bundle_path: economics
+      economics_report_digest: sha256:{a}
+      opportunity_digest: sha256:{b}
+      quality_run_path: quality
+      authorization_path: authorization/responses-closed.json
+      quality_run_id: quality-1
+      quality_report_digest: sha256:{c}
+      policy_digest: sha256:{d}
+      registry_digest: sha256:{e}
+      owned_cost_digest: sha256:{f}
+      max_economics_age_ms: 100000
+      expires_at_ms: 2000000000000
+"#,
+            kill_root.display(),
+            a = "a".repeat(64),
+            b = "b".repeat(64),
+            c = "c".repeat(64),
+            d = "d".repeat(64),
+            e = "e".repeat(64),
+            f = "f".repeat(64),
+        );
+        let raw = EnforcementConfigV1::from_yaml(&source).unwrap();
+        let route_ids = raw
+            .routes
+            .iter()
+            .map(|route| route.route_id.clone())
+            .collect();
+        let validated = raw.validate().unwrap();
+
+        let authority_dir = root.path().join("authority");
+        fs::create_dir(&authority_dir).unwrap();
+        fs::set_permissions(&authority_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let authority_writer = crate::writer::spawn_transient_faulting_authority_writer(
+            AuthorityWriterOptions {
+                directory: authority_dir,
+                enforcement_digest: validated.normalized_digest().to_owned(),
+                actuator_digests: vec![validated.actuator_digest("candidate").unwrap()],
+                grant_digests: vec![],
+                queue_capacity: 8,
+                max_records_bytes: 1024 * 1024,
+            },
+            7,
+        )
+        .unwrap();
+        let actuators = ActuatorRegistry::new(1, raw.actuators).unwrap();
+
+        let runtime = Arc::new(EnforcementRuntime {
+            validated,
+            route_ids,
+            grants: BTreeMap::new(),
+            grant_rejections: BTreeMap::from([(
+                "responses-closed".to_owned(),
+                SelectionReason::ApprovalMissing,
+            )]),
+            recommendations: BTreeMap::new(),
+            kill_reader: BoundedKillStateReader::new(
+                KillStateReader::open(&kill_root.canonicalize().unwrap(), "state").unwrap(),
+                8,
+            ),
+            actuators,
+            targets: BTreeMap::new(),
+            writer: authority_writer,
+            terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
+            last_kill_state: Mutex::new(KillReadResult::Unreadable),
+        });
+
+        let health = public_enforcement_health(&runtime).await;
+        assert_eq!(
+            health.grant_freshness,
+            GrantFreshnessCounts {
+                fresh: 0,
+                stale: 0,
+                unverified: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn controlled_handler_observe_and_fail_closed_are_exactly_zero_or_one_dispatch() {
         use std::{
             os::unix::fs::PermissionsExt,
