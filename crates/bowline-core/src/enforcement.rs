@@ -338,6 +338,10 @@ pub enum SelectionReason {
     SignatureInvalid,
     GrantMismatch,
     GrantStale,
+    ApprovalMissing,
+    ApprovalSignatureInvalid,
+    ApprovalUnbound,
+    ApprovalExpired,
     WorkloadMismatch,
     AllowlistMiss,
     RolloutMiss,
@@ -1655,18 +1659,25 @@ pub fn select_enforcement_plan(
     select_enforcement_plan_inner(input, GrantAvailability::Present(grant))
 }
 
-/// Selects a fallback plan for a route whose promotion authorization signature was rejected
-/// (missing or invalid) under a configured `authority_signing` policy. This reuses the exact
-/// existing zero-authority fallback pipeline: kill/route/identity/shape checks still take
-/// precedence, exactly as they do for `GrantMissing` today. `reason` must be
-/// `SelectionReason::SignatureMissing` or `SelectionReason::SignatureInvalid`.
-pub fn select_enforcement_plan_with_signature_rejection(
+/// Selects a fallback plan for a route whose promotion grant was rejected wholesale — a missing
+/// or invalid `authority_signing` signature, or a missing, invalid, unbound, or expired
+/// `promotion_approval` artifact. This reuses the exact existing zero-authority fallback
+/// pipeline: kill/route/identity/shape checks still take precedence, exactly as they do for
+/// `GrantMissing` today. `reason` must be one of `SelectionReason::SignatureMissing`,
+/// `SignatureInvalid`, `ApprovalMissing`, `ApprovalSignatureInvalid`, `ApprovalUnbound`, or
+/// `ApprovalExpired`.
+pub fn select_enforcement_plan_with_grant_rejection(
     input: &SelectionInput,
     reason: SelectionReason,
 ) -> EnforcementPlan {
     debug_assert!(matches!(
         reason,
-        SelectionReason::SignatureMissing | SelectionReason::SignatureInvalid
+        SelectionReason::SignatureMissing
+            | SelectionReason::SignatureInvalid
+            | SelectionReason::ApprovalMissing
+            | SelectionReason::ApprovalSignatureInvalid
+            | SelectionReason::ApprovalUnbound
+            | SelectionReason::ApprovalExpired
     ));
     select_enforcement_plan_inner(input, GrantAvailability::Absent(reason))
 }

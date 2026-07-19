@@ -16,14 +16,15 @@ use std::{
 };
 
 use bowline_core::{
-    config::AuthoritySigningConfig,
+    approval::{verify_approval_artifact, ApprovalBindingExpectation, ApprovalError},
+    config::{AuthoritySigningConfig, PromotionApprovalConfig},
     economics::{
         canonical_quality_projection_digest, ActionableEconomicsReport, AnalysisMode,
         QualityJoinEvidence, SelectedEvidence, SourceBindingCheck,
     },
     enforcement::{
         economics_opportunity_digest, select_enforcement_plan,
-        select_enforcement_plan_with_signature_rejection, select_enforcement_plan_without_grant,
+        select_enforcement_plan_with_grant_rejection, select_enforcement_plan_without_grant,
         validate_promotion_documents, validate_recommendation_documents, ActiveRuntimeProvenance,
         AuthorityProtocol, EconomicsPromotionSource, EnforcementPlan, EnforcementRoute,
         EvidenceState, KillReadResult, PlanTarget, PromotionAuthorizationV1,
@@ -70,6 +71,7 @@ const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_QUALITY_LEDGER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROMOTION_AUTHORIZATION_BYTES: usize = 64 * 1024;
+const MAX_APPROVAL_ARTIFACT_BYTES: usize = 64 * 1024;
 const MAX_QUALITY_RECORDS: u64 = bowline_core::quality::MAX_CASES as u64;
 
 /// Allocation authority is obtainable only by descriptor-safe source loading in this module.
@@ -137,6 +139,9 @@ impl VerifiedPromotionGrant {
     }
     pub fn quality_source_digest(&self) -> &str {
         self.validation.quality_source_digest()
+    }
+    pub fn authorization_digest(&self) -> &str {
+        self.validation.authorization_digest()
     }
     pub fn config_digest(&self) -> &str {
         self.validation.config_digest()
@@ -410,10 +415,12 @@ pub fn select_enforcement_target_without_grant(
     })
 }
 
-/// Selects a fallback plan for a route whose promotion authorization signature was rejected
-/// (missing or invalid) under a configured `authority_signing` policy. `reason` must be
-/// `SelectionReason::SignatureMissing` or `SelectionReason::SignatureInvalid`.
-pub fn select_enforcement_target_with_signature_rejection(
+/// Selects a fallback plan for a route whose promotion grant was rejected wholesale — a missing
+/// or invalid `authority_signing` signature, or a missing, invalid, unbound, or expired
+/// `promotion_approval` artifact. `reason` must be one of `SelectionReason::SignatureMissing`,
+/// `SignatureInvalid`, `ApprovalMissing`, `ApprovalSignatureInvalid`, `ApprovalUnbound`, or
+/// `ApprovalExpired`.
+pub fn select_enforcement_target_with_grant_rejection(
     validated: &ValidatedEnforcement,
     route_id: &str,
     facts: &SelectionRequestFacts,
@@ -422,7 +429,7 @@ pub fn select_enforcement_target_with_signature_rejection(
     let route = validated
         .route(route_id)
         .ok_or_else(|| EnforcementLoadError::Invalid("unknown enforcement route".into()))?;
-    let mut plan = select_enforcement_plan_with_signature_rejection(
+    let mut plan = select_enforcement_plan_with_grant_rejection(
         &SelectionInput::from_validated_route(route, facts),
         reason,
     );
@@ -504,17 +511,25 @@ fn load_unsealed_promotion_sources(
     Ok((economics, quality))
 }
 
+/// The route's configured authorization path, with no filesystem access. Pure metadata lookup:
+/// safe to call as often as needed without touching any evidence bytes.
+fn promotion_authorization_relative_path(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+) -> Result<String, EnforcementLoadError> {
+    validated
+        .route(route_id)
+        .and_then(|route| route.promotion.as_ref())
+        .map(|promotion| promotion.authorization_path.clone())
+        .ok_or_else(|| EnforcementLoadError::Invalid("route has no promotion evidence".into()))
+}
+
 fn read_promotion_authorization_bytes(
     validated: &ValidatedEnforcement,
     route_id: &str,
     evidence_root: &Path,
 ) -> Result<(String, Vec<u8>), EnforcementLoadError> {
-    let authorization_path = validated
-        .route(route_id)
-        .and_then(|route| route.promotion.as_ref())
-        .ok_or_else(|| EnforcementLoadError::Invalid("route has no promotion evidence".into()))?
-        .authorization_path
-        .clone();
+    let authorization_path = promotion_authorization_relative_path(validated, route_id)?;
     let bytes = read_private_bundle_file(
         evidence_root,
         &authorization_path,
@@ -538,15 +553,30 @@ fn signature_envelope_path(authorization_path: &str) -> String {
     format!("{authorization_path}.signature.json")
 }
 
-/// Outcome of loading a route's promotion grant under a configured `authority_signing` policy.
-/// Signature rejections are typed and deliberately never fail startup; every other evidence
-/// problem (missing base evidence, unsafe files, oversized files, malformed documents, binding
-/// mismatches) retains the existing hard startup refusal via `Err`.
+/// The deterministic path an authorization's external-approval artifact lives at, relative to
+/// the same evidence root as the authorization file itself.
+fn approval_artifact_path(authorization_path: &str) -> String {
+    format!("{authorization_path}.approval.json")
+}
+
+/// The deterministic path an approval artifact's own signature envelope lives at.
+fn approval_envelope_path(approval_path: &str) -> String {
+    format!("{approval_path}.signature.json")
+}
+
+/// Outcome of loading a route's promotion grant under configured `authority_signing` and/or
+/// `promotion_approval` policies. Rejections are typed and deliberately never fail startup;
+/// every other evidence problem (missing base evidence, unsafe files, oversized files, malformed
+/// documents, binding mismatches) retains the existing hard startup refusal via `Err`.
 #[derive(Debug)]
 pub enum PromotionGrantLoad {
     Verified(Box<VerifiedPromotionGrant>),
     SignatureMissing,
     SignatureInvalid,
+    ApprovalMissing,
+    ApprovalSignatureInvalid,
+    ApprovalUnbound,
+    ApprovalExpired,
 }
 
 /// Loads a route's verified promotion grant, applying an optional bring-your-own-key signing
@@ -612,6 +642,97 @@ pub fn load_verified_promotion_grant_signed(
     )
     .map(Box::new)
     .map(PromotionGrantLoad::Verified)
+}
+
+/// Loads a route's verified promotion grant, applying an optional bring-your-own-key signing
+/// policy and an optional, independent bring-your-own-approval-workflow binding policy. When
+/// both `authority_signing` and `promotion_approval` are `None` this is byte-for-byte the same
+/// call as `load_verified_promotion_grant` (zero default-behavior drift).
+///
+/// Approval binding is checked only once a grant has already been built by
+/// `load_verified_promotion_grant_signed` above — whether via a verified signature, or, when
+/// signing is unconfigured, the unsigned path. A missing, cryptographically invalid, unbound, or
+/// expired approval artifact is reported as a typed `PromotionGrantLoad` variant instead of
+/// failing startup, exactly like a rejected signature; the approval artifact and its own
+/// signature envelope are still subject to the same private-regular-file, no-symlink, and
+/// byte-bound safety checks as every other piece of evidence, and those failures continue to
+/// retain startup refusal. The evidence digests an approval artifact is checked against come
+/// from the already-verified grant, never from a fresh read of the authorization file.
+pub fn load_verified_promotion_grant_with_approval(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+    active: &ActiveRuntimeProvenance,
+    now_ms: u64,
+    authority_signing: Option<&AuthoritySigningConfig>,
+    promotion_approval: Option<&PromotionApprovalConfig>,
+) -> Result<PromotionGrantLoad, EnforcementLoadError> {
+    let grant = match load_verified_promotion_grant_signed(
+        validated,
+        route_id,
+        evidence_root,
+        active,
+        now_ms,
+        authority_signing,
+    )? {
+        PromotionGrantLoad::Verified(grant) => grant,
+        rejection => return Ok(rejection),
+    };
+    let Some(approval) = promotion_approval else {
+        return Ok(PromotionGrantLoad::Verified(grant));
+    };
+    let authorization_path = promotion_authorization_relative_path(validated, route_id)?;
+    let approval_path = approval_artifact_path(&authorization_path);
+    let envelope_path = approval_envelope_path(&approval_path);
+    let approval_bytes = match read_private_bundle_file(
+        evidence_root,
+        &approval_path,
+        MAX_APPROVAL_ARTIFACT_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(EnforcementLoadError::Io(io_error))
+            if io_error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(if approval.required {
+                PromotionGrantLoad::ApprovalMissing
+            } else {
+                PromotionGrantLoad::Verified(grant)
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let envelope_bytes =
+        match read_private_bundle_file(evidence_root, &envelope_path, MAX_ENVELOPE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(EnforcementLoadError::Io(io_error))
+                if io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(if approval.required {
+                    PromotionGrantLoad::ApprovalMissing
+                } else {
+                    PromotionGrantLoad::Verified(grant)
+                });
+            }
+            Err(error) => return Err(error),
+        };
+    let expected = ApprovalBindingExpectation {
+        descriptor_sha256: grant.authorization_digest().to_owned(),
+        economics_source_digest: grant.economics_source_digest().to_owned(),
+        quality_source_digest: grant.quality_source_digest().to_owned(),
+    };
+    match verify_approval_artifact(
+        &approval_bytes,
+        &envelope_bytes,
+        &approval.verify_keys,
+        &expected,
+        approval.max_age_seconds,
+        now_ms,
+    ) {
+        Ok(_artifact) => Ok(PromotionGrantLoad::Verified(grant)),
+        Err(ApprovalError::SignatureInvalid) => Ok(PromotionGrantLoad::ApprovalSignatureInvalid),
+        Err(ApprovalError::Unbound) => Ok(PromotionGrantLoad::ApprovalUnbound),
+        Err(ApprovalError::Expired) => Ok(PromotionGrantLoad::ApprovalExpired),
+    }
 }
 
 pub fn seal_promotion_authorization_for_route(

@@ -23,6 +23,16 @@ trusted_proxy_cidrs:
 #     - |
 #       untrusted comment: minisign public key <KEY-ID>
 #       <standard minisign public key, base64>
+# Optional bring-your-own-approval-workflow binding for promotion evidence. Off by default (omit
+# this section entirely). Independent of authority_signing above. See docs/external-approval.md.
+# promotion_approval:
+#   version: 1
+#   required: true
+#   verify_keys:
+#     - |
+#       untrusted comment: minisign public key <KEY-ID>
+#       <standard minisign public key, base64>
+#   max_age_seconds: 86400
 state_backend:
   version: 1
   kind: local

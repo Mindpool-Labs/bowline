@@ -8,7 +8,8 @@ use std::{
 
 use bowline_core::{
     config::{
-        load_owned_cost_catalog, AuthoritySigningConfig, Config, OwnedCostCatalog, RuntimeConfig,
+        load_owned_cost_catalog, AuthoritySigningConfig, Config, OwnedCostCatalog,
+        PromotionApprovalConfig, RuntimeConfig,
     },
     economics::{
         canonical_quality_projection_digest, ActionableEconomicsReport, AnalysisMode, Blocker,
@@ -39,7 +40,7 @@ use bowline_core::{
 };
 use bowline_gateway::enforcement_loader::{
     load_verified_promotion_grant as load_verified_promotion_grant_with_active,
-    load_verified_promotion_grant_signed,
+    load_verified_promotion_grant_signed, load_verified_promotion_grant_with_approval,
     load_verified_recommendation_evidence as load_verified_recommendation_evidence_with_active,
     read_private_bundle_file, seal_promotion_authorization_for_route, select_enforcement_target,
     select_enforcement_target_without_grant, select_recommendation_target, BoundedKillStateReader,
@@ -933,6 +934,7 @@ async fn startup_paths_reject_each_sealed_provenance_mutation_before_probe_or_bi
                 floors: None,
                 enforcement: Some(enforcement_path),
                 authority_signing: None,
+                promotion_approval: None,
                 state_backend: None,
                 trusted_proxy_cidrs: Vec::new(),
                 runtime: RuntimeConfig::default(),
@@ -2559,4 +2561,392 @@ fn authority_signing_envelope_oversized_retains_startup_refusal() {
         outcome.is_err(),
         "an oversized envelope must retain startup refusal"
     );
+}
+
+// --- promotion_approval: external-approval artifact binding on promotion ---
+//
+// Fixtures below are pre-signed offline, once, with throwaway Minisign key pairs unrelated to
+// `TEST_VERIFY_KEY` above; they authenticate nothing outside this test suite. Their embedded
+// `descriptor_sha256`/`economics_source_digest`/`quality_source_digest` values are the exact
+// digests `GATEWAY_AUTHORIZATION_JSON` carries (`authorization_digest`, `economics_bundle_digest`,
+// and `quality_source_digest` respectively), so they bind exactly to the grant `PositiveFixture`
+// produces.
+
+const TEST_APPROVAL_VERIFY_KEY: &str = "untrusted comment: minisign public key 789874E4D07535A9\nRWSpNXXQ5HSYeME2uwyrWBQg5TXdi+8vGt5J3++X+Z3aBCgUE3YhwS5c\n";
+
+const GATEWAY_APPROVAL_VALID_JSON: &str = "{\"artifact_version\":1,\"descriptor_sha256\":\"sha256:4377d1eca4e7292cacb2380150e3a3ffa1ea102a9eec0ac01b1ab4a53b8634cd\",\"source_evidence\":{\"economics_source_digest\":\"sha256:2933c7f784c974a4b1191d55ff89ae1d5df71ddaad0dd62417c8ced1d1b6a71a\",\"quality_source_digest\":\"sha256:5bed4d2721fb8c31a23090ce2b3b53fe153f47f73e9b7152355aaac6a46fe6fa\"},\"approver\":\"external-approval-workflow\",\"issued_at_ms\":1000,\"expires_at_ms\":4600}";
+
+/// Same claimed binding as `GATEWAY_APPROVAL_VALID_JSON`, but `quality_source_digest` does not
+/// match the fixture's actual quality source digest.
+const GATEWAY_APPROVAL_UNBOUND_JSON: &str = "{\"artifact_version\":1,\"descriptor_sha256\":\"sha256:4377d1eca4e7292cacb2380150e3a3ffa1ea102a9eec0ac01b1ab4a53b8634cd\",\"source_evidence\":{\"economics_source_digest\":\"sha256:2933c7f784c974a4b1191d55ff89ae1d5df71ddaad0dd62417c8ced1d1b6a71a\",\"quality_source_digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},\"approver\":\"external-approval-workflow\",\"issued_at_ms\":1000,\"expires_at_ms\":4600}";
+
+const GATEWAY_APPROVAL_ENVELOPE_VALID_JSON: &str = "{\"envelope_version\": 1, \"algorithm\": \"minisign-ed25519\", \"key_id\": \"789874E4D07535A9\", \"payload_sha256\": \"sha256:4a63138836fc0a2c1e1a6cb199882b4f93a9531ef4106585d81907f97d70008b\", \"minisign_signature\": \"untrusted comment: bowline gateway approval fixture\\nRUSpNXXQ5HSYeDV/R3AtV6lk6cu8YEomJpMDfJms03f7zJX2R59+COyih3FbXGoiv0cTiKIHhTxLgXurzGQpA22uCPVBfDHscQc=\\ntrusted comment: bowline external-approval artifact fixture\\nRzyUVtowDRRsiUwtiZ/cjuygCLYxEx6saSE/ajLsyWA/e5Na4VpXx3RZx1hKn8j2NR+KEcuiGzNKtvoX+sY6Bw==\\n\"}";
+
+/// Signed by a *different* throwaway key than `TEST_APPROVAL_VERIFY_KEY`, over the same exact
+/// valid payload. Models an operator whose configured `verify_keys` do not include the key that
+/// actually signed this artifact.
+const GATEWAY_APPROVAL_ENVELOPE_WRONG_KEY_JSON: &str = "{\"envelope_version\": 1, \"algorithm\": \"minisign-ed25519\", \"key_id\": \"523F586596E8204E\", \"payload_sha256\": \"sha256:4a63138836fc0a2c1e1a6cb199882b4f93a9531ef4106585d81907f97d70008b\", \"minisign_signature\": \"untrusted comment: bowline gateway approval fixture wrong key\\nRUROIOiWZVg/UqDvSt8gFjtfV1y+3eeu+II6+o5WbMKTpiJZLyGwY3eZaKF3J+BvifX9dqULxtzqW4S4eOs7s8N6bPZkX9VoTwg=\\ntrusted comment: bowline external-approval artifact fixture\\nxC5zoMwR7ie6FEZclrd6Ehb7WXueBqENErj+bgJajLNL0qnHmt4qpycdz0rOP+Zo5Zjc6593kD1PYQ0GbaZ+DA==\\n\"}";
+
+const GATEWAY_APPROVAL_ENVELOPE_UNBOUND_JSON: &str = "{\"envelope_version\": 1, \"algorithm\": \"minisign-ed25519\", \"key_id\": \"789874E4D07535A9\", \"payload_sha256\": \"sha256:4ed1ef4135f967a3bc4e20e16f5aa362802c6ff4d8bbc9440b33af7a29c24fa8\", \"minisign_signature\": \"untrusted comment: bowline gateway approval fixture\\nRUSpNXXQ5HSYeMBxpDHDOFOcveUD//InX+1+J3+RNQNRS3fzngRAGbR21MklNpZVr2adGWAUxe98Lp/orK/SXvgWxUtSfrVK7wU=\\ntrusted comment: bowline external-approval artifact fixture\\njlZPqThrPC5RZ0K7tKx6FKkot1E7rBbx3LWskDbSITYjCqgGkmpqcEtNOA+0uo/NsocPc8OCBcWvqF9lXVf5Bw==\\n\"}";
+
+/// Same claimed binding as `GATEWAY_APPROVAL_VALID_JSON`, but its own claimed validity window
+/// (`issued_at_ms: 100, expires_at_ms: 200`) has already elapsed by `NOW_MS`.
+const GATEWAY_APPROVAL_EXPIRED_JSON: &str = "{\"artifact_version\":1,\"descriptor_sha256\":\"sha256:4377d1eca4e7292cacb2380150e3a3ffa1ea102a9eec0ac01b1ab4a53b8634cd\",\"source_evidence\":{\"economics_source_digest\":\"sha256:2933c7f784c974a4b1191d55ff89ae1d5df71ddaad0dd62417c8ced1d1b6a71a\",\"quality_source_digest\":\"sha256:5bed4d2721fb8c31a23090ce2b3b53fe153f47f73e9b7152355aaac6a46fe6fa\"},\"approver\":\"external-approval-workflow\",\"issued_at_ms\":100,\"expires_at_ms\":200}";
+
+const GATEWAY_APPROVAL_ENVELOPE_EXPIRED_JSON: &str = "{\"envelope_version\": 1, \"algorithm\": \"minisign-ed25519\", \"key_id\": \"789874E4D07535A9\", \"payload_sha256\": \"sha256:7b06cbb3c348d35016eb749f4954cf518b400986dbbe1cfa335076906810429b\", \"minisign_signature\": \"untrusted comment: bowline gateway approval fixture\\nRUSpNXXQ5HSYeGsll4LiyokXDOGj9Ingf8ifYXeoUQCymIGfn+s79e/haLq8yzEvVTA0ZgScvWJX1tN3L7ct1kM2RzRJY1Higw0=\\ntrusted comment: bowline external-approval artifact fixture\\n1C6sNa9ezDhsZyGBAFox+D3q0KYgeGhSFgDWSeoCSwm/OYPOlG/7dS6OtwrkPGTQ0yu111CmrCcED/XDL8MhDg==\\n\"}";
+
+/// Both unbound (wrong `quality_source_digest`) *and* outside its own claimed validity window,
+/// to prove `Unbound` — not `Expired` — is reported when both conditions hold.
+const GATEWAY_APPROVAL_UNBOUND_AND_EXPIRED_JSON: &str = "{\"artifact_version\":1,\"descriptor_sha256\":\"sha256:4377d1eca4e7292cacb2380150e3a3ffa1ea102a9eec0ac01b1ab4a53b8634cd\",\"source_evidence\":{\"economics_source_digest\":\"sha256:2933c7f784c974a4b1191d55ff89ae1d5df71ddaad0dd62417c8ced1d1b6a71a\",\"quality_source_digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},\"approver\":\"external-approval-workflow\",\"issued_at_ms\":100,\"expires_at_ms\":200}";
+
+const GATEWAY_APPROVAL_ENVELOPE_UNBOUND_AND_EXPIRED_JSON: &str = "{\"envelope_version\": 1, \"algorithm\": \"minisign-ed25519\", \"key_id\": \"789874E4D07535A9\", \"payload_sha256\": \"sha256:8f46d55eeff2c089929aaa4f784a179fff2d8364bac52cbeff8720d88db7e308\", \"minisign_signature\": \"untrusted comment: bowline gateway approval fixture\\nRUSpNXXQ5HSYeHboTOwy+cc2Q3UbNK3rfyOCuWZMapX94tL/jVQtHblhnM6puMoD3fGWEajxPeMz59nI2jWk3bwgvLODAsQITAY=\\ntrusted comment: bowline external-approval artifact fixture\\nOJz5ZbgfJwt8FRUVLJr6kct/hFAycQrlNKJRlVcbbUTXwO1DLM15cdsrb/yR4/nHGVB3Jpv5IsDO2CiyFx+XBw==\\n\"}";
+
+fn approval_artifact_path(fixture: &PositiveFixture) -> PathBuf {
+    fixture
+        .root
+        .join("authorization/support-chat.json.approval.json")
+}
+
+fn approval_envelope_path(fixture: &PositiveFixture) -> PathBuf {
+    fixture
+        .root
+        .join("authorization/support-chat.json.approval.json.signature.json")
+}
+
+fn required_approval_config() -> PromotionApprovalConfig {
+    PromotionApprovalConfig {
+        version: 1,
+        required: true,
+        verify_keys: vec![TEST_APPROVAL_VERIFY_KEY.to_owned()],
+        max_age_seconds: 3_600,
+    }
+}
+
+#[test]
+fn promotion_approval_absent_matches_legacy_grant_loading_exactly() {
+    let fixture = PositiveFixture::create();
+    let legacy = load_verified_promotion_grant_with_active(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+    )
+    .unwrap();
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        None,
+    )
+    .unwrap();
+    let PromotionGrantLoad::Verified(grant) = outcome else {
+        panic!("expected a verified grant when promotion_approval is unconfigured");
+    };
+    assert_eq!(grant.grant_digest(), legacy.grant_digest());
+    assert_eq!(grant.route_id(), legacy.route_id());
+}
+
+#[test]
+fn promotion_approval_required_and_missing_artifact_is_approval_missing_not_a_hard_error() {
+    let fixture = PositiveFixture::create();
+    assert!(!approval_artifact_path(&fixture).exists());
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::ApprovalMissing));
+}
+
+#[test]
+fn promotion_approval_not_required_and_missing_artifact_falls_back_to_verified_grant() {
+    let fixture = PositiveFixture::create();
+    let approval = PromotionApprovalConfig {
+        version: 1,
+        required: false,
+        verify_keys: vec![TEST_APPROVAL_VERIFY_KEY.to_owned()],
+        max_age_seconds: 3_600,
+    };
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&approval),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::Verified(_)));
+}
+
+#[test]
+fn promotion_approval_required_and_missing_envelope_with_present_artifact_is_approval_missing() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &approval_artifact_path(&fixture),
+        GATEWAY_APPROVAL_VALID_JSON.as_bytes(),
+    );
+    assert!(!approval_envelope_path(&fixture).exists());
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::ApprovalMissing));
+}
+
+#[test]
+fn promotion_approval_valid_artifact_verifies_binds_and_grants() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &approval_artifact_path(&fixture),
+        GATEWAY_APPROVAL_VALID_JSON.as_bytes(),
+    );
+    write_private(
+        &approval_envelope_path(&fixture),
+        GATEWAY_APPROVAL_ENVELOPE_VALID_JSON.as_bytes(),
+    );
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    )
+    .unwrap();
+    let PromotionGrantLoad::Verified(grant) = outcome else {
+        panic!("expected a verified grant for a valid, bound, fresh approval artifact");
+    };
+    assert_eq!(grant.route_id(), ROUTE_ID);
+}
+
+#[test]
+fn promotion_approval_wrong_configured_key_is_approval_signature_invalid() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &approval_artifact_path(&fixture),
+        GATEWAY_APPROVAL_VALID_JSON.as_bytes(),
+    );
+    write_private(
+        &approval_envelope_path(&fixture),
+        GATEWAY_APPROVAL_ENVELOPE_WRONG_KEY_JSON.as_bytes(),
+    );
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    )
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        PromotionGrantLoad::ApprovalSignatureInvalid
+    ));
+}
+
+#[test]
+fn promotion_approval_validly_signed_but_unbound_artifact_is_approval_unbound() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &approval_artifact_path(&fixture),
+        GATEWAY_APPROVAL_UNBOUND_JSON.as_bytes(),
+    );
+    write_private(
+        &approval_envelope_path(&fixture),
+        GATEWAY_APPROVAL_ENVELOPE_UNBOUND_JSON.as_bytes(),
+    );
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::ApprovalUnbound));
+}
+
+#[test]
+fn unbound_takes_precedence_over_also_expired() {
+    // This artifact is *both* unbound (wrong `quality_source_digest`) *and* outside its own
+    // claimed validity window at `NOW_MS`, proving `Unbound` is reported — not `Expired` — when
+    // both conditions hold, exactly matching the documented missing -> bad signature -> unbound
+    // -> expired/stale precedence.
+    let fixture = PositiveFixture::create();
+    write_private(
+        &approval_artifact_path(&fixture),
+        GATEWAY_APPROVAL_UNBOUND_AND_EXPIRED_JSON.as_bytes(),
+    );
+    write_private(
+        &approval_envelope_path(&fixture),
+        GATEWAY_APPROVAL_ENVELOPE_UNBOUND_AND_EXPIRED_JSON.as_bytes(),
+    );
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::ApprovalUnbound));
+}
+
+#[test]
+fn promotion_approval_expired_artifact_is_approval_expired() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &approval_artifact_path(&fixture),
+        GATEWAY_APPROVAL_EXPIRED_JSON.as_bytes(),
+    );
+    write_private(
+        &approval_envelope_path(&fixture),
+        GATEWAY_APPROVAL_ENVELOPE_EXPIRED_JSON.as_bytes(),
+    );
+    // The artifact's own claimed window (`issued_at_ms: 100, expires_at_ms: 200`) has already
+    // elapsed by `NOW_MS`; the base grant's independent evidence freshness is untouched.
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::ApprovalExpired));
+}
+
+#[test]
+fn promotion_approval_artifact_symlink_retains_startup_refusal() {
+    let fixture = PositiveFixture::create();
+    let replacement = fixture.root.join("replacement-approval.json");
+    write_private(&replacement, GATEWAY_APPROVAL_VALID_JSON.as_bytes());
+    symlink(replacement, approval_artifact_path(&fixture)).unwrap();
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    );
+    assert!(
+        outcome.is_err(),
+        "a symlinked approval artifact must retain startup refusal"
+    );
+}
+
+#[test]
+fn promotion_approval_artifact_wrong_mode_retains_startup_refusal() {
+    let fixture = PositiveFixture::create();
+    let artifact = approval_artifact_path(&fixture);
+    write_private(&artifact, GATEWAY_APPROVAL_VALID_JSON.as_bytes());
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    );
+    assert!(
+        outcome.is_err(),
+        "a world-readable approval artifact must retain startup refusal"
+    );
+}
+
+#[test]
+fn promotion_approval_artifact_oversized_retains_startup_refusal() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &approval_artifact_path(&fixture),
+        &vec![b' '; 64 * 1024 + 1],
+    );
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    );
+    assert!(
+        outcome.is_err(),
+        "an oversized approval artifact must retain startup refusal"
+    );
+}
+
+#[test]
+fn promotion_approval_envelope_oversized_retains_startup_refusal() {
+    let fixture = PositiveFixture::create();
+    write_private(
+        &approval_artifact_path(&fixture),
+        GATEWAY_APPROVAL_VALID_JSON.as_bytes(),
+    );
+    write_private(
+        &approval_envelope_path(&fixture),
+        &vec![b' '; 64 * 1024 + 1],
+    );
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+        Some(&required_approval_config()),
+    );
+    assert!(
+        outcome.is_err(),
+        "an oversized approval envelope must retain startup refusal"
+    );
+}
+
+#[test]
+fn authority_signing_rejection_takes_precedence_over_unchecked_promotion_approval() {
+    // A missing, `required` `authority_signing` signature must be reported as
+    // `SignatureMissing`, never reaching approval-artifact checks at all — even though no
+    // approval artifact is present either (which would otherwise also be `ApprovalMissing`).
+    let fixture = PositiveFixture::create();
+    let outcome = load_verified_promotion_grant_with_approval(
+        &fixture.validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+        Some(&required_approval_config()),
+    )
+    .unwrap();
+    assert!(matches!(outcome, PromotionGrantLoad::SignatureMissing));
 }

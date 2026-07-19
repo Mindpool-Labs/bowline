@@ -1,5 +1,6 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod approval;
 pub mod attribution;
 pub mod billing;
 pub mod billing_run;

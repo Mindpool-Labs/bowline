@@ -79,6 +79,11 @@
   privileged administrators inside the deployment security domain remain trusted. An optional
   `authority_signing` signature over that sidecar attests only its exact-byte authenticity at
   signing time, not the correctness of what it binds or organizational approval.
+- An optional `promotion_approval` artifact is machine-checkable evidence that a signed,
+  externally produced document names the exact evidence digests a specific promotion
+  authorization is bound to and is fresh. It is not organizational authority, a role, a quorum, an
+  approval process, or a claim about who signed it or why; Bowline never interprets `approver`.
+  Off by default; see [external-approval](external-approval.md).
 - Candidate authority requires a resolved application plus exact runtime task and canonical tag
   binding. Missing or invalid application identity, task mismatch, and tag mismatch use the
   configured zero-authority fallback.

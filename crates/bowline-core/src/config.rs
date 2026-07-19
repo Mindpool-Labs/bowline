@@ -18,6 +18,11 @@ use crate::{
     supply::{Registry, SupplyClass},
 };
 
+/// Compiled upper bound on `promotion_approval.max_age_seconds` (365 days), mirroring
+/// `crate::enforcement::MAX_ECONOMICS_AGE_MS` so an operator cannot configure an approval
+/// freshness window unrepresentable elsewhere in the evidence pipeline.
+pub const MAX_PROMOTION_APPROVAL_MAX_AGE_SECONDS: u64 = 31_536_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -41,6 +46,8 @@ pub struct Config {
     #[serde(default)]
     pub authority_signing: Option<AuthoritySigningConfig>,
     #[serde(default)]
+    pub promotion_approval: Option<PromotionApprovalConfig>,
+    #[serde(default)]
     pub state_backend: Option<StateBackendConfig>,
     #[serde(default = "default_trusted_proxy_cidrs")]
     pub trusted_proxy_cidrs: Vec<IpNet>,
@@ -59,6 +66,22 @@ pub struct AuthoritySigningConfig {
     pub version: u32,
     pub required: bool,
     pub verify_keys: Vec<String>,
+}
+
+/// Optional, bring-your-own-workflow external-approval policy for promotion evidence. When
+/// absent, approval-artifact binding is entirely inert and promotion grants build exactly as
+/// they did before this section existed. When present, every promoted route additionally
+/// requires `<authorization_path>.approval.json` (with signature envelope
+/// `<authorization_path>.approval.json.signature.json`) to verify, name the exact evidence
+/// digests it is bound to, and be fresh — see `bowline_core::approval`. Bowline never
+/// interprets who `approver` names or what process produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotionApprovalConfig {
+    pub version: u32,
+    pub required: bool,
+    pub verify_keys: Vec<String>,
+    pub max_age_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +417,36 @@ impl Config {
                         "must be a standard minisign public key",
                     )
                 })?;
+            }
+        }
+        if let Some(approval) = self.promotion_approval.as_ref() {
+            if approval.version != 1 {
+                return Err(ConfigError::invalid(
+                    "promotion_approval.version",
+                    "must equal 1",
+                ));
+            }
+            if approval.verify_keys.is_empty() {
+                return Err(ConfigError::invalid(
+                    "promotion_approval.verify_keys",
+                    "must name at least one standard minisign public key",
+                ));
+            }
+            for key in &approval.verify_keys {
+                crate::envelope::validate_configured_key(key).map_err(|_| {
+                    ConfigError::invalid(
+                        "promotion_approval.verify_keys",
+                        "must be a standard minisign public key",
+                    )
+                })?;
+            }
+            if approval.max_age_seconds == 0
+                || approval.max_age_seconds > MAX_PROMOTION_APPROVAL_MAX_AGE_SECONDS
+            {
+                return Err(ConfigError::invalid(
+                    "promotion_approval.max_age_seconds",
+                    "must be positive and within the compiled bound",
+                ));
             }
         }
         if let Some(state_backend) = self.state_backend.as_ref() {
@@ -1014,6 +1067,103 @@ supplies:
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn promotion_approval_is_absent_by_default_and_inert() {
+        let config = Config::from_yaml(&valid_yaml()).expect("fixture parses");
+        assert_eq!(config.promotion_approval, None);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn promotion_approval_parses_and_validates_when_present() {
+        let yaml = format!(
+            "{}\npromotion_approval:\n  version: 1\n  required: true\n  verify_keys:\n    - {:?}\n  max_age_seconds: 86400\n",
+            valid_yaml(),
+            signing_test_key(),
+        );
+        let config = Config::from_yaml(&yaml).expect("fixture parses");
+        let approval = config
+            .promotion_approval
+            .as_ref()
+            .expect("promotion_approval section present");
+        assert_eq!(approval.version, 1);
+        assert!(approval.required);
+        assert_eq!(approval.verify_keys.len(), 1);
+        assert_eq!(approval.max_age_seconds, 86_400);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn promotion_approval_rejects_unsupported_version() {
+        let yaml = format!(
+            "{}\npromotion_approval:\n  version: 2\n  required: true\n  verify_keys:\n    - {:?}\n  max_age_seconds: 86400\n",
+            valid_yaml(),
+            signing_test_key(),
+        );
+        let config = Config::from_yaml(&yaml).expect("fixture parses");
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "promotion_approval.version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn promotion_approval_rejects_empty_verify_keys() {
+        let yaml = format!(
+            "{}\npromotion_approval:\n  version: 1\n  required: true\n  verify_keys: []\n  max_age_seconds: 86400\n",
+            valid_yaml(),
+        );
+        let config = Config::from_yaml(&yaml).expect("fixture parses");
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "promotion_approval.verify_keys",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn promotion_approval_rejects_malformed_verify_key() {
+        let yaml = format!(
+            "{}\npromotion_approval:\n  version: 1\n  required: true\n  verify_keys:\n    - \"not a minisign key\"\n  max_age_seconds: 86400\n",
+            valid_yaml(),
+        );
+        let config = Config::from_yaml(&yaml).expect("fixture parses");
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "promotion_approval.verify_keys",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn promotion_approval_rejects_zero_and_over_bound_max_age_seconds() {
+        for max_age in ["0", "31536001"] {
+            let yaml = format!(
+                "{}\npromotion_approval:\n  version: 1\n  required: true\n  verify_keys:\n    - {:?}\n  max_age_seconds: {max_age}\n",
+                valid_yaml(),
+                signing_test_key(),
+            );
+            let config = Config::from_yaml(&yaml).expect("fixture parses");
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ConfigError::InvalidField {
+                        field: "promotion_approval.max_age_seconds",
+                        ..
+                    })
+                ),
+                "max_age_seconds {max_age} must fail validation"
+            );
+        }
     }
 
     #[test]
