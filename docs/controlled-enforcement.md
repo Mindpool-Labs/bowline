@@ -78,7 +78,8 @@ the route and grant.
 The authorization sidecar can optionally require a standard, bring-your-own-key
 [Minisign](https://jedisct1.github.io/minisign/) signature. This is off by default and does not
 change the sidecar's binding semantics above; it adds one more precondition before a route's
-promotion grant is trusted.
+promotion grant or recommendation evidence is trusted — the same descriptor, the same envelope
+schema, and the same `authority_signing` config cover both.
 
 Configure it in the gateway config, never in the enforcement bundle:
 
@@ -127,6 +128,12 @@ fallback with zero allocation authority, durably recorded): the envelope is abse
 `required: true`, or the envelope is present but does not verify (tampered payload or a key
 outside `verify_keys`). With `required: false`, an absent envelope is legacy behavior — the grant
 still requires every check described above, just not a signature.
+
+Recommend-mode routes use the identical envelope over the identical descriptor, since a recommend
+route's evidence is sealed the same way an authority route's is. A recommend route never has
+allocation authority regardless of signing, so a missing or invalid signature only changes whether
+its evidence surfaces as presented or unverified advisory evidence — it never becomes a
+startup-refusing error and it never grants a candidate.
 
 A verifying signature attests only that the exact bytes of the sealed authorization file were
 signed by one of the configured keys at some point. It does not attest that the underlying

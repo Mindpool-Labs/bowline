@@ -845,6 +845,96 @@ pub fn load_verified_recommendation_evidence(
     active: &ActiveRuntimeProvenance,
     now_ms: u64,
 ) -> Result<VerifiedRecommendationEvidence, EnforcementLoadError> {
+    let authorization = load_promotion_authorization(validated, route_id, evidence_root)?;
+    build_verified_recommendation_evidence(
+        validated,
+        route_id,
+        evidence_root,
+        active,
+        now_ms,
+        authorization,
+    )
+}
+
+/// Loads a route's verified recommendation evidence, applying the same optional bring-your-own-key
+/// signing policy used for promotion grants over the identical `<authorization_path>.signature.json`
+/// descriptor. When `authority_signing` is `None` this is byte-for-byte the same call as
+/// `load_verified_recommendation_evidence` (zero default-behavior drift). When configured, a
+/// missing or cryptographically invalid signature is reported as a typed `Err` whose message uses
+/// the same `signature-missing` / `signature-invalid` vocabulary the authority-route path records
+/// in `SelectionReason::SignatureMissing`/`SignatureInvalid`. Recommendation evidence is always
+/// advisory and never gains candidate authority, so — exactly like every other recommendation
+/// evidence load error today — the caller (`optional_recommendation_evidence`) treats this `Err`
+/// as evidence simply being unverified rather than a startup failure; there is no separate hard
+/// vs. soft split to make here, because that caller already softens every error uniformly.
+pub fn load_verified_recommendation_evidence_signed(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+    active: &ActiveRuntimeProvenance,
+    now_ms: u64,
+    authority_signing: Option<&AuthoritySigningConfig>,
+) -> Result<VerifiedRecommendationEvidence, EnforcementLoadError> {
+    let Some(signing) = authority_signing else {
+        return load_verified_recommendation_evidence(
+            validated,
+            route_id,
+            evidence_root,
+            active,
+            now_ms,
+        );
+    };
+    let (authorization_path, payload_bytes) =
+        read_promotion_authorization_bytes(validated, route_id, evidence_root)?;
+    let envelope_path = signature_envelope_path(&authorization_path);
+    let envelope_bytes =
+        match read_private_bundle_file(evidence_root, &envelope_path, MAX_ENVELOPE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(EnforcementLoadError::Io(io_error))
+                if io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                if signing.required {
+                    return Err(EnforcementLoadError::Invalid("signature-missing".into()));
+                }
+                return load_verified_recommendation_evidence(
+                    validated,
+                    route_id,
+                    evidence_root,
+                    active,
+                    now_ms,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+    if verify_envelope(&payload_bytes, &envelope_bytes, &signing.verify_keys).is_err() {
+        return Err(EnforcementLoadError::Invalid("signature-invalid".into()));
+    }
+    // Parse the exact bytes the signature was just verified against — never re-read the
+    // authorization file here, for the same TOCTOU reason `load_verified_promotion_grant_signed`
+    // does not.
+    let authorization: PromotionAuthorizationV1 =
+        serde_json::from_slice(&payload_bytes).map_err(EnforcementLoadError::Json)?;
+    build_verified_recommendation_evidence(
+        validated,
+        route_id,
+        evidence_root,
+        active,
+        now_ms,
+        authorization,
+    )
+}
+
+/// Builds verified recommendation evidence from an already-loaded `authorization` document,
+/// without re-reading the authorization file from disk (see `build_verified_promotion_grant` for
+/// why this matters when the caller has already verified a signature over specific bytes).
+fn build_verified_recommendation_evidence(
+    validated: &ValidatedEnforcement,
+    route_id: &str,
+    evidence_root: &Path,
+    active: &ActiveRuntimeProvenance,
+    now_ms: u64,
+    authorization: PromotionAuthorizationV1,
+) -> Result<VerifiedRecommendationEvidence, EnforcementLoadError> {
     let route = validated
         .route(route_id)
         .ok_or_else(|| EnforcementLoadError::Invalid("unknown enforcement route".into()))?;
@@ -854,7 +944,6 @@ pub fn load_verified_recommendation_evidence(
         ));
     }
     let (economics, quality) = load_unsealed_promotion_sources(validated, route_id, evidence_root)?;
-    let authorization = load_promotion_authorization(validated, route_id, evidence_root)?;
     if !economics
         .selected_quality_digests
         .iter()

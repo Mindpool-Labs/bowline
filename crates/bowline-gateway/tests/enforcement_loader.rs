@@ -42,7 +42,8 @@ use bowline_gateway::enforcement_loader::{
     load_verified_promotion_grant as load_verified_promotion_grant_with_active,
     load_verified_promotion_grant_signed, load_verified_promotion_grant_with_approval,
     load_verified_recommendation_evidence as load_verified_recommendation_evidence_with_active,
-    read_private_bundle_file, seal_promotion_authorization_for_route, select_enforcement_target,
+    load_verified_recommendation_evidence_signed, read_private_bundle_file,
+    seal_promotion_authorization_for_route, select_enforcement_target,
     select_enforcement_target_without_grant, select_recommendation_target, BoundedKillStateReader,
     EnforcementLoadError, GatewayEvidenceState, KillStateReader, PromotionGrantLoad,
 };
@@ -2949,4 +2950,181 @@ fn authority_signing_rejection_takes_precedence_over_unchecked_promotion_approva
     )
     .unwrap();
     assert!(matches!(outcome, PromotionGrantLoad::SignatureMissing));
+}
+
+// --- authority_signing over recommendation evidence (same descriptor, never authoritative) ---
+//
+// `RECOMMEND_ENVELOPE_VALID_JSON` / `RECOMMEND_ENVELOPE_INVALID_JSON` are pre-signed over the
+// exact, deterministic bytes `recommendation_config(&fixture)` reseals for `ROUTE_ID` (fixed
+// digests/timestamps, no wall-clock or random input) — the same throwaway key as
+// `TEST_VERIFY_KEY`, generated exactly like the promotion-side fixtures above.
+
+const RECOMMEND_AUTHORIZATION_JSON: &str = "{\"schema_version\":1,\"route_id\":\"support-chat\",\"created_at_ms\":1000,\"economics_bundle_digest\":\"sha256:2933c7f784c974a4b1191d55ff89ae1d5df71ddaad0dd62417c8ced1d1b6a71a\",\"economics_report_digest\":\"sha256:2cc45e34338d7f6d20fe94c052d1811668d0af8407e0e96ca071d24c5307f033\",\"opportunity_digest\":\"sha256:b9622c09fffe22f929e0e48e2d4bc67b79682643ab86ff2ad0082771b2872e25\",\"quality_source_digest\":\"sha256:5bed4d2721fb8c31a23090ce2b3b53fe153f47f73e9b7152355aaac6a46fe6fa\",\"quality_run_id\":\"00000000-0000-0000-0000-000000000001\",\"quality_report_digest\":\"sha256:7dd077d47f35c26588cc5685927028bbafb6255468a157c1b5a67a062e188bf5\",\"policy_digest\":\"sha256:fa866bbe091a221af281781243aa63e586d8e22328faa1c63c8b252c99e262b7\",\"registry_digest\":\"sha256:aadab12c615bee889d2a20396d5ce3751575a1172f528295c72126871c1b68fd\",\"owned_cost_digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"enforcement_digest\":\"sha256:f7e3a4fe3c72d5305a9c93e96be932729cc80c4a5a514693a0239d3494b91b5b\",\"actuator_digest\":\"sha256:5696131a3e30cb82dfa6baddc9cff47db2101b447c55f950ce93a0b9c17844ec\",\"route_digest\":\"sha256:07c659e4778572fdd995a76f0b7ac792de8b053ab073713a9830bc772a64e909\",\"workload_identity_digest\":\"sha256:8ad64415d5c48cbf357a640f5ada080cb6705dba82d46edf743ebb960d682ca7\",\"task_class\":\"mechanical\",\"protocol\":\"chat-completions\",\"actual_supply_id\":\"public/openai\",\"candidate_supply_id\":\"owned/llama\",\"authorization_digest\":\"sha256:c2df47750e7dc1639332e5a1c9f6d8f37e3185ba0c6e2f1ef0c05ce70f89427d\"}\n";
+
+const RECOMMEND_ENVELOPE_VALID_JSON: &str = "{\"envelope_version\":1,\"algorithm\":\"minisign-ed25519\",\"key_id\":\"7D993CA9D5D0C222\",\"payload_sha256\":\"sha256:dbd7f1ae856f3ed9ed5b9df150ce54bcda2d765f034a301c25feaf921cde3e83\",\"minisign_signature\":\"untrusted comment: signature from minisign secret key\\nRUQiwtDVqTyZfSvpYjyLP/3/GJKeuNEVzC7zoIs+sqG0edZjfyDCNI/MeI2dJ7EeMJ2XnT+PPjmq4oqiVXMMmBjWsG9ppjZq0ws=\\ntrusted comment: bowline recommend fixture\\n26O+9nFakGrHrKA6sfwVkwuONozMqBPW8xz1p1nmAyUKAblDlvogXwjEn+5YEzwiDsY1BT0blsGLJnsylQGmDA==\\n\"}";
+
+/// Same signature bytes as `RECOMMEND_ENVELOPE_VALID_JSON`, but with `payload_sha256` corrupted so
+/// the digest check fails before the signature is ever checked. Models the promotion-side
+/// "present but invalid" case for recommendation evidence.
+const RECOMMEND_ENVELOPE_INVALID_JSON: &str = "{\"envelope_version\":1,\"algorithm\":\"minisign-ed25519\",\"key_id\":\"7D993CA9D5D0C222\",\"payload_sha256\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"minisign_signature\":\"untrusted comment: signature from minisign secret key\\nRUQiwtDVqTyZfSvpYjyLP/3/GJKeuNEVzC7zoIs+sqG0edZjfyDCNI/MeI2dJ7EeMJ2XnT+PPjmq4oqiVXMMmBjWsG9ppjZq0ws=\\ntrusted comment: bowline recommend fixture\\n26O+9nFakGrHrKA6sfwVkwuONozMqBPW8xz1p1nmAyUKAblDlvogXwjEn+5YEzwiDsY1BT0blsGLJnsylQGmDA==\\n\"}";
+
+fn recommend_signature_sidecar_path(fixture: &PositiveFixture) -> PathBuf {
+    fixture
+        .root
+        .join("authorization/support-chat.json.signature.json")
+}
+
+#[test]
+fn recommendation_signing_absent_matches_legacy_loading_exactly() {
+    let fixture = PositiveFixture::create();
+    let validated = recommendation_config(&fixture);
+    let legacy =
+        load_verified_recommendation_evidence(&validated, ROUTE_ID, &fixture.root, NOW_MS).unwrap();
+    let signed = load_verified_recommendation_evidence_signed(
+        &validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&legacy).unwrap(),
+        serde_json::to_value(&signed).unwrap()
+    );
+}
+
+#[test]
+fn recommendation_signing_required_and_valid_signature_is_presented_evidence() {
+    let fixture = PositiveFixture::create();
+    let validated = recommendation_config(&fixture);
+    let sidecar = fixture.root.join("authorization/support-chat.json");
+    assert_eq!(
+        fs::read(&sidecar).unwrap(),
+        RECOMMEND_AUTHORIZATION_JSON.as_bytes(),
+        "fixture recommendation authorization bytes drifted from the pre-signed test vector"
+    );
+    write_private(
+        &recommend_signature_sidecar_path(&fixture),
+        RECOMMEND_ENVELOPE_VALID_JSON.as_bytes(),
+    );
+    let evidence = load_verified_recommendation_evidence_signed(
+        &validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    )
+    .unwrap();
+    let result = select_recommendation_target(
+        &validated,
+        ROUTE_ID,
+        &selection_facts(&validated, &fixture.workload_digest),
+        &evidence,
+    )
+    .unwrap();
+    assert_eq!(result.evidence_state(), GatewayEvidenceState::Verified);
+    assert_eq!(result.reason(), SelectionReason::RecommendationOnly);
+    assert_ne!(result.target(), PlanTarget::Candidate);
+}
+
+#[test]
+fn recommendation_signing_required_and_missing_envelope_is_rejected_with_typed_reason() {
+    let fixture = PositiveFixture::create();
+    let validated = recommendation_config(&fixture);
+    assert!(!recommend_signature_sidecar_path(&fixture).exists());
+    let error = load_verified_recommendation_evidence_signed(
+        &validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("signature-missing"),
+        "expected the signature-missing reason, got: {error}"
+    );
+}
+
+#[test]
+fn recommendation_signing_required_and_invalid_signature_is_rejected_with_typed_reason() {
+    let fixture = PositiveFixture::create();
+    let validated = recommendation_config(&fixture);
+    write_private(
+        &recommend_signature_sidecar_path(&fixture),
+        RECOMMEND_ENVELOPE_INVALID_JSON.as_bytes(),
+    );
+    let error = load_verified_recommendation_evidence_signed(
+        &validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&required_signing_config()),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("signature-invalid"),
+        "expected the signature-invalid reason, got: {error}"
+    );
+}
+
+#[test]
+fn recommendation_signing_not_required_and_missing_envelope_falls_back_to_legacy() {
+    let fixture = PositiveFixture::create();
+    let validated = recommendation_config(&fixture);
+    let signing = AuthoritySigningConfig {
+        version: 1,
+        required: false,
+        verify_keys: vec![TEST_VERIFY_KEY.to_owned()],
+    };
+    let evidence = load_verified_recommendation_evidence_signed(
+        &validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&signing),
+    )
+    .unwrap();
+    let legacy =
+        load_verified_recommendation_evidence(&validated, ROUTE_ID, &fixture.root, NOW_MS).unwrap();
+    assert_eq!(
+        serde_json::to_value(&legacy).unwrap(),
+        serde_json::to_value(&evidence).unwrap()
+    );
+}
+
+#[test]
+fn recommendation_signing_not_required_and_present_invalid_signature_is_still_rejected() {
+    // Consistent with the documented promotion semantics: `required: false` only tolerates an
+    // *absent* envelope. A present-but-invalid envelope is never silently accepted.
+    let fixture = PositiveFixture::create();
+    let validated = recommendation_config(&fixture);
+    write_private(
+        &recommend_signature_sidecar_path(&fixture),
+        RECOMMEND_ENVELOPE_INVALID_JSON.as_bytes(),
+    );
+    let signing = AuthoritySigningConfig {
+        version: 1,
+        required: false,
+        verify_keys: vec![TEST_VERIFY_KEY.to_owned()],
+    };
+    let error = load_verified_recommendation_evidence_signed(
+        &validated,
+        ROUTE_ID,
+        &fixture.root,
+        &fixture.active,
+        NOW_MS,
+        Some(&signing),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("signature-invalid"),
+        "expected the signature-invalid reason, got: {error}"
+    );
 }

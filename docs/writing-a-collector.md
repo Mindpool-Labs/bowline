@@ -57,7 +57,7 @@ or, on the first rejection:
 `line-too-large`, `event-count-exceeded`, `malformed-profile`, `forbidden-profile-pointer`,
 `missing-required-target`, `duplicate-event-id`, and `invalid-event` (a malformed JSON line, or a
 canonical-schema type/bounds violation). `line` is the 1-based source line for a per-event
-violation, or absent for a whole-file violation (an oversized or unsafe input/profile path, or a
+violation, or `null` for a whole-file violation (an oversized or unsafe input/profile path, or a
 malformed profile). A passing result means this exact file would clear import's prevalidation
 today, nothing more or less.
 

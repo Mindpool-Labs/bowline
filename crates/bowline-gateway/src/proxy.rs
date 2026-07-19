@@ -63,7 +63,7 @@ use crate::{
         CircuitSnapshot, RedirectFreeClient,
     },
     enforcement_loader::{
-        load_verified_promotion_grant_with_approval, load_verified_recommendation_evidence,
+        load_verified_promotion_grant_with_approval, load_verified_recommendation_evidence_signed,
         select_enforcement_target, select_enforcement_target_with_grant_rejection,
         select_enforcement_target_without_grant, select_recommendation_target,
         BoundedKillStateReader, KillStateReader, PromotionGrantLoad, VerifiedPromotionGrant,
@@ -2884,12 +2884,13 @@ fn load_enforcement_runtime(
     }) {
         let evidence = optional_recommendation_evidence(
             &route.route_id,
-            load_verified_recommendation_evidence(
+            load_verified_recommendation_evidence_signed(
                 &validated,
                 &route.route_id,
                 evidence_root,
                 active,
                 now_ms(),
+                config.authority_signing.as_ref(),
             )
             .with_context(|| {
                 format!(
