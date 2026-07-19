@@ -15,6 +15,11 @@ pub mod protocol;
 mod provenance_digest;
 pub mod proxy;
 pub mod quality_writer;
+pub mod serving_lease;
+pub mod state_backend;
+pub mod supervisor;
 pub mod writer;
 
-pub use proxy::{serve, serve_with_shutdown, GatewayDeps, GatewayState};
+pub use proxy::{
+    serve, serve_with_runtime_factory, serve_with_shutdown, GatewayDeps, GatewayState,
+};

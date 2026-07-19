@@ -6,6 +6,7 @@ use std::process::ExitCode;
 mod cmd_billing;
 mod cmd_canary;
 mod cmd_economics;
+mod cmd_export;
 mod cmd_health;
 mod cmd_import;
 mod cmd_kill;
@@ -30,6 +31,7 @@ enum Command {
     Billing(cmd_billing::Args),
     Canary(cmd_canary::Args),
     Economics(cmd_economics::Args),
+    Export(cmd_export::Args),
     Health(cmd_health::Args),
     Import(cmd_import::Args),
     Kill(cmd_kill::Args),
@@ -57,6 +59,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Billing(args) => cmd_billing::run(args),
         Command::Canary(args) => cmd_canary::run(args),
         Command::Economics(args) => cmd_economics::run(args),
+        Command::Export(args) => cmd_export::run(args),
         Command::Health(args) => cmd_health::run(args),
         Command::Import(args) => cmd_import::run(args),
         Command::Kill(args) => cmd_kill::run(args),

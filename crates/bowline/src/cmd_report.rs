@@ -273,7 +273,7 @@ fn load_owned_costs(
 /// Returns `None` when the registry has no priced public-api entry — e.g. an all-owned fleet.
 /// That is a success state, not an error (design D-7): the report degrades the frontier-dependent
 /// counterfactual cells to "n/a" instead of failing.
-fn default_frontier_reference(registry: &Registry) -> Option<String> {
+pub(crate) fn default_frontier_reference(registry: &Registry) -> Option<String> {
     registry
         .entries
         .iter()

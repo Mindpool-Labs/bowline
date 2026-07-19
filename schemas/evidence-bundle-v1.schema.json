@@ -1,0 +1,763 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bowline Evidence Bundle v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_schema_version",
+    "generated_from",
+    "disclosure",
+    "runs",
+    "decisions",
+    "coverage",
+    "aggregates"
+  ],
+  "properties": {
+    "evidence_schema_version": {
+      "const": 1
+    },
+    "generated_from": {
+      "$ref": "#/$defs/generatedFrom"
+    },
+    "disclosure": {
+      "$ref": "#/$defs/disclosure"
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "$ref": "#/$defs/run"
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decision"
+      }
+    },
+    "coverage": {
+      "$ref": "#/$defs/coverage"
+    },
+    "aggregates": {
+      "$ref": "#/$defs/shadowReport"
+    }
+  },
+  "$defs": {
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nullableNumber": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-fA-F]{64}$"
+    },
+    "nullableDigest": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/digest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "protocol": {
+      "enum": [
+        "chat-completions",
+        "responses",
+        "embeddings",
+        "unsupported"
+      ]
+    },
+    "observationSource": {
+      "enum": [
+        "inline",
+        "passive"
+      ]
+    },
+    "coverageStatus": {
+      "enum": [
+        "supported",
+        "incomplete-observation",
+        "unsupported-protocol",
+        "unsupported-shape"
+      ]
+    },
+    "taskClass": {
+      "enum": [
+        "mechanical",
+        "heavy-lifting",
+        "taste-sensitive",
+        "judgment",
+        "unclassified"
+      ]
+    },
+    "policyExposure": {
+      "enum": [
+        "compliant",
+        "violation",
+        "unknown"
+      ]
+    },
+    "confidence": {
+      "enum": [
+        "observed",
+        "declared",
+        "canary-verified",
+        "unverified"
+      ]
+    },
+    "generatedFrom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "feed_version",
+        "policy_digest",
+        "registry_digest",
+        "attribution_digest",
+        "owned_cost_digest",
+        "passive_profile_digest",
+        "passive_input_digest"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "feed_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "registry_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "attribution_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "owned_cost_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "passive_profile_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "passive_input_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        }
+      }
+    },
+    "disclosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "integrity_warnings",
+        "coverage_gaps",
+        "confidence_legend"
+      ],
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "integrity_warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "coverage_gaps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "confidence_legend": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/confidenceLegend"
+          }
+        }
+      }
+    },
+    "confidenceLegend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confidence",
+        "meaning"
+      ],
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "meaning": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "run_id",
+        "started_at_ms",
+        "ended_at_ms",
+        "clean_shutdown",
+        "accepted",
+        "recorded",
+        "dropped",
+        "truncated",
+        "unmapped",
+        "unpriceable",
+        "records_digest",
+        "segment_count"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "started_at_ms": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "ended_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clean_shutdown": {
+          "type": "boolean"
+        },
+        "accepted": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "recorded": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "dropped": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "truncated": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unmapped": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unpriceable": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "records_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "segment_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_ref",
+        "sequence",
+        "observed_at_ms",
+        "protocol",
+        "observation_source",
+        "coverage_status",
+        "coverage_reason",
+        "task_class",
+        "actual_supply_id",
+        "shadow_supply_id",
+        "actual_est_cost_usd",
+        "shadow_est_cost_usd",
+        "policy_exposure"
+      ],
+      "properties": {
+        "decision_ref": {
+          "type": "string",
+          "minLength": 3
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observed_at_ms": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "protocol": {
+          "$ref": "#/$defs/protocol"
+        },
+        "observation_source": {
+          "$ref": "#/$defs/observationSource"
+        },
+        "coverage_status": {
+          "$ref": "#/$defs/coverageStatus"
+        },
+        "coverage_reason": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "task_class": {
+          "$ref": "#/$defs/taskClass"
+        },
+        "actual_supply_id": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "shadow_supply_id": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "actual_est_cost_usd": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "shadow_est_cost_usd": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "policy_exposure": {
+          "$ref": "#/$defs/policyExposure"
+        }
+      }
+    },
+    "decisionCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_ref",
+        "coverage_status",
+        "coverage_reason"
+      ],
+      "properties": {
+        "decision_ref": {
+          "type": "string",
+          "minLength": 3
+        },
+        "coverage_status": {
+          "$ref": "#/$defs/coverageStatus"
+        },
+        "coverage_reason": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_coverage",
+        "decisions"
+      ],
+      "properties": {
+        "protocol_coverage": {
+          "$ref": "#/$defs/protocolCoverage"
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/decisionCoverage"
+          }
+        }
+      }
+    },
+    "protocolCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_inference_records",
+        "supported_records",
+        "unsupported_records",
+        "complete",
+        "by_protocol",
+        "by_source",
+        "by_status",
+        "by_reason"
+      ],
+      "properties": {
+        "total_inference_records": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "supported_records": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unsupported_records": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "by_protocol": {
+          "$ref": "#/$defs/countMap"
+        },
+        "by_source": {
+          "$ref": "#/$defs/countMap"
+        },
+        "by_status": {
+          "$ref": "#/$defs/countMap"
+        },
+        "by_reason": {
+          "$ref": "#/$defs/countMap"
+        }
+      }
+    },
+    "countMap": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/nonNegativeInteger"
+      }
+    },
+    "attributionCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "static_configured",
+        "attributed",
+        "missing",
+        "unknown_reference",
+        "ambiguous",
+        "model_mismatch"
+      ],
+      "properties": {
+        "static_configured": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "attributed": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "missing": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unknown_reference": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "ambiguous": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "model_mismatch": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      }
+    },
+    "attribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "by_observation_source"
+      ],
+      "properties": {
+        "by_observation_source": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/attributionCounts"
+          }
+        }
+      }
+    },
+    "dataIntegrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "accepted",
+        "recorded",
+        "dropped",
+        "missing_sequences",
+        "truncated",
+        "unmapped",
+        "unpriceable",
+        "recovery_issues",
+        "clean_shutdown"
+      ],
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "accepted": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "recorded": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "dropped": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "missing_sequences": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "truncated": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unmapped": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unpriceable": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "recovery_issues": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "clean_shutdown": {
+          "type": "boolean"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attribution_digest",
+        "owned_cost_digest",
+        "passive_profile_digest",
+        "passive_input_digest"
+      ],
+      "properties": {
+        "attribution_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "owned_cost_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "passive_profile_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "passive_input_digest": {
+          "$ref": "#/$defs/nullableDigest"
+        }
+      }
+    },
+    "numberCell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "confidence"
+      ],
+      "properties": {
+        "value": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        }
+      }
+    },
+    "stringCell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "confidence"
+      ],
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        }
+      }
+    },
+    "cellMap": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/numberCell"
+      }
+    },
+    "sovereignty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actual_by_class",
+        "shadow_by_class",
+        "sovereignty_ratio_actual",
+        "sovereignty_ratio_shadow"
+      ],
+      "properties": {
+        "actual_by_class": {
+          "$ref": "#/$defs/cellMap"
+        },
+        "shadow_by_class": {
+          "$ref": "#/$defs/cellMap"
+        },
+        "sovereignty_ratio_actual": {
+          "$ref": "#/$defs/numberCell"
+        },
+        "sovereignty_ratio_shadow": {
+          "$ref": "#/$defs/numberCell"
+        }
+      }
+    },
+    "counterfactual": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actual_cost_usd",
+        "shadow_cost_usd",
+        "all_frontier_cost_usd",
+        "savings_vs_all_frontier_usd",
+        "quality_parity",
+        "has_frontier_reference"
+      ],
+      "properties": {
+        "actual_cost_usd": {
+          "$ref": "#/$defs/numberCell"
+        },
+        "shadow_cost_usd": {
+          "$ref": "#/$defs/numberCell"
+        },
+        "all_frontier_cost_usd": {
+          "$ref": "#/$defs/numberCell"
+        },
+        "savings_vs_all_frontier_usd": {
+          "$ref": "#/$defs/numberCell"
+        },
+        "quality_parity": {
+          "$ref": "#/$defs/stringCell"
+        },
+        "has_frontier_reference": {
+          "type": "boolean"
+        }
+      }
+    },
+    "arbitrageRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_class",
+        "records",
+        "actual_cost_usd",
+        "cheapest_clearing_rented_usd",
+        "delta_usd"
+      ],
+      "properties": {
+        "task_class": {
+          "$ref": "#/$defs/taskClass"
+        },
+        "records": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "actual_cost_usd": {
+          "$ref": "#/$defs/numberCell"
+        },
+        "cheapest_clearing_rented_usd": {
+          "$ref": "#/$defs/numberCell"
+        },
+        "delta_usd": {
+          "$ref": "#/$defs/numberCell"
+        }
+      }
+    },
+    "shadowReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "provenance",
+        "data_integrity",
+        "protocol_coverage",
+        "attribution",
+        "generated_from_records",
+        "ledger_state",
+        "window",
+        "sovereignty",
+        "counterfactual",
+        "tier_arbitrage",
+        "policy_digests",
+        "unplaceable",
+        "unmapped_records",
+        "unpriced_records"
+      ],
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        },
+        "data_integrity": {
+          "$ref": "#/$defs/dataIntegrity"
+        },
+        "protocol_coverage": {
+          "$ref": "#/$defs/protocolCoverage"
+        },
+        "attribution": {
+          "$ref": "#/$defs/attribution"
+        },
+        "generated_from_records": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "ledger_state": {
+          "type": "string"
+        },
+        "window": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            {
+              "$ref": "#/$defs/nonNegativeInteger"
+            }
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "sovereignty": {
+          "$ref": "#/$defs/sovereignty"
+        },
+        "counterfactual": {
+          "$ref": "#/$defs/counterfactual"
+        },
+        "tier_arbitrage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/arbitrageRow"
+          }
+        },
+        "policy_digests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "unplaceable": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unmapped_records": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unpriced_records": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      }
+    }
+  }
+}

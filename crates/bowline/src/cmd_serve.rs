@@ -5,13 +5,13 @@ use std::{
 
 use anyhow::Context;
 use bowline_core::{
-    config::{load_owned_cost_catalog, redact_url, Config, OwnedCostCatalog},
+    config::{load_owned_cost_catalog, redact_url, Config, OwnedCostCatalog, StateBackendConfig},
     decision::QualityFloors,
     policy::PolicyBundle,
     supply::Registry,
 };
 use bowline_gateway::{
-    serve_with_shutdown,
+    serve_with_runtime_factory,
     writer::{spawn_managed_writer, ManagedWriterOptions},
     GatewayDeps,
 };
@@ -31,7 +31,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     config.attribution_resolver(&registry)?;
     let owned_costs = load_owned_costs(config.tco.as_deref(), &config.actual_supply_id, &registry)?;
     let attribution_digest = config.attribution_digest(&registry)?;
-    let writer = spawn_managed_writer(ManagedWriterOptions {
+    let writer_options = ManagedWriterOptions {
         directory: config.ledger_dir.clone(),
         policy_digest: policy.digest().to_string(),
         registry_digest,
@@ -42,29 +42,40 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         segment_bytes: config.runtime.ledger_segment_bytes,
         max_segments: config.runtime.ledger_max_segments,
         queue_capacity: config.runtime.writer_queue_capacity,
-    })?;
-    let deps = GatewayDeps::managed_with_provenance(
-        policy.clone(),
-        &registry_source,
-        config.floors.clone().unwrap_or_else(QualityFloors::default),
-        owned_costs,
-        writer.clone(),
-    )?;
+    };
 
     tracing_subscriber::fmt::try_init().ok();
-    print_startup_summary(&config, policy.digest(), &writer.health().snapshot().run_id);
 
-    let grace = config.runtime.shutdown_grace();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build gateway runtime")?
         .block_on(async move {
-            let serve_result = serve_with_shutdown(config, deps, shutdown_signal()).await;
-            let shutdown_result = writer.shutdown(grace).await;
-            serve_result?;
-            shutdown_result.context("failed to drain managed ledger writer")?;
-            Ok(())
+            let startup_config = config.clone();
+            serve_with_runtime_factory(
+                config,
+                move || {
+                    let writer = spawn_managed_writer(writer_options.clone())?;
+                    let deps = GatewayDeps::managed_with_provenance(
+                        policy.clone(),
+                        &registry_source,
+                        startup_config
+                            .floors
+                            .clone()
+                            .unwrap_or_else(QualityFloors::default),
+                        owned_costs.clone(),
+                        writer.clone(),
+                    )?;
+                    print_startup_summary(
+                        &startup_config,
+                        policy.digest(),
+                        &writer.health().snapshot().run_id,
+                    );
+                    Ok(deps)
+                },
+                shutdown_signal(),
+            )
+            .await
         })
 }
 
@@ -104,6 +115,9 @@ fn resolve_config_paths(config: &mut Config, config_path: &Path) {
         .enforcement
         .as_ref()
         .map(|path| resolve_path(base, path));
+    if let Some(StateBackendConfig::FileLease { path, .. }) = config.state_backend.as_mut() {
+        *path = resolve_path(base, path);
+    }
 }
 
 fn resolve_path(base: &Path, path: &Path) -> PathBuf {
@@ -176,5 +190,47 @@ async fn shutdown_signal() {
         if let Err(error) = tokio::signal::ctrl_c().await {
             eprintln!("failed to listen for Ctrl-C: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bowline_core::config::StateBackendConfig;
+
+    use super::*;
+
+    #[test]
+    fn relative_file_lease_path_resolves_from_config_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config").join("bowline.yaml");
+        let mut config = Config::from_yaml(
+            r#"
+listen: 127.0.0.1:3000
+upstream: http://127.0.0.1:11434
+actual_supply_id: local/test
+policy_bundle: policy.yaml
+registry_feed: registry.json
+ledger_dir: ledger
+state_backend:
+  version: 1
+  kind: file-lease
+  path: lease/active.lock
+  poll_interval_ms: 250
+  takeover_timeout_ms: 15000
+"#,
+        )
+        .unwrap();
+
+        resolve_config_paths(&mut config, &config_path);
+
+        assert_eq!(
+            config.state_backend,
+            Some(StateBackendConfig::FileLease {
+                version: 1,
+                path: root.path().join("config").join("lease").join("active.lock"),
+                poll_interval_ms: 250,
+                takeover_timeout_ms: 15_000,
+            })
+        );
     }
 }

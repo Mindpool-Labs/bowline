@@ -1,0 +1,42 @@
+{
+  "feed_version": "fixture-v1",
+  "entries": [
+    {
+      "id": "supply/actual",
+      "model": "SENTINEL-MODEL-ACTUAL",
+      "location": "fixture-public",
+      "attributes": {
+        "class": "public-api",
+        "jurisdiction": "us",
+        "retention": "days30",
+        "training_use": false,
+        "cloud_act_exposure": true
+      },
+      "price": {
+        "input_per_mtok_usd": 10.0,
+        "output_per_mtok_usd": 20.0
+      },
+      "ratings": {
+        "mechanical": 1.0
+      },
+      "available": true
+    },
+    {
+      "id": "supply/selected",
+      "model": "SENTINEL-MODEL-SELECTED",
+      "location": "fixture-owned",
+      "attributes": {
+        "class": "owned",
+        "jurisdiction": "local",
+        "retention": "none",
+        "training_use": false,
+        "cloud_act_exposure": false
+      },
+      "price": null,
+      "ratings": {
+        "mechanical": 1.0
+      },
+      "available": true
+    }
+  ]
+}

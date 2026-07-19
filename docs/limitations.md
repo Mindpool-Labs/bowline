@@ -28,7 +28,14 @@
 - Profile pointer vocabulary blocks known sensitive/content names, but an emitter can alias a
   secret under an innocuous field name. Operators must review emitter configuration and profiles.
 - One deployment is one enterprise security domain; dimensions are not isolation boundaries.
-- Single replica/single writer: no active-active availability or shared-writer deployment.
+- The optional file-lease backend provides active-passive supervision only when every replica
+  participates in one reliable POSIX lock domain and shares one evidence root. The supported
+  example is two processes or containers on one host. Multi-host and NFS deployments are not
+  claimed, even if a particular filesystem advertises advisory locking.
+- File-lease failover does not provide active-active serving, state replication, forced lock
+  stealing, or shared concurrent writers. A paused holder that retains the OS lock blocks
+  takeover. The new active starts a fresh run with startup-open circuit and admission state; a
+  killed active leaves its prior run incomplete.
 - Workload identity policy only: no prompt/response content classification or blocking.
 - No DLP claim. The exact scope is documented in [security](security.md).
 - Accounting depends on upstream model/usage fields; estimates, missing usage, aliases, truncation,
@@ -73,8 +80,8 @@
 - Candidate traffic has zero-or-one dispatch. There is no redirect following, completion retry, or
   original-upstream fallback after a candidate attempt. This avoids Bowline-originated duplicate
   attempts but cannot prove whether an ambiguous remote transport executed.
-- Circuit and admission state is volatile and local to one process. It is not coordinated between
-  replicas and resets startup-open.
+- Circuit and admission state is volatile and local to each activation. It is not replicated and
+  resets startup-open after process restart or file-lease takeover.
 - Promotion inputs, the local authorization seal, kill state, and configuration are
   operator-controlled checksummed evidence, not third-party attestations. Arming and organizational
   approval remain external.

@@ -38,10 +38,26 @@ pub struct Config {
     pub floors: Option<QualityFloors>,
     #[serde(default)]
     pub enforcement: Option<PathBuf>,
+    #[serde(default)]
+    pub state_backend: Option<StateBackendConfig>,
     #[serde(default = "default_trusted_proxy_cidrs")]
     pub trusted_proxy_cidrs: Vec<IpNet>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum StateBackendConfig {
+    Local {
+        version: u32,
+    },
+    FileLease {
+        version: u32,
+        path: PathBuf,
+        poll_interval_ms: u64,
+        takeover_timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +358,40 @@ impl Config {
                 "enforcement",
                 "must name an enforcement bundle when present",
             ));
+        }
+        if let Some(state_backend) = self.state_backend.as_ref() {
+            let version = match state_backend {
+                StateBackendConfig::Local { version }
+                | StateBackendConfig::FileLease { version, .. } => *version,
+            };
+            if version != 1 {
+                return Err(ConfigError::invalid(
+                    "state_backend.version",
+                    "must equal 1",
+                ));
+            }
+            if let StateBackendConfig::FileLease {
+                path,
+                poll_interval_ms,
+                takeover_timeout_ms,
+                ..
+            } = state_backend
+            {
+                if path.as_os_str().is_empty() {
+                    return Err(ConfigError::invalid(
+                        "state_backend.path",
+                        "must name a lease file",
+                    ));
+                }
+                validate_positive("state_backend.poll_interval_ms", *poll_interval_ms)?;
+                validate_positive("state_backend.takeover_timeout_ms", *takeover_timeout_ms)?;
+                if takeover_timeout_ms < poll_interval_ms {
+                    return Err(ConfigError::invalid(
+                        "state_backend.takeover_timeout_ms",
+                        "must be greater than or equal to poll_interval_ms",
+                    ));
+                }
+            }
         }
         self.runtime.validate()
     }

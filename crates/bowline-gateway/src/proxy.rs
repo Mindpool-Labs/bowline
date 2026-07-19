@@ -5,8 +5,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -26,7 +26,7 @@ use bowline_core::{
     },
     config::{
         endpoint_identity, load_owned_cost_catalog, Config, InlineAttributionConfig,
-        OwnedCostCatalog, RuntimeConfig,
+        OwnedCostCatalog, RuntimeConfig, StateBackendConfig,
     },
     decision::{decide, Decision, QualityFloors},
     enforcement::{
@@ -189,16 +189,101 @@ pub struct GatewayState {
     client: reqwest::Client,
     upstream_base: String,
     upstream_identity: String,
+    trusted_proxy_cidrs: Vec<ipnet::IpNet>,
+    response_header_timeout: std::time::Duration,
+    stream_idle_timeout: std::time::Duration,
+    accounting_limit_bytes: usize,
+    controlled_configured: bool,
+    serving_status: Option<crate::supervisor::ServingStatus>,
+    runtime: Arc<RwLock<Option<Arc<GatewayRuntime>>>>,
+}
+
+struct GatewayRuntime {
     recording: Option<Arc<RecordingDeps>>,
     health: Option<GatewayHealth>,
     attribution_resolver: Option<Arc<AttributionResolver>>,
     attribution_header: Option<HeaderName>,
     attribution_namespace: Option<String>,
-    trusted_proxy_cidrs: Vec<ipnet::IpNet>,
-    response_header_timeout: std::time::Duration,
-    stream_idle_timeout: std::time::Duration,
-    accounting_limit_bytes: usize,
     enforcement: Option<Arc<EnforcementRuntime>>,
+    admission: Arc<RuntimeAdmission>,
+}
+
+#[derive(Default)]
+struct RuntimeAdmission {
+    accepting: AtomicBool,
+    in_flight: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+struct RuntimeAdmissionGuard {
+    admission: Arc<RuntimeAdmission>,
+}
+
+struct AdmissionStream<S> {
+    inner: Pin<Box<S>>,
+    _guard: RuntimeAdmissionGuard,
+}
+
+impl<S> Stream for AdmissionStream<S>
+where
+    S: Stream,
+{
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
+}
+
+impl RuntimeAdmission {
+    fn active() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            in_flight: AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn try_admit(self: &Arc<Self>) -> Option<RuntimeAdmissionGuard> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        if !self.accepting.load(Ordering::Acquire) {
+            if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.idle.notify_waiters();
+            }
+            return None;
+        }
+        Some(RuntimeAdmissionGuard {
+            admission: Arc::clone(self),
+        })
+    }
+
+    fn stop(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let notified = self.idle.notified();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for RuntimeAdmissionGuard {
+    fn drop(&mut self) {
+        if self.admission.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.admission.idle.notify_waiters();
+        }
+    }
 }
 
 struct EnforcementRuntime {
@@ -279,6 +364,30 @@ enum RecordingWriter {
     Managed(ManagedWriter),
 }
 
+fn managed_recording_writer(deps: &GatewayDeps) -> Option<ManagedWriter> {
+    deps.recording
+        .as_ref()
+        .and_then(|recording| match &recording.writer {
+            RecordingWriter::Managed(writer) => Some(writer.clone()),
+            RecordingWriter::Legacy(_) => None,
+        })
+}
+
+async fn cleanup_failed_activation(
+    writer: Option<ManagedWriter>,
+    grace: Duration,
+) -> anyhow::Result<()> {
+    let Some(writer) = writer else {
+        return Ok(());
+    };
+    let run = writer.health().run().clone();
+    run.set_writer_error("activation-failed");
+    let flush_result = run.flush();
+    let shutdown_result = writer.shutdown(grace).await;
+    flush_result.context("failed to persist activation failure")?;
+    shutdown_result.context("failed to close partial activation writer")
+}
+
 impl GatewayState {
     pub fn new(upstream_base: impl Into<String>, deps: GatewayDeps) -> Self {
         let runtime = RuntimeConfig::default();
@@ -286,34 +395,199 @@ impl GatewayState {
             ipnet::IpNet::from(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             ipnet::IpNet::from(IpAddr::V6(Ipv6Addr::LOCALHOST)),
         ];
-        Self::build(
+        let state = Self::build_base(
             upstream_base.into(),
-            None,
-            None,
             trusted_proxy_cidrs,
             &runtime,
-            deps,
+            false,
+            false,
         )
-        .expect("default reqwest client configuration is valid")
+        .expect("default reqwest client configuration is valid");
+        let active = GatewayRuntime::build(None, None, deps)
+            .expect("default gateway dependencies are valid");
+        state.replace_runtime(Some(Arc::new(active)));
+        state
     }
 
     pub fn from_config(config: &Config, deps: GatewayDeps) -> anyhow::Result<Self> {
-        Self::build(
+        let state = Self::build_base(
             config.upstream.clone(),
-            Some(config.actual_supply_id.clone()),
-            config.attribution.clone(),
             config.trusted_proxy_cidrs.clone(),
             &config.runtime,
+            config.enforcement.is_some(),
+            matches!(
+                config.state_backend.as_ref(),
+                Some(StateBackendConfig::FileLease { .. })
+            ),
+        )?;
+        let active = GatewayRuntime::build(
+            Some(config.actual_supply_id.clone()),
+            config.attribution.clone(),
             deps,
+        )?;
+        state.replace_runtime(Some(Arc::new(active)));
+        Ok(state)
+    }
+
+    pub fn standby(config: &Config) -> anyhow::Result<Self> {
+        Self::build_base(
+            config.upstream.clone(),
+            config.trusted_proxy_cidrs.clone(),
+            &config.runtime,
+            config.enforcement.is_some(),
+            matches!(
+                config.state_backend.as_ref(),
+                Some(StateBackendConfig::FileLease { .. })
+            ),
         )
     }
 
-    fn build(
+    fn build_base(
         upstream_base: String,
-        actual_supply_id: Option<String>,
-        attribution_config: Option<InlineAttributionConfig>,
         trusted_proxy_cidrs: Vec<ipnet::IpNet>,
         runtime: &RuntimeConfig,
+        controlled_configured: bool,
+        file_lease_mode: bool,
+    ) -> anyhow::Result<Self> {
+        let upstream_identity = endpoint_identity(&upstream_base);
+        Ok(Self {
+            // Invariant: reqwest has no compression features, so bytes pass through verbatim; do not add gzip/brotli features.
+            client: reqwest::Client::builder()
+                .connect_timeout(runtime.connect_timeout())
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .context("failed to build upstream HTTP client")?,
+            upstream_base: upstream_base.trim_end_matches('/').to_string(),
+            upstream_identity,
+            trusted_proxy_cidrs,
+            response_header_timeout: runtime.response_header_timeout(),
+            stream_idle_timeout: runtime.stream_idle_timeout(),
+            accounting_limit_bytes: runtime.accounting_limit_bytes,
+            controlled_configured,
+            serving_status: file_lease_mode.then(crate::supervisor::ServingStatus::standby),
+            runtime: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    fn replace_runtime(&self, runtime: Option<Arc<GatewayRuntime>>) {
+        *self
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime;
+    }
+
+    fn active_runtime(&self) -> Option<Arc<GatewayRuntime>> {
+        self.runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn has_active_runtime(&self) -> bool {
+        self.runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    pub(crate) fn active_run_id(&self) -> Option<String> {
+        self.active_runtime().and_then(|runtime| runtime.run_id())
+    }
+
+    pub(crate) fn set_serving_state(&self, state: crate::supervisor::ServingState) {
+        if let Some(status) = &self.serving_status {
+            status.set_state(state);
+        }
+    }
+
+    pub(crate) fn activation_failed(&self) {
+        if let Some(status) = &self.serving_status {
+            status.activation_failed();
+        }
+    }
+
+    fn serving_status_snapshot(&self) -> Option<crate::supervisor::ServingStatusSnapshot> {
+        self.serving_status
+            .as_ref()
+            .map(crate::supervisor::ServingStatus::snapshot)
+    }
+
+    #[cfg(test)]
+    fn set_health_for_test(&self, health: GatewayHealth) {
+        let mut runtime = self
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::get_mut(runtime.as_mut().expect("test runtime is active"))
+            .expect("test runtime is not shared")
+            .health = Some(health);
+    }
+
+    pub(crate) async fn activate_runtime(
+        &self,
+        config: &Config,
+        deps: GatewayDeps,
+    ) -> anyhow::Result<()> {
+        if self.has_active_runtime() {
+            anyhow::bail!("gateway runtime is already active");
+        }
+        let cleanup_writer = managed_recording_writer(&deps);
+        let deps = match prepare_runtime_deps(config, deps) {
+            Ok(deps) => deps,
+            Err(error) => {
+                cleanup_failed_activation(cleanup_writer, config.runtime.shutdown_grace())
+                    .await
+                    .with_context(|| format!("activation cleanup failed after: {error}"))?;
+                return Err(error);
+            }
+        };
+        let cleanup_writer = cleanup_writer.or_else(|| managed_recording_writer(&deps));
+        let runtime = match GatewayRuntime::build(
+            Some(config.actual_supply_id.clone()),
+            config.attribution.clone(),
+            deps,
+        ) {
+            Ok(runtime) => Arc::new(runtime),
+            Err(error) => {
+                cleanup_failed_activation(cleanup_writer, config.runtime.shutdown_grace())
+                    .await
+                    .with_context(|| format!("activation cleanup failed after: {error}"))?;
+                return Err(error);
+            }
+        };
+        if let Some(enforcement) = runtime.enforcement.as_deref() {
+            run_startup_authority_probes(enforcement).await;
+        }
+        self.replace_runtime(Some(runtime));
+        Ok(())
+    }
+
+    pub(crate) async fn deactivate_runtime(&self, grace: Duration) -> anyhow::Result<()> {
+        let runtime = self
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(runtime) = runtime {
+            runtime.shutdown(grace).await?;
+        }
+        Ok(())
+    }
+
+    pub fn router(self) -> Router {
+        Router::new()
+            .route("/health/live", get(health_live))
+            .route("/health/ready", get(health_ready))
+            .route("/health/status", get(health_status))
+            .fallback(any(proxy_handler))
+            .with_state(self)
+    }
+}
+
+impl GatewayRuntime {
+    fn build(
+        actual_supply_id: Option<String>,
+        attribution_config: Option<InlineAttributionConfig>,
         deps: GatewayDeps,
     ) -> anyhow::Result<Self> {
         let attribution_header = attribution_config
@@ -341,7 +615,6 @@ impl GatewayState {
                     .map(Arc::new)
             })
             .transpose()?;
-        let upstream_identity = endpoint_identity(&upstream_base);
         let health = deps
             .recording
             .as_ref()
@@ -350,39 +623,59 @@ impl GatewayState {
                 RecordingWriter::Legacy(_) => None,
             });
         Ok(Self {
-            // Invariant: reqwest has no compression features, so bytes pass through verbatim; do not add gzip/brotli features.
-            client: reqwest::Client::builder()
-                .connect_timeout(runtime.connect_timeout())
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .context("failed to build upstream HTTP client")?,
-            upstream_base: upstream_base.trim_end_matches('/').to_string(),
-            upstream_identity,
             recording: deps.recording,
             health,
             attribution_resolver,
             attribution_header,
             attribution_namespace,
-            trusted_proxy_cidrs,
-            response_header_timeout: runtime.response_header_timeout(),
-            stream_idle_timeout: runtime.stream_idle_timeout(),
-            accounting_limit_bytes: runtime.accounting_limit_bytes,
             enforcement: deps.enforcement,
+            admission: Arc::new(RuntimeAdmission::active()),
         })
     }
 
-    pub fn router(self) -> Router {
-        Router::new()
-            .route("/health/live", get(health_live))
-            .route("/health/ready", get(health_ready))
-            .route("/health/status", get(health_status))
-            .fallback(any(proxy_handler))
-            .with_state(self)
+    fn run_id(&self) -> Option<String> {
+        self.health.as_ref().map(|health| health.snapshot().run_id)
+    }
+
+    fn try_admit(&self) -> Option<RuntimeAdmissionGuard> {
+        self.admission.try_admit()
+    }
+
+    async fn shutdown(&self, grace: Duration) -> anyhow::Result<()> {
+        self.admission.stop();
+        tokio::time::timeout(grace, self.admission.wait_idle())
+            .await
+            .context("gateway request drain exceeded shutdown grace")?;
+        if let Some(enforcement) = self.enforcement.as_deref() {
+            enforcement.kill_reader.shutdown();
+            tokio::time::timeout(grace, enforcement.terminal_tracker.wait_idle())
+                .await
+                .context("authority terminal drain exceeded shutdown grace")?;
+            enforcement
+                .writer
+                .shutdown(grace)
+                .await
+                .context("failed to close authority evidence writer")?;
+        }
+        if let Some(RecordingWriter::Managed(writer)) =
+            self.recording.as_ref().map(|recording| &recording.writer)
+        {
+            writer
+                .shutdown(grace)
+                .await
+                .context("failed to drain managed ledger writer")?;
+        }
+        Ok(())
     }
 }
 
 async fn health_live(State(state): State<GatewayState>) -> Response<Body> {
-    let mode = if state.enforcement.is_some() {
+    let runtime = state.active_runtime();
+    let mode = if runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.enforcement.is_some())
+        || state.controlled_configured
+    {
         "controlled"
     } else {
         "shadow"
@@ -394,57 +687,71 @@ async fn health_live(State(state): State<GatewayState>) -> Response<Body> {
 }
 
 async fn health_ready(State(state): State<GatewayState>) -> Response<Body> {
-    let enforcement = match state.enforcement.as_deref() {
+    let runtime = state.active_runtime();
+    let enforcement = match runtime
+        .as_ref()
+        .and_then(|runtime| runtime.enforcement.as_deref())
+    {
         Some(runtime) => Some(public_enforcement_health(runtime).await),
         None => None,
     };
-    let ready = state
-        .health
+    let ready = runtime
         .as_ref()
+        .and_then(|runtime| runtime.health.as_ref())
         .is_some_and(|health| match &enforcement {
             Some(enforcement) => health.controlled_snapshot(enforcement).ready,
             None => health.snapshot().ready,
         });
-    let mode = if enforcement.is_some() {
+    let mode = if enforcement.is_some() || state.controlled_configured {
         "controlled"
     } else {
         "shadow"
     };
+    let mut value = serde_json::json!({ "mode": mode, "ready": ready });
+    if let Some(serving) = state.serving_status_snapshot() {
+        if !ready {
+            value["reason"] =
+                serde_json::Value::String(serving.state.rejection_reason().to_string());
+        }
+    }
     json_response(
         if ready {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
-        serde_json::json!({ "mode": mode, "ready": ready }),
+        value,
     )
 }
 
 async fn health_status(State(state): State<GatewayState>) -> Response<Body> {
-    let enforcement = match state.enforcement.as_deref() {
+    let runtime = state.active_runtime();
+    let enforcement = match runtime
+        .as_ref()
+        .and_then(|runtime| runtime.enforcement.as_deref())
+    {
         Some(runtime) => Some(public_enforcement_health(runtime).await),
         None => None,
     };
-    match state.health {
-        Some(health) => {
-            let value = match &enforcement {
-                Some(enforcement) => serde_json::to_value(health.controlled_snapshot(enforcement)),
-                None => serde_json::to_value(health.snapshot()),
-            };
-            json_response(
-                StatusCode::OK,
-                value.unwrap_or_else(|_| serde_json::json!({ "mode": "shadow", "ready": false })),
-            )
+    let mut value = match runtime.and_then(|runtime| runtime.health.clone()) {
+        Some(health) => match &enforcement {
+            Some(enforcement) => serde_json::to_value(health.controlled_snapshot(enforcement)),
+            None => serde_json::to_value(health.snapshot()),
         }
-        None => json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "mode": "shadow",
-                "ready": false,
-                "reason": "durable recording is not configured"
-            }),
-        ),
+        .unwrap_or_else(|_| serde_json::json!({ "mode": "shadow", "ready": false })),
+        None => serde_json::json!({
+            "mode": if state.controlled_configured { "controlled" } else { "shadow" },
+            "ready": false,
+            "reason": "durable recording is not configured"
+        }),
+    };
+    if let Some(serving) = state.serving_status_snapshot() {
+        value["serving_state"] = serde_json::Value::String(serving.state.as_str().to_string());
+        if let Some(reason) = serving.last_activation_reason {
+            value["last_activation_reason"] = serde_json::Value::String(reason.to_string());
+        }
     }
+    json_response(StatusCode::OK, value)
 }
 
 async fn public_enforcement_health(runtime: &EnforcementRuntime) -> PublicEnforcementHealth {
@@ -525,10 +832,163 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let mut deps = Some(deps);
+    serve_with_runtime_factory(
+        config,
+        move || {
+            deps.take()
+                .context("injected gateway dependencies cannot be reactivated")
+        },
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_with_runtime_factory<D, F>(
+    config: Config,
+    factory: D,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    D: FnMut() -> anyhow::Result<GatewayDeps> + Send,
+    F: Future<Output = ()> + Send + 'static,
+{
+    match config.state_backend.clone() {
+        Some(StateBackendConfig::FileLease {
+            path,
+            poll_interval_ms,
+            takeover_timeout_ms,
+            ..
+        }) => {
+            let lease = crate::serving_lease::FileServingLease::open(&path)?;
+            serve_with_file_lease(
+                config,
+                factory,
+                shutdown,
+                lease,
+                Duration::from_millis(poll_interval_ms),
+                Duration::from_millis(takeover_timeout_ms),
+            )
+            .await
+        }
+        None | Some(StateBackendConfig::Local { .. }) => {
+            serve_with_local_lease(config, factory, shutdown).await
+        }
+    }
+}
+
+async fn serve_with_local_lease<D, F>(
+    config: Config,
+    mut factory: D,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    D: FnMut() -> anyhow::Result<GatewayDeps> + Send,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let shutdown_grace = config.runtime.shutdown_grace();
+    let mut supervisor = crate::supervisor::GatewaySupervisor::new(
+        config.clone(),
+        crate::serving_lease::LocalServingLease,
+    )?;
+    supervisor.activate(&mut factory).await?;
+    let listener = match TcpListener::bind(&config.listen).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            supervisor.deactivate(shutdown_grace).await?;
+            return Err(error)
+                .with_context(|| format!("failed to bind gateway listener {}", config.listen));
+        }
+    };
+    let serve_result = axum::serve(
+        listener,
+        supervisor
+            .router()
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("gateway server failed");
+    supervisor.deactivate(shutdown_grace).await?;
+    serve_result
+}
+
+async fn serve_with_file_lease<D, F>(
+    config: Config,
+    mut factory: D,
+    shutdown: F,
+    lease: crate::serving_lease::FileServingLease,
+    poll_interval: Duration,
+    takeover_timeout: Duration,
+) -> anyhow::Result<()>
+where
+    D: FnMut() -> anyhow::Result<GatewayDeps> + Send,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let shutdown_grace = config.runtime.shutdown_grace();
+    let mut supervisor = crate::supervisor::GatewaySupervisor::new(config.clone(), lease)?;
+    let listener = TcpListener::bind(&config.listen)
+        .await
+        .with_context(|| format!("failed to bind gateway listener {}", config.listen))?;
+    let router = supervisor.router();
+    let (server_started_tx, server_started_rx) = tokio::sync::oneshot::channel();
+    let mut server = tokio::spawn(async move {
+        let server = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown);
+        let _ = server_started_tx.send(());
+        server.await.context("gateway server failed")
+    });
+    server_started_rx
+        .await
+        .context("gateway server task exited before startup")?;
+    let mut standby_since = tokio::time::Instant::now();
+    let mut takeover_alerted = false;
+    if let Err(error) = supervisor.reconcile(&mut factory, shutdown_grace).await {
+        tracing::warn!(error = %error, "gateway activation failed; remaining in standby");
+    }
+
+    loop {
+        tokio::select! {
+            result = &mut server => {
+                let server_result = match result {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::Error::from(error)
+                        .context("gateway server task failed")),
+                };
+                supervisor.deactivate(shutdown_grace).await?;
+                return server_result;
+            }
+            _ = tokio::time::sleep(poll_interval) => {
+                let was_active = supervisor.is_active();
+                if let Err(error) = supervisor.reconcile(&mut factory, shutdown_grace).await {
+                    if was_active {
+                        return Err(error).context("gateway deactivation failed after serving lease loss");
+                    }
+                    tracing::warn!(error = %error, "gateway activation failed; remaining in standby");
+                }
+                if supervisor.is_active() {
+                    standby_since = tokio::time::Instant::now();
+                    takeover_alerted = false;
+                } else if !takeover_alerted && standby_since.elapsed() >= takeover_timeout {
+                    tracing::warn!(
+                        timeout_ms = takeover_timeout.as_millis(),
+                        "serving lease has remained unavailable beyond the takeover alert boundary"
+                    );
+                    takeover_alerted = true;
+                }
+            }
+        }
+    }
+}
+
+fn prepare_runtime_deps(config: &Config, deps: GatewayDeps) -> anyhow::Result<GatewayDeps> {
     let mut deps = if deps.recording.is_some() {
         deps
     } else {
-        deps_from_config(&config)?
+        deps_from_config(config)?
     };
     if deps.enforcement.is_none() {
         if let Some(path) = config.enforcement.as_deref() {
@@ -553,41 +1013,11 @@ where
                     "configured enforcement requires active provenance from the exact loaded policy, registry source, and owned costs",
                 )?;
             deps.enforcement = Some(Arc::new(load_enforcement_runtime(
-                &config, path, &registry, active,
+                config, path, &registry, active,
             )?));
         }
     }
-    let state = GatewayState::from_config(&config, deps)?;
-    let enforcement = state.enforcement.clone();
-    if let Some(runtime) = enforcement.as_deref() {
-        run_startup_authority_probes(runtime).await;
-    }
-    let listener = TcpListener::bind(&config.listen)
-        .await
-        .with_context(|| format!("failed to bind gateway listener {}", config.listen))?;
-    let shutdown_grace = config.runtime.shutdown_grace();
-
-    let serve_result = axum::serve(
-        listener,
-        state
-            .router()
-            .into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
-    .context("gateway server failed");
-    if let Some(enforcement) = enforcement {
-        enforcement.kill_reader.shutdown();
-        tokio::time::timeout(shutdown_grace, enforcement.terminal_tracker.wait_idle())
-            .await
-            .context("authority terminal drain exceeded shutdown grace")?;
-        enforcement
-            .writer
-            .shutdown(shutdown_grace)
-            .await
-            .context("failed to close authority evidence writer")?;
-    }
-    serve_result
+    Ok(deps)
 }
 
 async fn proxy_handler(
@@ -595,6 +1025,26 @@ async fn proxy_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: Method,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    request: Request<Body>,
+) -> Response<Body> {
+    let Some(runtime) = state.active_runtime() else {
+        return serving_unavailable_response(&state);
+    };
+    let Some(admission) = runtime.try_admit() else {
+        return serving_unavailable_response(&state);
+    };
+    let response =
+        proxy_admitted_handler(state, runtime, peer, method, uri, headers, request).await;
+    hold_admission_until_body_complete(response, admission)
+}
+
+async fn proxy_admitted_handler(
+    state: GatewayState,
+    runtime: Arc<GatewayRuntime>,
+    peer: SocketAddr,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Response<Body> {
@@ -612,7 +1062,7 @@ async fn proxy_handler(
     let resolved_context = protocol
         .and_then(authority_protocol)
         .and_then(|authority_protocol| {
-            state.recording.as_ref().map(|recording| {
+            runtime.recording.as_ref().map(|recording| {
                 resolve_request_context(
                     &recording.policy,
                     &headers,
@@ -625,6 +1075,7 @@ async fn proxy_handler(
     let mut pending_shadow = protocol.and_then(|protocol| {
         prepare_shadow(
             &state,
+            &runtime,
             Some(peer.ip()),
             &headers,
             &path,
@@ -637,6 +1088,7 @@ async fn proxy_handler(
 
     if let Some(response) = controlled_enforcement_response(
         &state,
+        &runtime,
         &method,
         &uri,
         &headers,
@@ -694,9 +1146,22 @@ async fn proxy_handler(
     response_from_upstream(upstream_response, pending_shadow, state.stream_idle_timeout)
 }
 
+fn hold_admission_until_body_complete(
+    response: Response<Body>,
+    guard: RuntimeAdmissionGuard,
+) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+    let stream = AdmissionStream {
+        inner: Box::pin(body.into_data_stream()),
+        _guard: guard,
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn controlled_enforcement_response(
     state: &GatewayState,
+    gateway_runtime: &Arc<GatewayRuntime>,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -705,7 +1170,7 @@ async fn controlled_enforcement_response(
     request_context: Option<&ResolvedRequestContext>,
     pending_shadow: &mut Option<PendingShadow>,
 ) -> Option<Response<Body>> {
-    let runtime = Arc::clone(state.enforcement.as_ref()?);
+    let runtime = Arc::clone(gateway_runtime.enforcement.as_ref()?);
     let protocol = authority_protocol(protocol?)?;
     let route = runtime
         .validated
@@ -717,7 +1182,7 @@ async fn controlled_enforcement_response(
                 && runtime.route_ids.iter().any(|id| id == &route.route_id)
         })?
         .clone();
-    let recording = state.recording.as_ref()?;
+    let recording = gateway_runtime.recording.as_ref()?;
     let request_context = request_context?;
     let request_facts = parse_request(protocol_to_traffic(protocol), body);
     let request_body_digest: [u8; 32] = Sha256::digest(body).into();
@@ -1510,6 +1975,16 @@ fn evidence_unavailable_response() -> Response<Body> {
     )
 }
 
+fn serving_unavailable_response(state: &GatewayState) -> Response<Body> {
+    match state.serving_status_snapshot() {
+        Some(serving) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": {"code": serving.state.rejection_reason()}}),
+        ),
+        None => status_response(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
 fn fail_closed_response() -> Response<Body> {
     json_response(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1554,6 +2029,7 @@ fn finalize_failed_shadow(
 #[allow(clippy::too_many_arguments)]
 fn prepare_shadow(
     state: &GatewayState,
+    runtime: &GatewayRuntime,
     peer_ip: Option<IpAddr>,
     headers: &HeaderMap,
     path: &str,
@@ -1562,7 +2038,7 @@ fn prepare_shadow(
     protocol: ProtocolKind,
     resolved_context: Option<&ResolvedRequestContext>,
 ) -> Option<PendingShadow> {
-    let recording = Arc::clone(state.recording.as_ref()?);
+    let recording = Arc::clone(runtime.recording.as_ref()?);
     let trusted = peer_ip.is_some_and(|ip| {
         state
             .trusted_proxy_cidrs
@@ -1626,9 +2102,9 @@ fn prepare_shadow(
         started_at,
         response_status: 0,
         upstream: state.upstream_identity.clone(),
-        attribution_resolver: state.attribution_resolver.clone(),
-        attribution_header: state.attribution_header.clone(),
-        attribution_namespace: state.attribution_namespace.clone(),
+        attribution_resolver: runtime.attribution_resolver.clone(),
+        attribution_header: runtime.attribution_header.clone(),
+        attribution_namespace: runtime.attribution_namespace.clone(),
         attribution_input: AttributionInput::Absent,
         record_context,
         accounting_limit_bytes: state.accounting_limit_bytes,
@@ -2603,6 +3079,7 @@ rules:
             attribution: None,
             floors: None,
             enforcement: Some(root.path().join("enforcement.yaml")),
+            state_backend: None,
             trusted_proxy_cidrs: vec![],
             runtime: RuntimeConfig::default(),
         };
@@ -2989,8 +3466,8 @@ rules:
             )
             .unwrap(),
         );
-        let mut gateway_state = GatewayState::new(format!("http://{upstream_addr}"), deps);
-        gateway_state.health = Some(GatewayHealth::new(health_run, 8));
+        let gateway_state = GatewayState::new(format!("http://{upstream_addr}"), deps);
+        gateway_state.set_health_for_test(GatewayHealth::new(health_run, 8));
         let gateway = gateway_state.router();
         let gateway_task = tokio::spawn(async move {
             axum::serve(

@@ -14,6 +14,16 @@ attribution:
 trusted_proxy_cidrs:
   - 127.0.0.0/8
   - ::1/128
+state_backend:
+  version: 1
+  kind: local
+# Active-passive alternative for replicas in one reliable POSIX lock domain:
+# state_backend:
+#   version: 1
+#   kind: file-lease
+#   path: /var/lib/bowline/lease/active.lock
+#   poll_interval_ms: 250
+#   takeover_timeout_ms: 15000
 runtime:
   connect_timeout_ms: 2000
   response_header_timeout_ms: 300000

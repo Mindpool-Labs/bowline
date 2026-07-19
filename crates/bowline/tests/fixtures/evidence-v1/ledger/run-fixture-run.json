@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-run",
+  "started_at_ms": 1783785600000,
+  "ended_at_ms": 1783785600500,
+  "clean_shutdown": true,
+  "policy_digest": "sha256:a3c5fff3be2d9719c69d6fa39d442b5e7b3a72de25758f103370e60fed25508a",
+  "registry_digest": "sha256:63a333765724db535d540cb7bd7a826f535adc28dc0bba1da74755ecbb6e8924",
+  "attribution_digest": "sha256:d403a0eabbd0ddf4411daac899ac3433624e94bd8c22bceab49fc3ed0c7e1899",
+  "owned_cost_digest": "sha256:d1b85cd9356951338c1e45e44e7bf56df3f983fa5ba4803ff3f20a469c30fca2",
+  "passive_profile_digest": null,
+  "passive_input_digest": null,
+  "accepted": 1,
+  "recorded": 1,
+  "dropped": 0,
+  "truncated": 0,
+  "unmapped": 0,
+  "unpriceable": 0,
+  "untrusted_identity_headers": 0,
+  "next_sequence": 2,
+  "writer_healthy": true,
+  "writer_error": null,
+  "last_flush_at_ms": 1783785600500,
+  "segment_bytes": 65536,
+  "max_segments": 8,
+  "segments": [
+    "run-fixture-run-000000.bwl"
+  ],
+  "segment_inventory": [
+    {
+      "name": "run-fixture-run-000000.bwl",
+      "bytes": 1087,
+      "records": 1,
+      "first_sequence": 1,
+      "last_sequence": 1,
+      "digest": "sha256:e8c152508aadebfc6a4b2cf9430838e1cbeef0a2062537bd17275a3e9e776970"
+    }
+  ],
+  "records_digest": "sha256:d66abc2fdaf367789ba8fc5dca62ce89fd0c4f0882f6ce50b78427a6bdcbe635"
+}
