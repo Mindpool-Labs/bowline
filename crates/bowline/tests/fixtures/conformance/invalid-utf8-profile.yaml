@@ -1,0 +1,8 @@
+version: 1
+kind: bad-ÿutf8
+source_contract: test-v1
+timestamp_unit: milliseconds
+fields:
+  event_id: /request_id
+constants:
+  method: POST

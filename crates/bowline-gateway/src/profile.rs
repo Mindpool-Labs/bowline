@@ -11,7 +11,7 @@ use crate::passive::{
     MAX_LINE_BYTES,
 };
 
-const MAX_PROFILE_BYTES: usize = 256 * 1024;
+pub const MAX_PROFILE_BYTES: usize = 256 * 1024;
 const MAX_PROFILE_STRING_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
