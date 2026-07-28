@@ -1,6 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Read,
+    fs,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -15,13 +14,13 @@ use bowline_core::{
 };
 use bowline_gateway::{
     passive::{normalize_passive_event, PassiveNormalizationContext, MAX_INPUT_BYTES},
-    profile::{transform_profile_jsonl, TransformProfile},
+    profile::{transform_profile_jsonl, TransformProfile, MAX_PROFILE_BYTES},
     writer::{spawn_managed_writer, ManagedWriterOptions},
 };
 use clap::{Args as ClapArgs, Subcommand};
 use sha2::{Digest, Sha256};
 
-const MAX_PROFILE_BYTES: usize = 256 * 1024;
+use crate::safe_path;
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
@@ -188,40 +187,21 @@ fn import_observations(args: ObservationArgs) -> anyhow::Result<ExitCode> {
 }
 
 fn read_bounded(path: &Path, max: usize, label: &str) -> anyhow::Result<Vec<u8>> {
-    let file = open_regular_file(path, label)?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        anyhow::bail!("{label} must be a regular file");
-    }
-    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max.saturating_add(1)));
-    file.take(max as u64 + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {label} {}", path.display()))?;
-    if bytes.len() > max {
-        anyhow::bail!("{label} exceeds {max} bytes");
-    }
-    Ok(bytes)
-}
-
-#[cfg(unix)]
-fn open_regular_file(path: &Path, label: &str) -> anyhow::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .with_context(|| format!("failed to open {label} {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn open_regular_file(path: &Path, label: &str) -> anyhow::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .open(path)
-        .with_context(|| format!("failed to open {label} {}", path.display()))
+    safe_path::read_bounded_bytes(path, max).map_err(|failure| match failure {
+        safe_path::BoundedReadFailure::Open(error) => {
+            anyhow::Error::new(error).context(format!("failed to open {label} {}", path.display()))
+        }
+        safe_path::BoundedReadFailure::Metadata(error) => anyhow::Error::new(error).context(
+            format!("failed to inspect opened {label} {}", path.display()),
+        ),
+        safe_path::BoundedReadFailure::NotRegular => {
+            anyhow::anyhow!("{label} must be a regular file")
+        }
+        safe_path::BoundedReadFailure::Read(error) => {
+            anyhow::Error::new(error).context(format!("failed to read {label} {}", path.display()))
+        }
+        safe_path::BoundedReadFailure::TooLarge => anyhow::anyhow!("{label} exceeds {max} bytes"),
+    })
 }
 
 fn load_config(path: &Path) -> anyhow::Result<Config> {

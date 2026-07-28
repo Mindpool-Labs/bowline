@@ -64,6 +64,24 @@ enum EvidenceSetup {
     Verified,
     Missing,
     Stale,
+    /// A configured `authority_signing` policy rejected the route's promotion authorization
+    /// because no signature envelope was present.
+    SignatureMissing,
+    /// A configured `authority_signing` policy rejected the route's promotion authorization
+    /// because the signature envelope did not verify (tampered payload or an unconfigured key).
+    SignatureInvalid,
+    /// A configured, `required` `promotion_approval` policy rejected the route's grant because
+    /// no approval artifact was present.
+    ApprovalMissing,
+    /// A configured `promotion_approval` policy rejected the route's grant because the
+    /// artifact's signature envelope did not verify.
+    ApprovalSignatureInvalid,
+    /// A configured `promotion_approval` policy rejected the route's grant because the artifact
+    /// did not name the exact evidence digests it is bound to.
+    ApprovalUnbound,
+    /// A configured `promotion_approval` policy rejected the route's grant because the artifact
+    /// was outside its permitted freshness window.
+    ApprovalExpired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +234,15 @@ async fn production_proxy_handler_enforcement_matrix_is_single_dispatch_and_evid
         fallback_case("selector-miss", SelectionVariant::SelectorMiss),
         declared_task_mismatch_case(),
         fallback_case("stale-grant", SelectionVariant::StaleGrant),
+        fallback_case("signature-missing", SelectionVariant::SignatureMissing),
+        fallback_case("signature-invalid", SelectionVariant::SignatureInvalid),
+        fallback_case("approval-missing", SelectionVariant::ApprovalMissing),
+        fallback_case(
+            "approval-signature-invalid",
+            SelectionVariant::ApprovalSignatureInvalid,
+        ),
+        fallback_case("approval-unbound", SelectionVariant::ApprovalUnbound),
+        fallback_case("approval-expired", SelectionVariant::ApprovalExpired),
         fallback_case("pinned-preserve", SelectionVariant::PinnedPreserve),
         fallback_case("rewrite-failure", SelectionVariant::RewriteFailure),
         fallback_case("kill-bypass", SelectionVariant::KillBypass),
@@ -475,6 +502,12 @@ enum SelectionVariant {
     CanaryOut,
     SelectorMiss,
     StaleGrant,
+    SignatureMissing,
+    SignatureInvalid,
+    ApprovalMissing,
+    ApprovalSignatureInvalid,
+    ApprovalUnbound,
+    ApprovalExpired,
     PinnedPreserve,
     RewriteFailure,
     KillBypass,
@@ -552,6 +585,8 @@ fn parity_config(upstream: &str, root: &std::path::Path) -> Config {
         }),
         floors: None,
         enforcement: None,
+        authority_signing: None,
+        promotion_approval: None,
         state_backend: None,
         trusted_proxy_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
         runtime: RuntimeConfig::default(),
@@ -944,6 +979,30 @@ fn fallback_case(name: &'static str, variant: SelectionVariant) -> MatrixCase {
         }
         SelectionVariant::SelectorMiss => case.app = "other",
         SelectionVariant::StaleGrant => case.evidence = EvidenceSetup::Stale,
+        SelectionVariant::SignatureMissing => {
+            case.evidence = EvidenceSetup::SignatureMissing;
+            case.expected_reason = Some(SelectionReason::SignatureMissing);
+        }
+        SelectionVariant::SignatureInvalid => {
+            case.evidence = EvidenceSetup::SignatureInvalid;
+            case.expected_reason = Some(SelectionReason::SignatureInvalid);
+        }
+        SelectionVariant::ApprovalMissing => {
+            case.evidence = EvidenceSetup::ApprovalMissing;
+            case.expected_reason = Some(SelectionReason::ApprovalMissing);
+        }
+        SelectionVariant::ApprovalSignatureInvalid => {
+            case.evidence = EvidenceSetup::ApprovalSignatureInvalid;
+            case.expected_reason = Some(SelectionReason::ApprovalSignatureInvalid);
+        }
+        SelectionVariant::ApprovalUnbound => {
+            case.evidence = EvidenceSetup::ApprovalUnbound;
+            case.expected_reason = Some(SelectionReason::ApprovalUnbound);
+        }
+        SelectionVariant::ApprovalExpired => {
+            case.evidence = EvidenceSetup::ApprovalExpired;
+            case.expected_reason = Some(SelectionReason::ApprovalExpired);
+        }
         SelectionVariant::PinnedPreserve => {
             case.model_authority = bowline_core::enforcement::ModelAuthority::Preserve;
         }
@@ -1166,13 +1225,49 @@ async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
         .promotion
         .as_ref()
         .map(|_| promotion_validation(&validated, case.protocol, evidence_now, expires_at_ms));
-    let grant =
-        (case.mode.grants_authority() && case.evidence != EvidenceSetup::Missing).then(|| {
-            crate::enforcement_loader::test_verified_promotion_grant_for_task(
-                validation.clone().unwrap(),
-                case.grant_task,
-            )
-        });
+    let grant = (case.mode.grants_authority()
+        && !matches!(
+            case.evidence,
+            EvidenceSetup::Missing
+                | EvidenceSetup::SignatureMissing
+                | EvidenceSetup::SignatureInvalid
+                | EvidenceSetup::ApprovalMissing
+                | EvidenceSetup::ApprovalSignatureInvalid
+                | EvidenceSetup::ApprovalUnbound
+                | EvidenceSetup::ApprovalExpired
+        ))
+    .then(|| {
+        crate::enforcement_loader::test_verified_promotion_grant_for_task(
+            validation.clone().unwrap(),
+            case.grant_task,
+        )
+    });
+    let grant_rejections = if case.mode.grants_authority() {
+        match case.evidence {
+            EvidenceSetup::SignatureMissing => {
+                BTreeMap::from([("route".to_owned(), SelectionReason::SignatureMissing)])
+            }
+            EvidenceSetup::SignatureInvalid => {
+                BTreeMap::from([("route".to_owned(), SelectionReason::SignatureInvalid)])
+            }
+            EvidenceSetup::ApprovalMissing => {
+                BTreeMap::from([("route".to_owned(), SelectionReason::ApprovalMissing)])
+            }
+            EvidenceSetup::ApprovalSignatureInvalid => BTreeMap::from([(
+                "route".to_owned(),
+                SelectionReason::ApprovalSignatureInvalid,
+            )]),
+            EvidenceSetup::ApprovalUnbound => {
+                BTreeMap::from([("route".to_owned(), SelectionReason::ApprovalUnbound)])
+            }
+            EvidenceSetup::ApprovalExpired => {
+                BTreeMap::from([("route".to_owned(), SelectionReason::ApprovalExpired)])
+            }
+            _ => BTreeMap::new(),
+        }
+    } else {
+        BTreeMap::new()
+    };
     let recommendation = (case.mode == RouteMode::Recommend
         && case.protocol != AuthorityProtocol::Embeddings
         && case.evidence != EvidenceSetup::Missing)
@@ -1234,6 +1329,7 @@ async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
             .into_iter()
             .map(|grant| ("route".into(), grant))
             .collect(),
+        grant_rejections,
         recommendations: recommendation
             .into_iter()
             .map(|evidence| ("route".into(), evidence))

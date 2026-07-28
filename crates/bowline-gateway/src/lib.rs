@@ -4,6 +4,7 @@ pub mod accounting;
 pub mod actuator;
 pub mod billing;
 pub mod canary;
+pub mod contract;
 pub mod enforcement_loader;
 pub mod health;
 pub mod identity;

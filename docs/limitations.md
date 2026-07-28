@@ -56,8 +56,11 @@
 - Quality overlays do not update ratings, choose among candidates, or execute promotion. Controlled
   authority separately requires exact fresh quality and economics evidence plus explicit route
   configuration and an armed private kill state.
-- Evidence uses checksummed frames and atomic manifests, not cryptographic signing or an external
-  transparency log. Privileged storage administrators remain trusted.
+- Evidence uses checksummed frames and atomic manifests, not an external transparency log.
+  Promotion/authority evidence can optionally require a bring-your-own-key standard-Minisign
+  signature (`authority_signing`); this is off by default, attests only exact-byte authenticity at
+  signing time, and does not extend to other evidence. Privileged storage administrators remain
+  trusted.
 - Identity headers are trustworthy only to the extent the configured immediate proxy is trusted.
 - The 10 MiB request limit, accounting capture bound, timeouts, queue capacity, and segment capacity
   define the supported traffic envelope; tune and load-test them for the workload.
@@ -72,8 +75,15 @@
   zero-authority evidence.
 - Promotion configuration is not authorization by itself. Each authority route requires a private
   descriptor-protected local sidecar that binds exact source evidence, normalized route semantics,
-  and active policy/registry-source/owned-cost provenance. It is not a signature or external
-  approval, and privileged administrators inside the deployment security domain remain trusted.
+  and active policy/registry-source/owned-cost provenance. It is not organizational approval, and
+  privileged administrators inside the deployment security domain remain trusted. An optional
+  `authority_signing` signature over that sidecar attests only its exact-byte authenticity at
+  signing time, not the correctness of what it binds or organizational approval.
+- An optional `promotion_approval` artifact is machine-checkable evidence that a signed,
+  externally produced document names the exact evidence digests a specific promotion
+  authorization is bound to and is fresh. It is not organizational authority, a role, a quorum, an
+  approval process, or a claim about who signed it or why; Bowline never interprets `approver`.
+  Off by default; see [external-approval](external-approval.md).
 - Candidate authority requires a resolved application plus exact runtime task and canonical tag
   binding. Missing or invalid application identity, task mismatch, and tag mismatch use the
   configured zero-authority fallback.

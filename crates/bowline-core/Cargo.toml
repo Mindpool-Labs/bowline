@@ -19,6 +19,7 @@ ipnet.workspace = true
 jsonschema.workspace = true
 regex.workspace = true
 unicode-normalization.workspace = true
+minisign-verify.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

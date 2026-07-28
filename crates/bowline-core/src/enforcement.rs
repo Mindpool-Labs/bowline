@@ -334,8 +334,14 @@ pub enum SelectionReason {
     UntrustedIdentity,
     UnsupportedShape,
     GrantMissing,
+    SignatureMissing,
+    SignatureInvalid,
     GrantMismatch,
     GrantStale,
+    ApprovalMissing,
+    ApprovalSignatureInvalid,
+    ApprovalUnbound,
+    ApprovalExpired,
     WorkloadMismatch,
     AllowlistMiss,
     RolloutMiss,
@@ -1622,20 +1628,63 @@ pub fn enforcement_bucket(
     (first % u64::from(MAX_ROLLOUT_PPM)) as u32
 }
 
+/// Whether a candidate grant is present, or the specific reason none is usable. `Absent` reasons
+/// occupy the exact pipeline position the legacy `GrantMissing` check always held: they are only
+/// ever considered after kill/route/identity/shape have already passed.
+enum GrantAvailability<'a> {
+    Present(&'a PromotionGrantSnapshot),
+    Absent(SelectionReason),
+}
+
+impl<'a> GrantAvailability<'a> {
+    fn as_option(&self) -> Option<&'a PromotionGrantSnapshot> {
+        match *self {
+            GrantAvailability::Present(grant) => Some(grant),
+            GrantAvailability::Absent(_) => None,
+        }
+    }
+}
+
 pub fn select_enforcement_plan_without_grant(input: &SelectionInput) -> EnforcementPlan {
-    select_enforcement_plan_inner(input, None)
+    select_enforcement_plan_inner(
+        input,
+        GrantAvailability::Absent(SelectionReason::GrantMissing),
+    )
 }
 
 pub fn select_enforcement_plan(
     input: &SelectionInput,
     grant: &PromotionGrantSnapshot,
 ) -> EnforcementPlan {
-    select_enforcement_plan_inner(input, Some(grant))
+    select_enforcement_plan_inner(input, GrantAvailability::Present(grant))
+}
+
+/// Selects a fallback plan for a route whose promotion grant was rejected wholesale — a missing
+/// or invalid `authority_signing` signature, or a missing, invalid, unbound, or expired
+/// `promotion_approval` artifact. This reuses the exact existing zero-authority fallback
+/// pipeline: kill/route/identity/shape checks still take precedence, exactly as they do for
+/// `GrantMissing` today. `reason` must be one of `SelectionReason::SignatureMissing`,
+/// `SignatureInvalid`, `ApprovalMissing`, `ApprovalSignatureInvalid`, `ApprovalUnbound`, or
+/// `ApprovalExpired`.
+pub fn select_enforcement_plan_with_grant_rejection(
+    input: &SelectionInput,
+    reason: SelectionReason,
+) -> EnforcementPlan {
+    debug_assert!(matches!(
+        reason,
+        SelectionReason::SignatureMissing
+            | SelectionReason::SignatureInvalid
+            | SelectionReason::ApprovalMissing
+            | SelectionReason::ApprovalSignatureInvalid
+            | SelectionReason::ApprovalUnbound
+            | SelectionReason::ApprovalExpired
+    ));
+    select_enforcement_plan_inner(input, GrantAvailability::Absent(reason))
 }
 
 fn select_enforcement_plan_inner(
     input: &SelectionInput,
-    grant: Option<&PromotionGrantSnapshot>,
+    grant: GrantAvailability<'_>,
 ) -> EnforcementPlan {
     let mode = input.route.mode;
     // Observe and recommend never hold candidate authority. Kill/circuit/admission state therefore
@@ -1657,7 +1706,7 @@ fn select_enforcement_plan_inner(
             && input.authority_metadata_valid
             && input.shape_supported;
         let evidence_state = exact_context
-            .then_some(grant)
+            .then(|| grant.as_option())
             .flatten()
             .filter(|grant| {
                 grant_matches_route(input, grant)
@@ -1685,8 +1734,9 @@ fn select_enforcement_plan_inner(
         return fallback_plan(input, SelectionReason::UnsupportedShape, None);
     }
 
-    let Some(grant) = grant else {
-        return fallback_plan(input, SelectionReason::GrantMissing, None);
+    let grant = match grant {
+        GrantAvailability::Present(grant) => grant,
+        GrantAvailability::Absent(reason) => return fallback_plan(input, reason, None),
     };
     if !grant_matches_route(input, grant) {
         return fallback_plan(input, SelectionReason::GrantMismatch, None);

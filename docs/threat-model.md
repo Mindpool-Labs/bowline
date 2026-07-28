@@ -31,13 +31,17 @@ attacker.
 | Duplicate billable work | Zero-or-one target construction, no redirects/retries/post-attempt fallback | Transport ambiguity can hide whether the single candidate attempt executed remotely. |
 | Candidate outage or overload | Startup-open volatile circuit, bounded probe, global/per-actuator admission, configured pre-dispatch fallback | Circuit state is per process and resets on restart. |
 | Authority evidence loss | Durable decision before dispatch, exact replacement decision, irreversible incomplete-run lifecycle | Host loss after remote execution can leave outcome evidence incomplete. |
+| Promotion authority tampering | Optional, bring-your-own-key standard-Minisign signature over the exact bounded authorization file (`authority_signing`); missing/invalid signatures are a typed, fail-closed, durably recorded rejection | Off by default; a verifying signature attests only exact-byte authenticity of the sealed authorization at signing time, not the correctness or freshness of the evidence it binds, or organizational approval. |
 
 ## Non-goals
 
-Bowline does not provide prompt-content policy, cryptographic evidence signatures, or high
-availability. Bowline does not provide tenant isolation inside one process. It also does not provide
-authenticated billing truth, dataset representativeness, independent judge trust, spend approval,
-or control of traffic that bypasses the gateway. Controlled authority is limited to exact
-Chat/Responses grants and volatile local circuit state. Offline quality canaries provide advisory
-evidence only. Review
+Bowline does not provide prompt-content policy or high availability. Evidence signing is optional,
+bring-your-own-key, and scoped to promotion/authority evidence (see
+[controlled enforcement](controlled-enforcement.md#optional-authority-signing)); it is not a
+general evidence-signing or transparency-log capability, and it attests exact-byte authenticity
+only, never correctness or organizational approval. Bowline does not provide tenant isolation
+inside one process. It also does not provide authenticated billing truth, dataset
+representativeness, independent judge trust, spend approval, or control of traffic that bypasses
+the gateway. Controlled authority is limited to exact Chat/Responses grants and volatile local
+circuit state. Offline quality canaries provide advisory evidence only. Review
 [limitations](limitations.md) before interpreting a PoV.

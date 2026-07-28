@@ -192,10 +192,6 @@ has_unsupported_controlled_claim() {
       q{bowline does not provide an administration api},
       q{bowline has no management plane},
       q{bowline has no route administration service},
-      q{bowline does not verify signed enforcement bundles},
-      q{bowline does not use signed enforcement bundles},
-      q{bowline does not accept signed authority},
-      q{enforcement grants do not carry cryptographic signatures},
       q{bowline does not isolate multiple tenants},
       q{bowline does not provide provider-native support or content dlp},
       q{bowline does not provide provider-native support},
@@ -254,8 +250,6 @@ has_unsupported_controlled_claim() {
       qr{\b(?:circuit|breaker)\w*\b[^.;!?]{0,100}\b(?:distributed|durable|replica\w*|shared|surviv\w*\s+restart)\b}i,
       qr{\b(?:distributed|durable|replica\w*|shared|surviv\w*\s+restart)\b[^.;!?]{0,100}\b(?:circuit|breaker)\w*\b}i,
       qr{\b(?:management\s+plane|administration\s+(?:api|console|service)|route\s+administration\s+service|control\s+service|administer\w*\s+routes?|central\s+(?:console|dashboard)\s+(?:configur\w*|manag\w*|administer\w*|control\w*)\s+routes?)\b}i,
-      qr{\b(?:signed|signature\w*|cryptographic\s+signature\w*)\b[^.;!?]{0,100}\b(?:authority|enforcement|grant|bundle)\w*\b}i,
-      qr{\b(?:authority|enforcement|grant|bundle)\w*\b[^.;!?]{0,100}\b(?:signed|signature\w*|cryptographic\s+signature\w*)\b}i,
       qr{\b(?:provider[- ]native|native\s+provider|provider[- ]specific)\b[^.;!?]{0,100}\b(?:support|adapter\w*|integration\w*|detector|native\s+semantics)\b}i,
       qr{\b(?:support|adapter\w*|integration\w*|detector|native\s+semantics)\b[^.;!?]{0,100}\b(?:provider[- ]native|native\s+provider|provider[- ]specific)\b}i,
       qr{\bdlp\b}i,
@@ -289,7 +283,6 @@ for fixture in \
   'executes each provider request exactly once' \
   'coordinates circuit breakers across replicas' \
   'ships an administration API' \
-  'verifies signed enforcement bundles' \
   'isolates multiple tenants' \
   'Bowline provides automatic routing' 'Bowline uses learned routing' \
   'Bowline guarantees universal quality' 'Bowline guarantees realized savings' \
@@ -299,13 +292,12 @@ for fixture in \
   'Candidate failures trigger a retry against the original upstream' \
   'Bowline guarantees exactly-once provider execution' \
   'Bowline provides durable distributed circuits' 'Bowline includes a management plane' \
-  'Bowline provides signed authority' 'Bowline provides provider-native support' \
+  'Bowline provides provider-native support' \
   'Native provider adapters are included' 'The gateway performs content DLP' \
   'Bowline provides DLP' 'Bowline provides secure multi-tenancy' \
   'Bowline fails over to the original upstream after a candidate attempt.' \
   'Savings are guaranteed.' 'Quality is universal.' \
   'Bowline has a management plane.' \
-  'Bowline uses signed enforcement bundles.' \
   'Bowline supports provider-native adapters.' \
   'Bowline supports content DLP.' \
   'Circuit breakers are distributed across replicas.' \
@@ -318,7 +310,6 @@ for fixture in \
   'Each request to a provider is executed once and only once.' \
   'Breaker state is shared and survives restart on every replica.' \
   'Operators administer routes through a control service.' \
-  'Enforcement grants carry cryptographic signatures.' \
   'Built-in provider-specific integrations preserve native semantics.' \
   'Prompts are scanned to block sensitive data.' \
   'Different customers share one process with isolated data.' \
@@ -340,7 +331,6 @@ for fixture in \
   'Bowline does not execute each provider request exactly once.' \
   'Bowline does not coordinate circuit breakers across replicas.' \
   'Bowline does not provide an administration API.' \
-  'Bowline does not verify signed enforcement bundles.' \
   'Bowline does not isolate multiple tenants.' \
   'Bowline does not provide universal quality or guaranteed savings.' \
   'Bowline does not report realized savings.' \
@@ -352,7 +342,6 @@ for fixture in \
   'Bowline does not guarantee savings.' \
   'Bowline does not provide universal quality.' \
   'Bowline has no management plane.' \
-  'Bowline does not use signed enforcement bundles.' \
   'Bowline does not support provider-native adapters.' \
   'Bowline does not perform content DLP.' \
   'Bowline does not provide provider-native support.' \
@@ -366,7 +355,6 @@ for fixture in \
   'Bowline does not execute provider requests once and only once.' \
   'Breaker state is process-local and does not survive restart or replicate.' \
   'Bowline has no route administration service.' \
-  'Enforcement grants do not carry cryptographic signatures.' \
   'Bowline has no built-in provider-specific integration.' \
   'Bowline does not scan prompts or block sensitive content.' \
   'Bowline does not isolate different customers inside one process.'; do

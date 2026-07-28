@@ -1,0 +1,6 @@
+{
+  "envelope_version": 1,
+  "algorithm": "minisign-ed25519",
+  "key_id": "7D993CA9D5D0C222",
+  "payload_sha256": "sha256:5600d5197b1decb5c9369e82f12cc901cba7629a39e3b0890ecc2ed88cd53fa8"
+}

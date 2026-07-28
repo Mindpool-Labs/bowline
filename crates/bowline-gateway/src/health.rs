@@ -85,6 +85,11 @@ pub struct CircuitCounts {
     pub half_open: usize,
 }
 
+/// `unverified` counts every authority route with no usable promotion grant for any reason: no
+/// evidence configured at all, a rejected `authority_signing` signature, or a rejected
+/// `promotion_approval` artifact (missing, invalid, unbound, or expired). This snapshot never
+/// distinguishes which of those applied; it only reports that the route currently carries no
+/// authority.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct GrantFreshnessCounts {
     pub fresh: usize,

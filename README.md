@@ -128,6 +128,8 @@ for the exact authority, fallback, and safe-start contract.
   reconciliation, opportunity arithmetic, static bundles, and financial non-claims.
 - [`docs/controlled-enforcement.md`](docs/controlled-enforcement.md) - exact authority, fallback,
   kill, circuit, evidence, health, and failure contracts.
+- [`docs/external-approval.md`](docs/external-approval.md) - optional bring-your-own
+  approval-workflow artifact binding for promotion.
 - [`examples/enforcement/validate-offline.sh`](examples/enforcement/validate-offline.sh) - offline
   structural validation of the synthetic killed example without endpoint contact.
 - [`docs/bench.md`](docs/bench.md) - latency bench method and current localhost result.
