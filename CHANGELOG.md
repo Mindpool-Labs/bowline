@@ -21,6 +21,39 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   volatile circuits, bounded candidate admission, schema-v2 authority evidence, aggregate health,
   and modeled-delta reports. Startup preserves an existing valid kill state and never arms
   authority automatically.
+- A pluggable state-backend seam for circuit-breaker and candidate-admission state, with the
+  existing local, volatile, startup-open behavior as the default. A supervisor owns the serving
+  lease and the whole active-runtime lifecycle, so every activation has an explicit run boundary.
+- An optional file-lease backend providing active-passive supervision: an exclusive POSIX advisory
+  lock is the sole ownership authority, standbys stay live but unready and reject inference with
+  `standby-no-lease`, and only the holder opens evidence writers, creates runtime state, runs
+  startup probes, and admits traffic. Supported where every replica participates in one reliable
+  POSIX lock domain and shares one evidence root; state is not replicated across failover.
+- `bowline export evidence`, publishing a versioned `evidence_schema_version: 1` bundle for one
+  selected run against a published JSON Schema (`schemas/evidence-bundle-v1.schema.json`). The
+  decision projection is allowlisted and content-free: no route, app, tag, key digest, upstream,
+  model identifier, attribution reference, prompt, response, header, or authorization material is
+  exported, and aggregates are the report's own numbers rather than a second accounting path.
+- Optional signature verification for promotion and authority evidence. A versioned detached
+  envelope wraps a standard Minisign signature verified against operator-configured keys; the key
+  an envelope carries is never a trust root. Who signs is left entirely to the operator. A missing
+  or invalid required signature yields zero authority on the affected route and a durable reason
+  in decision evidence rather than a startup failure.
+- Optional external-approval artifact binding for promotion. A strict `ApprovalArtifactV1` is bound
+  to the exact authorization it approves, verified through the same envelope and bounded by a
+  configured maximum age. Bowline checks binding and freshness only — it never interprets the
+  approver string, roles, quorum, or organizational policy.
+- A published canonical passive-event schema (`schemas/passive-event-v1.schema.json`) and an offline
+  conformance runner: `bowline conformance canonical` and `bowline conformance collector` share the
+  importer's own validation, stable reason codes, and whole-file atomicity, so a passing result
+  means the same input will pass import. The shipped LiteLLM and Envoy profile/fixture pairs are the
+  reference corpus and run in CI.
+- Documentation for the new contracts: `docs/evidence-export.md`, `docs/external-approval.md`, and
+  `docs/writing-a-collector.md`.
+- A Contributor License Agreement (`CLA.md`), affirmed per pull request.
+- A neutrality charter (`docs/neutrality-charter.md`) stating the commitments that govern how
+  affiliated supply is treated, anchored in a public transparency log with the Sigstore bundle
+  committed for offline verification (`docs/anchors.md`).
 
 ### Fixed
 
