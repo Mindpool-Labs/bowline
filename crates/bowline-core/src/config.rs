@@ -588,8 +588,8 @@ impl Config {
             })?;
             let loopback = matches!(url.host(), Some(Host::Ipv4(ip)) if ip.is_loopback())
                 || matches!(url.host(), Some(Host::Ipv6(ip)) if ip.is_loopback());
-            if !(url.scheme() == "http" && loopback)
-                && !(url.scheme() == "https" && !loopback && switchyard.remote_acknowledged)
+            if !(url.scheme() == "http" && loopback
+                || url.scheme() == "https" && !loopback && switchyard.remote_acknowledged)
             {
                 return Err(ConfigError::invalid(
                     "switchyard_observe.decision_api_url",
