@@ -34,6 +34,7 @@ pub struct AuthorityDecisionContextV2 {
     pub resolved_tags: Vec<String>,
     pub request_body_digest: [u8; 32],
     pub requested_supply_id: Option<String>,
+    pub routing: Option<bowline_core::ledger::AuthorityRoutingBindingV3>,
 }
 
 #[derive(Debug)]
@@ -170,6 +171,7 @@ pub async fn prepare_candidate_authority_decision_v2(
     gateway_plan: GatewayEnforcementPlan,
     grant: VerifiedPromotionGrant,
     decision_id: String,
+    routing: Option<bowline_core::ledger::AuthorityRoutingBindingV3>,
     kill_reader: &BoundedKillStateReader,
 ) -> Result<CandidatePreparationV2, AuthorityRecordError> {
     let kill_state = kill_reader.read_kill_state().await;
@@ -222,6 +224,7 @@ pub async fn prepare_candidate_authority_decision_v2(
         resolved_tags: selection.resolved_tags.clone(),
         request_body_digest: selection.request_body_digest,
         requested_supply_id: selection.requested_supply_id.clone(),
+        routing,
     };
     if kill_state != KillReadResult::Armed || !grant.is_fresh_at(now_ms) {
         let reason = if kill_state == KillReadResult::Armed {
@@ -337,6 +340,7 @@ fn build_prepared_decision(
             .clone()
             .ok_or(AuthorityRecordError::InvalidDecision)?,
         model_rewritten: plan.model_rewritten,
+        routing: context.routing,
     };
     decision.validate()?;
     Ok(PreparedAuthorityDecisionV2 {
@@ -357,7 +361,9 @@ fn selection_facts_for_plan(
             .map(AuthoritySelectionFactsV2::canonical_candidate)
             .ok_or(AuthorityRecordError::InvalidDecision),
         bowline_core::enforcement::SelectionReason::ObserveOnly
-        | bowline_core::enforcement::SelectionReason::RecommendationOnly => Ok(
+        | bowline_core::enforcement::SelectionReason::RecommendationOnly
+        | bowline_core::enforcement::SelectionReason::RoutingCapable
+        | bowline_core::enforcement::SelectionReason::RoutingUnavailable => Ok(
             AuthoritySelectionFactsV2::canonical_non_authority(kill_state),
         ),
         reason => {
@@ -531,6 +537,7 @@ mod candidate_protocol_tests {
             resolved_tags: vec!["production".into()],
             request_body_digest: [7; 32],
             requested_supply_id: None,
+            routing: None,
         };
         let grant = AuthorityGrantBindingV2 {
             grant_digest: digest(4),

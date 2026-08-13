@@ -22,8 +22,12 @@ fn canonical_totals_are_explicit_and_unvalidated_shadow_opportunity_is_unavailab
         bypasses: 1,
         fail_closed: 1,
         failures: 1,
+        candidate_failures: 1,
         cancellations: 1,
         incomplete: 2,
+        routing_capable: 0,
+        routing_efficient: 0,
+        routing_unavailable: 0,
         observed_enforced_cost_micros: Some(700_000),
         enforced_modeled_delta_micros: Some(300_000),
     };
@@ -86,6 +90,7 @@ fn cancelled_pair() -> (AuthorityRecordV2, AuthorityRecordV2) {
         enforcement_config_digest: digest('c'),
         route_config_digest: digest('r'),
         model_rewritten: true,
+        routing: None,
     };
     let outcome = AuthorityOutcomeV2 {
         decision_id: decision.decision_id.clone(),
@@ -126,6 +131,7 @@ fn cancelled_pair() -> (AuthorityRecordV2, AuthorityRecordV2) {
         observed_actual_cost_micros: None,
         approved_counterfactual_cost_micros: None,
         enforced_modeled_delta_micros: None,
+        routing: None,
     };
     (
         AuthorityRecordV2::decision(1, decision).unwrap(),

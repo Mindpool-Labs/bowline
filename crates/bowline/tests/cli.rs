@@ -8,6 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bowline_core::routing::{RoutingReason, RoutingTarget};
 use bowline_core::{
     attribution::{AttributionSource, AttributionStatus},
     config::{load_owned_cost_catalog, Config},
@@ -15,8 +16,9 @@ use bowline_core::{
     enforcement::{AuthorityProtocol, EvidenceState, PlanTarget, RouteMode, SelectionReason},
     ledger::{
         ActualOutcome, AuthorityDecisionV2, AuthorityGrantBindingV2, AuthorityLedgerV2,
-        AuthorityOutcomeV2, AuthorityRecordV2, AuthoritySelectionFactsV2, CircuitStateV2,
-        CompletionStateV2, DecisionRecord, Ledger, SegmentedLedger, UsageSource,
+        AuthorityOutcomeV2, AuthorityRecordV2, AuthorityRoutingBindingV3,
+        AuthoritySelectionFactsV2, CircuitStateV2, CompletionStateV2, DecisionRecord, Ledger,
+        RoutingDecisionSourceV3, SegmentedLedger, UsageSource,
     },
     policy::{PolicyBundle, WorkloadIdentity},
     report::compute_run_report,
@@ -1807,6 +1809,90 @@ fn incomplete_authority_report_publishes_and_exits_2_unless_explicitly_allowed()
     }));
 }
 
+#[test]
+fn schema_v3_routed_authority_report_exposes_routing_categories_in_all_cli_formats() {
+    let dir = tempdir("schema-v3-routed-authority-report");
+    let manifest = create_cancelled_authority_run(&dir);
+    let manifest = manifest.to_str().unwrap();
+
+    let json = bowline()
+        .args([
+            "report",
+            "--authority-manifest",
+            manifest,
+            "--json",
+            "--allow-incomplete",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(json["authority_schema_version"], 3);
+    for category in [
+        "routing_capable",
+        "routing_efficient",
+        "routing_unavailable",
+        "bypasses",
+        "fail_closed",
+        "candidate_failures",
+        "failures",
+        "enforced_modeled_delta_micros",
+    ] {
+        assert!(json["totals"].get(category).is_some(), "missing {category}");
+    }
+
+    for (format, expected) in [
+        ("markdown", "Routing efficient"),
+        ("csv", "routing_efficient"),
+    ] {
+        let output = bowline()
+            .args([
+                "report",
+                "--authority-manifest",
+                manifest,
+                "--authority-format",
+                format,
+                "--allow-incomplete",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(expected));
+        for category in match format {
+            "markdown" => [
+                "Routing capable",
+                "Routing unavailable",
+                "Bypasses",
+                "Fail-closed",
+                "Candidate failures",
+                "Failures",
+                "Enforced modeled cost delta",
+            ],
+            "csv" => [
+                "routing_capable",
+                "routing_unavailable",
+                "bypasses",
+                "fail_closed",
+                "candidate_failures",
+                "failures",
+                "enforced_modeled_cost_delta_usd",
+            ],
+            _ => unreachable!(),
+        } {
+            assert!(text.contains(category), "{format} missing {category}");
+        }
+    }
+}
+
 fn create_cancelled_authority_run(root: &Path) -> PathBuf {
     let digest = |_ch: char| format!("sha256:{}", "a".repeat(64));
     let directory = root.join("authority");
@@ -1855,6 +1941,16 @@ fn create_cancelled_authority_run(root: &Path) -> PathBuf {
         enforcement_config_digest: digest('e'),
         route_config_digest: digest('r'),
         model_rewritten: true,
+        routing: Some(AuthorityRoutingBindingV3::Decision {
+            routing_decision_digest: digest('d'),
+            routing_state_digest: digest('s'),
+            profile_digest: digest('p'),
+            task_reference_digest: digest('t'),
+            step_id: 1,
+            semantic_target: RoutingTarget::Efficient,
+            reason: RoutingReason::RecentProgress,
+            source: RoutingDecisionSourceV3::TrustedImmediatePeer,
+        }),
     };
     let outcome = AuthorityOutcomeV2 {
         decision_id: decision.decision_id.clone(),
@@ -1892,13 +1988,21 @@ fn create_cancelled_authority_run(root: &Path) -> PathBuf {
         observed_actual_cost_micros: None,
         approved_counterfactual_cost_micros: None,
         enforced_modeled_delta_micros: None,
+        routing: decision.routing.clone(),
     };
+    decision.validate().unwrap();
+    outcome.validate().unwrap();
+    bowline_core::ledger::validate_authority_pair_v2(&decision, &outcome).unwrap();
     let decision = AuthorityRecordV2::decision(store.accept().unwrap(), decision).unwrap();
     ledger.append(&decision).unwrap();
-    store.recorded(1).unwrap();
+    store
+        .recorded_with_schema(1, decision.schema_version())
+        .unwrap();
     let outcome = AuthorityRecordV2::outcome(store.accept().unwrap(), outcome).unwrap();
     ledger.append(&outcome).unwrap();
-    store.recorded(2).unwrap();
+    store
+        .recorded_with_schema(2, outcome.schema_version())
+        .unwrap();
     let (bytes, records_digest) = ledger.integrity().unwrap();
     store
         .finish(true, Some(bytes), Some(records_digest))

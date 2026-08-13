@@ -1,5 +1,9 @@
 # Bowline
 
+## Bounded task routing
+
+Bowline can use explicit stage profiles for exact Chat Completions and Responses routes. The decision API is advisory-only. Only the in-process controlled gateway can exercise candidate authority. Bowline does not use learned routing. Controlled enforcement does not inspect prompt or response content. Promotion remains an external approval sequence. See the synthetic [routing v2 example](examples/enforcement/routing-v2.yaml).
+
 Bowline is the intelligence layer for enterprise AI. It turns task distribution into an evidenced
 decision: which class of work runs on which supply, at what modeled cost, with what measured
 quality.

@@ -115,8 +115,19 @@ where
         self.state.clone().router()
     }
 
+    pub(crate) fn routing_api_state(
+        &self,
+        authorization_env: &str,
+    ) -> anyhow::Result<crate::routing_api::RoutingApiState> {
+        self.state.routing_api_state(authorization_env)
+    }
+
     pub fn is_active(&self) -> bool {
         self.state.has_active_runtime()
+    }
+
+    pub(crate) fn may_admit(&self) -> bool {
+        self.lease.may_admit()
     }
 
     pub async fn activate<F>(&mut self, factory: &mut F) -> anyhow::Result<ActivationSummary>

@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, process::ExitCode, time::Duration};
 use anyhow::Context;
 use bowline_core::{
     config::Config,
-    enforcement::{EnforcementConfigV1, FallbackMode, RouteMode, ValidatedEnforcement},
+    enforcement::{EnforcementConfig, FallbackMode, RouteMode, ValidatedEnforcement},
 };
 use clap::Args as ClapArgs;
 use serde::Serialize;
@@ -100,7 +100,7 @@ fn run_local_diagnostics(path: &std::path::Path, json: bool) -> anyhow::Result<E
         )
     })?;
     let diagnostics = local_enforcement_diagnostics(
-        &EnforcementConfigV1::from_yaml(&source)
+        &EnforcementConfig::from_yaml(&source)
             .context("failed to parse controlled-enforcement bundle")?
             .validate()
             .context("failed to validate controlled-enforcement bundle")?,

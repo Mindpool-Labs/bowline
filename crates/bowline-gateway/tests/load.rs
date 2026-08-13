@@ -55,6 +55,8 @@ async fn five_thousand_requests_leave_reconcilable_durable_evidence() {
         authority_signing: None,
         promotion_approval: None,
         state_backend: None,
+        routing: None,
+        switchyard_observe: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime: RuntimeConfig {
             writer_queue_capacity: REQUESTS as usize,

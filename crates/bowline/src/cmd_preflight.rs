@@ -9,7 +9,7 @@ use std::{
 use anyhow::Context;
 use bowline_core::{
     config::{load_owned_cost_catalog, Config},
-    enforcement::{ActiveRuntimeProvenance, EnforcementConfigV1, KillReadResult},
+    enforcement::{ActiveRuntimeProvenance, EnforcementConfig, KillReadResult},
     policy::PolicyBundle,
     supply::Registry,
 };
@@ -416,9 +416,7 @@ async fn preflight_enforcement(
             )]
         }
     };
-    let raw = match EnforcementConfigV1::from_yaml(&source)
-        .and_then(|raw| raw.clone().validate().map(|validated| (raw, validated)))
-    {
+    let validated = match EnforcementConfig::from_yaml(&source).and_then(|raw| raw.validate()) {
         Ok(value) => value,
         Err(error) => {
             return vec![fail(
@@ -428,7 +426,6 @@ async fn preflight_enforcement(
             )]
         }
     };
-    let (raw, validated) = raw;
     let Some(active) = active else {
         return vec![fail(
             "enforcement-evidence",
@@ -469,7 +466,7 @@ async fn preflight_enforcement(
             )];
         }
     }
-    let kill = &raw.kill_switch;
+    let kill = validated.kill_switch();
     let kill_state = match KillStateReader::open(Path::new(&kill.trust_root), &kill.relative_path) {
         Ok(reader) => reader.read_kill_state(),
         Err(error) => {
@@ -495,8 +492,8 @@ async fn preflight_enforcement(
         )];
     };
     let actuators = match ActuatorRegistry::new(
-        raw.global_candidate_in_flight,
-        raw.actuators.iter().cloned(),
+        validated.global_candidate_in_flight(),
+        validated.actuators().cloned(),
     ) {
         Ok(actuators) => actuators,
         Err(error) => {
@@ -511,7 +508,7 @@ async fn preflight_enforcement(
         "enforcement-config",
         format!("controlled enforcement is valid; kill state is {kill_state:?}"),
     )];
-    for actuator in &raw.actuators {
+    for actuator in validated.actuators() {
         let fallbacks = validated
             .authority_routes()
             .filter(|route| route.promoted_supply_id.as_deref() == Some(&actuator.supply_id))

@@ -937,6 +937,8 @@ async fn startup_paths_reject_each_sealed_provenance_mutation_before_probe_or_bi
                 authority_signing: None,
                 promotion_approval: None,
                 state_backend: None,
+                routing: None,
+                switchyard_observe: None,
                 trusted_proxy_cidrs: Vec::new(),
                 runtime: RuntimeConfig::default(),
             };
@@ -1472,6 +1474,7 @@ async fn gateway_selection_requires_exact_opaque_grant_and_validated_context() {
         exact,
         prepare_grant,
         "authority-decision".into(),
+        None,
         &kill_reader,
     )
     .await
@@ -1610,6 +1613,7 @@ async fn candidate_preparation_rereads_kill_and_cannot_backdate_freshness() {
         plan,
         prepare_grant,
         "changed-kill".into(),
+        None,
         &kill_reader,
     )
     .await

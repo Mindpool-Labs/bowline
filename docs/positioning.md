@@ -1,5 +1,9 @@
 # Positioning
 
+## Bounded routing claim.
+
+Bowline does not use learned routing. Controlled enforcement does not inspect prompt or response content. Stage profiles use operator-set thresholds over content-free signals. Switchyard is observe-only. Only the in-process controlled gateway can exercise candidate authority.
+
 ## Where Bowline sits
 
 Bowline is the intelligence layer for enterprise AI. It sits between the agent and workflow value

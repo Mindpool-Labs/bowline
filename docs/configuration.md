@@ -1,5 +1,9 @@
 # Configuration reference
 
+## Routing and observe-only proposal configuration
+
+`routing` configures a loopback-only advisory decision listener, named authorization environment reference, and bounded durable-state limits. `switchyard_observe` is optional and strict: version, decision API URL, profile ID, named authorization environment reference, 25 ms default timeout, exact capable/efficient backend IDs, bounded queue, and `remote_acknowledged`. Loopback HTTP is permitted; remote use requires HTTPS and acknowledgement. Neither section grants external allocation authority.
+
 Bowline parses YAML with unknown fields denied. Relative paths resolve from the configuration file
 directory. Run `bowline preflight --config PATH --json` before starting the production writer.
 
@@ -136,3 +140,56 @@ Promotion binds economics bundle/report/opportunity, quality run/report, policy,
 owned-cost, age, and expiry. Authority routes require exactly one workload selector and support
 only Chat Completions or Responses. See the [full contract](controlled-enforcement.md) and the
 [synthetic killed example](../examples/enforcement/README.md).
+
+## Advisory routing and Switchyard
+
+Enforcement version 1 has no routing fields and rejects them. Version 2 adds non-empty
+`routing_profiles` (at most 64) and an optional `routing_profile_id` on Chat Completions or
+Responses routes. Routing does not add an actuator, promotion, or authority. In `observe` and
+`recommend`, the original target remains the dispatch target. In `enforce` or `canary-enforce`,
+only already-valid promotion authority can permit an efficient dispatch.
+
+`routing` starts a separate loopback-only decision listener only while the serving runtime is
+active. Its complete version-1 fields are `version`, `listen`, `authorization_env`,
+`max_active_tasks`, `segment_bytes`, and `max_segments`. `max_active_tasks` is `1..=16384`;
+without a `routing` section its default is 1024. `segment_bytes` and `max_segments` are positive
+and cannot exceed compiled ledger limits; their no-section defaults are normal runtime limits
+(1048576 bytes and 16 segments). Routing state is a private, exclusive-writer, CRC-checked durable
+prefix under the ledger directory. It survives activation and takeover. It is not a distributed
+coordinator or a volatile cache. A listener stops before lease-loss state drain; a standby does not
+bind or write routing state.
+
+The decision API accepts only `POST /v1/routing/decision`, exactly one `Authorization` header
+whose byte value equals the value named by `authorization_env`, and JSON no larger than 65536 bytes.
+Its grammar is `schema_version: 1`, bounded `route_id`, bounded `task_id`, unsigned decimal
+`step_id`, and `signals`, an array of enumerated routing signals. A successful response names the
+version, opaque decision ID, route and profile digest bindings, task-reference digest, step,
+target, selected supply ID, deterministic reason, state digest, and `authority`. Errors are 400
+`invalid_request`, 401 `unauthorized`, 404 `unknown_route`, 409 `step_conflict`, 413
+`body_too_large`, and 503 `routing_unavailable`. A 503 retains a typed cause:
+`missing-metadata`, `untrusted-metadata`, `malformed-metadata`, `step-conflict`,
+`capacity-exhausted`, `state-corrupt`, `writer-failure`, or `startup-unavailable`.
+
+Trusted inference metadata is one `x-bowline-task-id`, one decimal `x-bowline-step-id`, and one
+`x-bowline-agent-signals` value. Task IDs use the bounded identifier grammar; signals are a JSON
+array of the same enumerated routing signals accepted by the decision API. These
+headers are accepted only from a configured trusted immediate peer and are stripped before upstream
+forwarding. Missing, untrusted, malformed, conflicting, capacity-exhausted, corrupt, writer-failed,
+or unavailable routing retains the capable/original target. Schema-v3 authority decision and
+outcome evidence binds either the durable routing decision or that unavailable cause and source.
+
+`switchyard_observe` is optional. Its complete version-1 fields are `version`,
+`decision_api_url`, `profile_id`, `authorization_env`, `timeout_ms`, `capable_backend_id`,
+`efficient_backend_id`, `observation_queue_capacity`, and `remote_acknowledged`. Backend and
+profile IDs are bounded and the backend IDs differ. `timeout_ms` defaults to 25 and is
+`1..=1000`; `observation_queue_capacity` is `1..=1024`; `remote_acknowledged` defaults to
+`false`. HTTP is valid only for a loopback IP literal; a remote endpoint needs HTTPS and
+`remote_acknowledged: true`. For a committed routed decision only, the outbound JSON has exactly
+`schema_version`, routing `task_ref` digest, `protocol`, `step_id`, and enumerated `signals`.
+The native target and the adapter version, profile version, and configuration digest are local
+telemetry only. The public health
+record never includes a profile ID or profile digest. The adapter disables redirects, bounds a successful response
+before parsing, and emits bounded local adapter version, profile version, configuration digest,
+targets/agreement/latency/error aggregates. It does not retain a profile-ID digest, request content,
+credentials, endpoint text, or raw routing identifiers in telemetry. Switchyard is observe-only: it cannot change
+plan, authority, target, dispatch, fallback, kill state, or the native request result.

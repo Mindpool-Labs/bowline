@@ -10,14 +10,17 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, OriginalUri},
+    extract::{ConnectInfo, OriginalUri, State},
     http::{HeaderMap, Request, StatusCode},
     response::Response,
-    routing::{any, get},
-    Router,
+    routing::{any, get, post},
+    Json, Router,
 };
 use bowline_core::{
-    config::{Config, InlineAttributionConfig, InlineAttributionMapping, RuntimeConfig},
+    config::{
+        Config, InlineAttributionConfig, InlineAttributionMapping, RuntimeConfig,
+        SwitchyardObserveConfig,
+    },
     enforcement::{
         validate_promotion_documents, validate_recommendation_documents, EconomicsPromotionSource,
         EvidenceState, PromotionOpportunityEvidence, QualityPromotionSource, RouteMode,
@@ -100,6 +103,14 @@ enum IdentityHeaderSetup {
     UnsupportedTask,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutingSetup {
+    None,
+    Capable,
+    Efficient,
+    UnavailableMissingMetadata,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MatrixCase {
     name: &'static str,
@@ -144,6 +155,7 @@ struct MatrixCase {
     original_status: u16,
     original_attribution: Option<&'static str>,
     original_upstream_override: Option<&'static str>,
+    routing: RoutingSetup,
 }
 
 struct ShadowParityEvidence {
@@ -318,6 +330,200 @@ async fn production_proxy_handler_enforcement_matrix_is_single_dispatch_and_evid
     for case in cases {
         run_case(case).await;
     }
+}
+
+#[tokio::test]
+async fn routed_proxy_branches_keep_native_dispatch_and_bind_schema_v3_evidence() {
+    run_case(MatrixCase {
+        name: "routed-observe-capable",
+        mode: RouteMode::Observe,
+        expected_original: 1,
+        expected_candidate: 0,
+        expected_target: PlanTarget::Original,
+        expected_evidence: EvidenceState::NotRequired,
+        routing: RoutingSetup::Capable,
+        ..base_case("routed-observe-capable")
+    })
+    .await;
+    run_case(MatrixCase {
+        name: "routed-recommend-capable",
+        mode: RouteMode::Recommend,
+        expected_original: 1,
+        expected_candidate: 0,
+        expected_target: PlanTarget::Original,
+        // Routing is schema-v3 evidence. The normal recommendation evidence remains intact.
+        expected_evidence: EvidenceState::Presented,
+        routing: RoutingSetup::Capable,
+        ..base_case("routed-recommend-capable")
+    })
+    .await;
+    run_case(MatrixCase {
+        name: "routed-recommend-unavailable",
+        mode: RouteMode::Recommend,
+        expected_original: 1,
+        expected_candidate: 0,
+        expected_target: PlanTarget::Original,
+        expected_evidence: EvidenceState::Presented,
+        routing: RoutingSetup::UnavailableMissingMetadata,
+        ..base_case("routed-recommend-unavailable")
+    })
+    .await;
+    run_case(MatrixCase {
+        name: "routed-enforce-efficient",
+        routing: RoutingSetup::Efficient,
+        ..base_case("routed-enforce-efficient")
+    })
+    .await;
+    run_case(MatrixCase {
+        name: "routed-efficient-grant-loss-bypass",
+        evidence: EvidenceSetup::Missing,
+        expected_original: 1,
+        expected_candidate: 0,
+        expected_target: PlanTarget::Original,
+        expected_evidence: EvidenceState::Unverified,
+        routing: RoutingSetup::Efficient,
+        ..base_case("routed-efficient-grant-loss-bypass")
+    })
+    .await;
+    run_case(MatrixCase {
+        name: "routed-efficient-grant-loss-fail-closed",
+        evidence: EvidenceSetup::Missing,
+        fallback: FallbackMode::FailClosed,
+        expected_status: 503,
+        expected_original: 0,
+        expected_candidate: 0,
+        expected_target: PlanTarget::None,
+        expected_evidence: EvidenceState::Unverified,
+        expected_completion: CompletionStateV2::Local,
+        routing: RoutingSetup::Efficient,
+        ..base_case("routed-efficient-grant-loss-fail-closed")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn real_proxy_switchyard_wire_uses_only_the_routed_binding_and_skips_unavailable() {
+    const AUTH_ENV: &str = "BOWLINE_PROXY_SWITCHYARD_AUTH";
+    std::env::set_var(AUTH_ENV, "Bearer proxy-fixture-secret");
+    let (payload_tx, mut payload_rx) = tokio::sync::mpsc::channel(2);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route(
+                    "/decision",
+                    post(
+                        |State(sender): State<tokio::sync::mpsc::Sender<serde_json::Value>>,
+                         Json(value): Json<serde_json::Value>| async move {
+                            sender.send(value).await.unwrap();
+                            Json(serde_json::json!({"backend_id":"capable-backend"}))
+                        },
+                    ),
+                )
+                .with_state(payload_tx),
+        )
+        .await
+        .unwrap();
+    });
+    let adapter = Arc::new(
+        crate::switchyard_observe::SwitchyardObserveAdapter::new(&SwitchyardObserveConfig {
+            version: 1,
+            decision_api_url: format!("http://{address}/decision"),
+            profile_id: "stage-main".into(),
+            authorization_env: AUTH_ENV.into(),
+            timeout_ms: 100,
+            capable_backend_id: "capable-backend".into(),
+            efficient_backend_id: "efficient-backend".into(),
+            observation_queue_capacity: 2,
+            remote_acknowledged: false,
+        })
+        .unwrap(),
+    );
+
+    run_case_with_switchyard(
+        MatrixCase {
+            name: "proxy-switchyard-capable",
+            mode: RouteMode::Observe,
+            expected_original: 1,
+            expected_candidate: 0,
+            expected_target: PlanTarget::Original,
+            expected_evidence: EvidenceState::NotRequired,
+            routing: RoutingSetup::Capable,
+            ..base_case("proxy-switchyard-capable")
+        },
+        Some(Arc::clone(&adapter)),
+    )
+    .await;
+    let payload = tokio::time::timeout(Duration::from_secs(1), payload_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "protocol",
+            "schema_version",
+            "signals",
+            "step_id",
+            "task_ref"
+        ]
+    );
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["protocol"], "responses");
+    assert_eq!(payload["step_id"], 1);
+    assert_eq!(
+        payload["task_ref"],
+        bowline_core::routing::task_reference("routed-task").unwrap()
+    );
+    assert_eq!(payload["signals"], serde_json::json!(["critical-error"]));
+    let wire = payload.to_string();
+    for forbidden in [
+        "proxy-fixture-secret",
+        "routed-task",
+        "input",
+        "hello",
+        "x-bowline",
+        "support",
+        "tag",
+        "source",
+        "adapter_version",
+        "profile_version",
+        "profile_id_digest",
+        "config_digest",
+        "native_target",
+    ] {
+        assert!(!wire.contains(forbidden), "proxy wire leaked {forbidden}");
+    }
+
+    run_case_with_switchyard(
+        MatrixCase {
+            name: "proxy-switchyard-unavailable",
+            mode: RouteMode::Observe,
+            expected_original: 1,
+            expected_candidate: 0,
+            expected_target: PlanTarget::Original,
+            expected_evidence: EvidenceState::NotRequired,
+            routing: RoutingSetup::UnavailableMissingMetadata,
+            ..base_case("proxy-switchyard-unavailable")
+        },
+        Some(adapter),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), payload_rx.recv())
+            .await
+            .is_err(),
+        "unavailable routing must not enqueue a Switchyard proposal"
+    );
+    fixture.abort();
+    std::env::remove_var(AUTH_ENV);
 }
 
 #[tokio::test]
@@ -561,6 +767,7 @@ fn base_case(name: &'static str) -> MatrixCase {
         original_status: 200,
         original_attribution: None,
         original_upstream_override: None,
+        routing: RoutingSetup::None,
     }
 }
 
@@ -588,6 +795,8 @@ fn parity_config(upstream: &str, root: &std::path::Path) -> Config {
         authority_signing: None,
         promotion_approval: None,
         state_backend: None,
+        routing: None,
+        switchyard_observe: None,
         trusted_proxy_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
         runtime: RuntimeConfig::default(),
     }
@@ -1127,6 +1336,13 @@ fn startup_case(
 }
 
 async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
+    run_case_with_switchyard(case, None).await
+}
+
+async fn run_case_with_switchyard(
+    case: MatrixCase,
+    switchyard_observe: Option<Arc<crate::switchyard_observe::SwitchyardObserveAdapter>>,
+) -> Option<ShadowParityEvidence> {
     let root = tempfile::tempdir().unwrap();
     let redirect_target_count = Arc::new(AtomicUsize::new(0));
     let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1163,17 +1379,25 @@ async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
 
     let upstream_count = Arc::new(AtomicUsize::new(0));
     let upstream_bodies = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let upstream_routing_headers = Arc::new(Mutex::new(Vec::<bool>::new()));
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream_listener.local_addr().unwrap();
     let upstream_app = Router::new().fallback(any({
         let count = Arc::clone(&upstream_count);
         let bodies = Arc::clone(&upstream_bodies);
+        let routing_headers = Arc::clone(&upstream_routing_headers);
         move |request: Request<Body>| {
             let count = Arc::clone(&count);
             let bodies = Arc::clone(&bodies);
+            let routing_headers = Arc::clone(&routing_headers);
             async move {
                 count.fetch_add(1, Ordering::AcqRel);
-                let body = axum::body::to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
+                let (parts, body) = request.into_parts();
+                routing_headers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(parts.headers.keys().any(|name| name.as_str().starts_with("x-bowline-")));
+                let body = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)
                     .await
                     .unwrap();
                 bodies
@@ -1214,9 +1438,8 @@ async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
         evidence_now + 60_000
     };
     let source = enforcement_source(case, &kill_root, &candidate_base, expires_at_ms);
-    let raw = EnforcementConfigV1::from_yaml(&source)
-        .unwrap_or_else(|error| panic!("{} config parse failed: {error}", case.name));
-    let validated = raw
+    let validated = bowline_core::enforcement::EnforcementConfig::from_yaml(&source)
+        .unwrap_or_else(|error| panic!("{} config parse failed: {error}", case.name))
         .validate()
         .unwrap_or_else(|error| panic!("{} config validation failed: {error}", case.name));
     let validation = validated
@@ -1305,7 +1528,7 @@ async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
     if case.post_rejection_closing {
         writer.install_post_rejection_closing_hook();
     }
-    let actuators = ActuatorRegistry::new(1, raw.actuators).unwrap();
+    let actuators = ActuatorRegistry::new(1, validated.actuators().cloned()).unwrap();
     let raw_kill_reader =
         KillStateReader::open(&kill_root.canonicalize().unwrap(), "state").unwrap();
     if case.name == "recommend-kill-missing" {
@@ -1344,6 +1567,24 @@ async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
         writer: writer.clone(),
         terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
         last_kill_state: Mutex::new(KillReadResult::Unreadable),
+        routing_state: match case.routing {
+            RoutingSetup::None => None,
+            RoutingSetup::Capable
+            | RoutingSetup::Efficient
+            | RoutingSetup::UnavailableMissingMetadata => Some(Arc::new(
+                crate::routing_state::RoutingStateStore::open(
+                    root.path(),
+                    crate::routing_state::RoutingStateLimits {
+                        max_active_tasks: 16,
+                        segment_bytes: 64 * 1024,
+                        max_segments: 4,
+                    },
+                )
+                .unwrap(),
+            )),
+        },
+        routing_startup_unavailable: None,
+        switchyard_observe,
     });
 
     let mut held_permit = None;
@@ -1493,6 +1734,22 @@ rules:
     if case.original_upstream_override.is_some() {
         headers.insert("x-parity-request", "same".parse().unwrap());
     }
+    match case.routing {
+        RoutingSetup::None | RoutingSetup::UnavailableMissingMetadata => {}
+        RoutingSetup::Capable => {
+            headers.insert("x-bowline-task-id", "routed-task".parse().unwrap());
+            headers.insert("x-bowline-step-id", "1".parse().unwrap());
+            headers.insert(
+                "x-bowline-agent-signals",
+                r#"["critical-error"]"#.parse().unwrap(),
+            );
+        }
+        RoutingSetup::Efficient => {
+            headers.insert("x-bowline-task-id", "routed-task".parse().unwrap());
+            headers.insert("x-bowline-step-id", "1".parse().unwrap());
+            headers.insert("x-bowline-agent-signals", r#"["write"]"#.parse().unwrap());
+        }
+    }
     let mut request = Request::builder().method("POST").uri(path);
     for (name, value) in &headers {
         request = request.header(name, value);
@@ -1602,6 +1859,15 @@ rules:
     assert!(
         upstream_count.load(Ordering::Acquire) + candidate_count.load(Ordering::Acquire) <= 1,
         "{} retried",
+        case.name
+    );
+    assert!(
+        upstream_routing_headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .all(|present| !present),
+        "{} leaked a Bowline header upstream",
         case.name
     );
 
@@ -1716,6 +1982,78 @@ rules:
             "{} outcome task",
             case.name
         );
+        match case.routing {
+            RoutingSetup::None => {
+                assert!(decision.routing.is_none(), "{} decision routing", case.name);
+                assert!(outcome.routing.is_none(), "{} outcome routing", case.name);
+            }
+            RoutingSetup::Capable => {
+                assert!(
+                    matches!(
+                        decision.routing.as_ref(),
+                        Some(bowline_core::ledger::AuthorityRoutingBindingV3::Decision {
+                            semantic_target: bowline_core::routing::RoutingTarget::Capable,
+                            source:
+                                bowline_core::ledger::RoutingDecisionSourceV3::TrustedImmediatePeer,
+                            ..
+                        })
+                    ),
+                    "{} capable binding: {:?}",
+                    case.name,
+                    decision.routing
+                );
+                assert_eq!(
+                    decision.routing, outcome.routing,
+                    "{} routing pair",
+                    case.name
+                );
+            }
+            RoutingSetup::Efficient => {
+                assert!(
+                    matches!(
+                        decision.routing.as_ref(),
+                        Some(bowline_core::ledger::AuthorityRoutingBindingV3::Decision {
+                            semantic_target: bowline_core::routing::RoutingTarget::Efficient,
+                            source:
+                                bowline_core::ledger::RoutingDecisionSourceV3::TrustedImmediatePeer,
+                            ..
+                        })
+                    ),
+                    "{} efficient binding: {:?}",
+                    case.name,
+                    decision.routing
+                );
+                assert_eq!(
+                    decision.routing, outcome.routing,
+                    "{} routing pair",
+                    case.name
+                );
+            }
+            RoutingSetup::UnavailableMissingMetadata => {
+                assert!(
+                    matches!(
+                        decision.routing.as_ref(),
+                        Some(
+                            bowline_core::ledger::AuthorityRoutingBindingV3::Unavailable {
+                                cause:
+                                    bowline_core::ledger::RoutingUnavailableCauseV3::MissingMetadata,
+                                source:
+                                    bowline_core::ledger::RoutingDecisionSourceV3::InferenceGateway,
+                                ..
+                            }
+                        )
+                    ),
+                    "{} unavailable binding: {:?}",
+                    case.name,
+                    decision.routing
+                );
+                assert_eq!(
+                    decision.routing, outcome.routing,
+                    "{} routing pair",
+                    case.name
+                );
+            }
+        }
         if case.expect_unresolved_app {
             assert_eq!(decision.app, None, "{} decision app", case.name);
             assert_eq!(outcome.app, None, "{} outcome app", case.name);
@@ -2013,6 +2351,17 @@ fn enforcement_source(
     } else {
         String::new()
     };
+    let authority = if case.routing != RoutingSetup::None
+        && case.protocol != AuthorityProtocol::Embeddings
+        && case.mode == RouteMode::Observe
+    {
+        format!(
+            "    promoted_supply_id: candidate\n    actual_supply_id: baseline\n    task_class: {}\n",
+            task_yaml(case.route_task),
+        )
+    } else {
+        authority
+    };
     let workload = if case.protocol == AuthorityProtocol::Embeddings {
         String::new()
     } else {
@@ -2048,9 +2397,29 @@ fn enforcement_source(
                 f = active.owned_cost_digest()
             )
         };
+    let routing_profile = if case.routing == RoutingSetup::None {
+        String::new()
+    } else {
+        r#"
+routing_profiles:
+  - profile_id: stage-main
+    kind: stage
+    recent_window: 4
+    error_threshold: 2
+    exploration_threshold: 2
+    progress_threshold: 1
+    default_target: capable
+"#
+        .to_owned()
+    };
+    let routing_route = if case.routing == RoutingSetup::None {
+        String::new()
+    } else {
+        "    routing_profile_id: stage-main\n".to_owned()
+    };
     format!(
         r#"
-version: 1
+version: {version}
 global_candidate_in_flight: 1
 kill_switch: {{trust_root: {kill_root}, relative_path: state}}
 actuators:
@@ -2074,8 +2443,13 @@ routes:
 {workload}
     mode: {mode}
     rollout_ppm: {rollout}
-{authority}{promotion}
+{authority}{routing_route}{promotion}{routing_profile}
 "#,
+        version = if case.routing == RoutingSetup::None {
+            1
+        } else {
+            2
+        },
         kill_root = kill_root.display(),
         candidate_base = candidate_base,
         path = path,
@@ -2084,7 +2458,9 @@ routes:
         rollout = case.rollout_ppm,
         workload = workload,
         authority = authority,
+        routing_route = routing_route,
         promotion = promotion,
+        routing_profile = routing_profile,
     )
 }
 

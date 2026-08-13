@@ -396,6 +396,11 @@ impl AuthorizedDispatchHandle {
                 decision.mode,
                 bowline_core::enforcement::RouteMode::Observe
                     | bowline_core::enforcement::RouteMode::Recommend
+            )
+            || matches!(
+                decision.reason,
+                bowline_core::enforcement::SelectionReason::RoutingCapable
+                    | bowline_core::enforcement::SelectionReason::RoutingUnavailable
             ) {
             None
         } else {
@@ -443,6 +448,7 @@ impl AuthorizedDispatchHandle {
             observed_actual_cost_micros: None,
             approved_counterfactual_cost_micros: None,
             enforced_modeled_delta_micros: None,
+            routing: decision.routing.clone(),
         };
         if modeled_delta_applicable(&outcome) {
             if let Some(grant) = payload.verified_grant.as_ref() {
@@ -1057,6 +1063,7 @@ impl ManagedAuthorityWriter {
             observed_actual_cost_micros: None,
             approved_counterfactual_cost_micros: None,
             enforced_modeled_delta_micros: None,
+            routing: decision.routing.clone(),
         };
         if outcome.validate().is_err() || validate_authority_pair_v2(decision, &outcome).is_err() {
             candidate.invalidate("pre-dispatch rejection outcome was invalid");
@@ -2227,7 +2234,7 @@ fn process_authority_record(
     ledger
         .flush()
         .map_err(|error| AuthorityRecordFailure::Transport(error.to_string()))?;
-    run.recorded(sequence)
+    run.recorded_with_schema(sequence, record.schema_version())
         .map_err(|error| AuthorityRecordFailure::Transport(error.to_string()))?;
     run.flush()
         .map_err(|error| AuthorityRecordFailure::Transport(error.to_string()))?;
@@ -5396,6 +5403,7 @@ routes:
             enforcement_config_digest: digest(8),
             route_config_digest: digest(9),
             model_rewritten: false,
+            routing: None,
         }
     }
 
@@ -5455,6 +5463,7 @@ routes:
             observed_actual_cost_micros: Some(1),
             approved_counterfactual_cost_micros: Some(2),
             enforced_modeled_delta_micros: Some(1),
+            routing: None,
         }
     }
 

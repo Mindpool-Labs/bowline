@@ -67,6 +67,8 @@ async fn enforcement_requires_active_provenance_from_injected_dependencies() {
         authority_signing: None,
         promotion_approval: None,
         state_backend: None,
+        routing: None,
+        switchyard_observe: None,
         trusted_proxy_cidrs: Vec::new(),
         runtime: RuntimeConfig::default(),
     };
@@ -1278,6 +1280,8 @@ async fn spawn_gateway_with_runtime(upstream: String, runtime: RuntimeConfig) ->
         authority_signing: None,
         promotion_approval: None,
         state_backend: None,
+        routing: None,
+        switchyard_observe: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime,
     };
@@ -1333,6 +1337,8 @@ async fn spawn_gateway_with_shadow(upstream: String, ledger_dir: &std::path::Pat
         authority_signing: None,
         promotion_approval: None,
         state_backend: None,
+        routing: None,
+        switchyard_observe: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime: RuntimeConfig::default(),
     };
@@ -1400,6 +1406,8 @@ async fn spawn_managed_gateway(
         authority_signing: None,
         promotion_approval: None,
         state_backend: None,
+        routing: None,
+        switchyard_observe: None,
         trusted_proxy_cidrs,
         runtime,
     };
@@ -1465,6 +1473,8 @@ async fn spawn_managed_gateway_with_registry(
         authority_signing: None,
         promotion_approval: None,
         state_backend: None,
+        routing: None,
+        switchyard_observe: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().expect("loopback CIDR")],
         runtime: RuntimeConfig::default(),
     };

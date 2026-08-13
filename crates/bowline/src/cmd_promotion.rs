@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, process::ExitCode, time::SystemTime};
 
 use anyhow::Context;
 use bowline_core::enforcement::{
-    operator_safe_route_id, ActiveRuntimeProvenance, AuthorityProtocol, EnforcementConfigV1,
+    operator_safe_route_id, ActiveRuntimeProvenance, AuthorityProtocol, EnforcementConfig,
 };
 use bowline_gateway::enforcement_loader::seal_promotion_authorization_for_route;
 
@@ -48,7 +48,7 @@ fn seal(config_path: PathBuf, route_id: String) -> anyhow::Result<ExitCode> {
             enforcement_path.display()
         )
     })?;
-    let validated = EnforcementConfigV1::from_yaml(&source)
+    let validated = EnforcementConfig::from_yaml(&source)
         .context("failed to parse enforcement bundle")?
         .validate()
         .context("failed to validate enforcement bundle")?;

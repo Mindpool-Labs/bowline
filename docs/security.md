@@ -1,5 +1,9 @@
 # Security
 
+## Routing boundary
+
+Routing stores a task digest, never a raw task ID, prompt, response, tool argument, body, or source content. The advisory listener requires an exact Authorization value from a named environment variable and does not log or persist it. Switchyard observations contain only digest, protocol, step, and enumerated signals; remote use needs explicit HTTPS acknowledgement.
+
 Bowline's Phase 1 security objective is byte-faithful default forwarding plus exact, bounded,
 reversible controlled authority with local integrity-disclosed evidence. It is not a content
 classifier or secret store.

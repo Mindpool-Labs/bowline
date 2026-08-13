@@ -1,5 +1,9 @@
 # Operations
 
+## Routing operations
+
+Monitor aggregate routing readiness, task/segment capacity, and dropped observations. Corruption, capacity exhaustion, or writer failure is routing-unavailable and retains the capable target. On file-lease loss, the advisory listener drains before runtime deactivation and starts only after takeover activation. Do not treat Switchyard telemetry as authority.
+
 ## Health and capacity
 
 `/health/live` proves the process loop is serving. `/health/ready` is 200 only while durable

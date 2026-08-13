@@ -1,5 +1,8 @@
 # Phase 1 limitations
 
+- Task state is durable and bounded, but circuit and admission state remains volatile and resets on restart or file-lease takeover. Bowline does not use learned routing. Controlled enforcement does not inspect prompt or response content. Promotion remains an external approval sequence.
+- Switchyard is observe-only. It is not an authority service, runtime dependency, provider proxy, or dispatch path.
+
 - Shadow is the default. Controlled authority exists only for exact verified Chat/Responses grants;
   all other traffic retains the original upstream or configured local failure behavior.
 - Inline decision evidence supports OpenAI-compatible Chat Completions, Responses, and Embeddings.

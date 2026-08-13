@@ -1,0 +1,9 @@
+# Synthetic schema-v2 routing example. It contains no credentials or generated evidence.
+version: 2
+global_candidate_in_flight: 1
+kill_switch: { trust_root: /private/bowline-kill, relative_path: state }
+actuators: []
+routing_profiles:
+  - { profile_id: stage-main, kind: stage, recent_window: 8, error_threshold: 2, exploration_threshold: 2, progress_threshold: 3, default_target: capable }
+routes:
+  - { route_id: chat-stage, method: POST, path: /v1/chat/completions, protocol: chat-completions, mode: observe, rollout_ppm: 0, actual_supply_id: capable-supply, promoted_supply_id: efficient-supply, routing_profile_id: stage-main }

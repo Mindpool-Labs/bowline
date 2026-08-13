@@ -279,6 +279,42 @@ impl GatewayEnforcementPlan {
         self.plan.reason
     }
 
+    /// A stage profile can intentionally retain the configured capable upstream. This is prior to
+    /// candidate authority and must never be represented as a failed candidate fallback.
+    pub(crate) fn retain_capable(
+        &mut self,
+        reason: SelectionReason,
+    ) -> Result<(), EnforcementLoadError> {
+        if !matches!(
+            reason,
+            SelectionReason::RoutingCapable | SelectionReason::RoutingUnavailable
+        ) {
+            return Err(EnforcementLoadError::Invalid(
+                "invalid routing retention reason".into(),
+            ));
+        }
+        // A pre-existing normal fallback (for example a missing grant) is still the
+        // schema-v2 reason for the original dispatch. Routing is carried only in the
+        // schema-v3 binding. Only a would-be candidate needs a routing retention reason.
+        if self.plan.target != PlanTarget::Candidate {
+            return Ok(());
+        }
+        self.plan.target = PlanTarget::Original;
+        self.plan.reason = reason;
+        self.plan.evidence_state =
+            if self.plan.mode == bowline_core::enforcement::RouteMode::Observe {
+                EvidenceState::NotRequired
+            } else {
+                EvidenceState::Unverified
+            };
+        self.plan.selected_supply_id = self.plan.baseline_supply_id.clone();
+        self.plan.actuator_digest = None;
+        self.plan.model_rewritten = false;
+        self.plan.grant_digest = None;
+        self.plan.dispatch_count = 1;
+        Ok(())
+    }
+
     pub fn evidence_state(&self) -> GatewayEvidenceState {
         self.evidence_state
     }

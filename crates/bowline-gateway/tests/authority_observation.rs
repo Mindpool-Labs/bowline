@@ -46,6 +46,7 @@ fn fabricated_candidate_schema_cannot_cross_the_zero_authority_boundary() {
             resolved_tags: vec!["production".into()],
             request_body_digest: [7; 32],
             requested_supply_id: None,
+            routing: None,
         },
     );
     assert!(result.is_err());
@@ -82,6 +83,7 @@ fn zero_authority_mapping_rejects_candidate_only_context() {
         resolved_tags: vec!["production".into()],
         request_body_digest: [7; 32],
         requested_supply_id: None,
+        routing: None,
     };
     let prepared = prepare_zero_authority_decision_v2(&plan, context).unwrap();
     assert!(!prepared.decision().grants_candidate_authority());

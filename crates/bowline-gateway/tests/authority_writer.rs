@@ -65,6 +65,7 @@ fn decision(id: &str) -> PreparedAuthorityDecisionV2 {
             resolved_tags: vec!["production".into()],
             request_body_digest: [7; 32],
             requested_supply_id: None,
+            routing: None,
         },
     )
     .unwrap()
@@ -113,6 +114,7 @@ fn outcome(id: &str) -> AuthorityOutcomeV2 {
         observed_actual_cost_micros: None,
         approved_counterfactual_cost_micros: None,
         enforced_modeled_delta_micros: None,
+        routing: None,
     }
 }
 
@@ -150,6 +152,7 @@ async fn configured_unicode_punctuation_identifiers_persist_as_a_complete_author
             resolved_tags: vec!["environment:test".into(), "région:eu-west/1".into()],
             request_body_digest: [7; 32],
             requested_supply_id: Some("requested/模型:v1?".into()),
+            routing: None,
         },
     )
     .unwrap();

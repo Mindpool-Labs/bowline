@@ -4,9 +4,10 @@ use bowline_core::{
     },
     ledger::{
         validate_authority_run_v2, AuthorityDecisionV2, AuthorityFallbackReasonV2,
-        AuthorityGrantBindingV2, AuthorityOutcomeV2, AuthorityRecordV2,
+        AuthorityGrantBindingV2, AuthorityOutcomeV2, AuthorityRecordV2, AuthorityRoutingBindingV3,
         AuthorityRunValidationError, AuthoritySelectionFactsV2, CandidateFailureClassV2,
-        CircuitStateV2, CompletionStateV2, UsageSource,
+        CircuitStateV2, CompletionStateV2, RoutingDecisionSourceV3, RoutingUnavailableCauseV3,
+        UsageSource,
     },
     run::AuthorityRunManifestV2,
     supply::TaskClass,
@@ -14,6 +15,237 @@ use bowline_core::{
 
 fn digest(label: &str) -> String {
     format!("sha256:{:064x}", label.len())
+}
+
+#[test]
+fn schema_v3_routing_linkage_is_strict_and_v2_remains_readable() {
+    let routing = AuthorityRoutingBindingV3::Decision {
+        routing_decision_digest: digest("routing-decision"),
+        routing_state_digest: digest("routing-state"),
+        profile_digest: digest("profile"),
+        task_reference_digest: digest("task-ref"),
+        step_id: 1,
+        semantic_target: bowline_core::routing::RoutingTarget::Efficient,
+        reason: bowline_core::routing::RoutingReason::RecentProgress,
+        source: RoutingDecisionSourceV3::TrustedImmediatePeer,
+    };
+    let mut decision = candidate_decision();
+    decision.routing = Some(routing.clone());
+    let mut outcome = success_outcome();
+    outcome.routing = Some(routing.clone());
+    let records = vec![
+        AuthorityRecordV2::decision(1, decision.clone()).unwrap(),
+        AuthorityRecordV2::outcome(2, outcome.clone()).unwrap(),
+    ];
+    assert!(matches!(
+        records[0],
+        AuthorityRecordV2::Decision {
+            schema_version: 3,
+            ..
+        }
+    ));
+    let mut v3_manifest = manifest(2);
+    v3_manifest.schema_version = 3;
+    validate_authority_run_v2(&v3_manifest, &records).unwrap();
+
+    let impossible = AuthorityRoutingBindingV3::Decision {
+        routing_decision_digest: digest("routing-decision"),
+        routing_state_digest: digest("routing-state"),
+        profile_digest: digest("profile"),
+        task_reference_digest: digest("task-ref"),
+        step_id: 1,
+        semantic_target: bowline_core::routing::RoutingTarget::Capable,
+        reason: bowline_core::routing::RoutingReason::RecentProgress,
+        source: RoutingDecisionSourceV3::TrustedImmediatePeer,
+    };
+    assert!(impossible.validate().is_err());
+
+    outcome.routing = None;
+    assert_eq!(
+        validate_authority_run_v2(
+            &v3_manifest,
+            &[
+                AuthorityRecordV2::decision(1, decision).unwrap(),
+                AuthorityRecordV2::outcome(2, outcome).unwrap(),
+            ],
+        ),
+        Err(AuthorityRunValidationError::PairMismatch)
+    );
+}
+
+#[test]
+fn every_routing_unavailable_cause_has_a_schema_v3_binding_and_v2_has_no_new_enum() {
+    let causes = [
+        (
+            RoutingUnavailableCauseV3::MissingMetadata,
+            RoutingDecisionSourceV3::InferenceGateway,
+        ),
+        (
+            RoutingUnavailableCauseV3::UntrustedMetadata,
+            RoutingDecisionSourceV3::InferenceGateway,
+        ),
+        (
+            RoutingUnavailableCauseV3::MalformedMetadata,
+            RoutingDecisionSourceV3::InferenceGateway,
+        ),
+        (
+            RoutingUnavailableCauseV3::StepConflict,
+            RoutingDecisionSourceV3::TrustedImmediatePeer,
+        ),
+        (
+            RoutingUnavailableCauseV3::CapacityExhausted,
+            RoutingDecisionSourceV3::TrustedImmediatePeer,
+        ),
+        (
+            RoutingUnavailableCauseV3::StateCorrupt,
+            RoutingDecisionSourceV3::ConfiguredStartup,
+        ),
+        (
+            RoutingUnavailableCauseV3::WriterFailure,
+            RoutingDecisionSourceV3::TrustedImmediatePeer,
+        ),
+        (
+            RoutingUnavailableCauseV3::StartupUnavailable,
+            RoutingDecisionSourceV3::ConfiguredStartup,
+        ),
+    ];
+    for (cause, source) in causes {
+        let routing = AuthorityRoutingBindingV3::Unavailable {
+            profile_digest: digest("profile"),
+            cause,
+            source,
+        };
+        routing
+            .validate()
+            .unwrap_or_else(|error| panic!("{cause:?}: {error}"));
+
+        let mut decision = candidate_decision();
+        decision.decision_id = format!("unavailable-{cause:?}").to_lowercase();
+        decision.reason = SelectionReason::RoutingUnavailable;
+        decision.evidence_state = EvidenceState::Unverified;
+        decision.target = PlanTarget::Original;
+        decision.intended_dispatch = 1;
+        decision.selection_facts =
+            AuthoritySelectionFactsV2::canonical_non_authority(KillReadResult::Armed);
+        decision.grant = None;
+        decision.selected_supply_id = decision.baseline_supply_id.clone();
+        decision.actuator_identity_digest = None;
+        decision.actuator_config_digest = None;
+        decision.model_rewritten = false;
+        decision.routing = Some(routing.clone());
+        let mut outcome = success_outcome();
+        outcome.decision_id = decision.decision_id.clone();
+        outcome.target = PlanTarget::Original;
+        outcome.actual_dispatch = 1;
+        outcome.fallback_reason = None;
+        outcome.selection_facts = decision.selection_facts.clone();
+        outcome.grant_digest = None;
+        outcome.grant_expires_at_ms = None;
+        outcome.model_rewritten = false;
+        outcome.selected_supply_id = outcome.baseline_supply_id.clone();
+        outcome.actuator_identity_digest = None;
+        outcome.actuator_config_digest = None;
+        outcome.circuit_before = decision.selection_facts.circuit_before;
+        outcome.circuit_after = decision.selection_facts.circuit_before;
+        outcome.observed_actual_cost_micros = None;
+        outcome.approved_counterfactual_cost_micros = None;
+        outcome.enforced_modeled_delta_micros = None;
+        outcome.routing = Some(routing);
+        assert_eq!(
+            AuthorityRecordV2::decision(1, decision)
+                .unwrap()
+                .schema_version(),
+            3
+        );
+        assert_eq!(
+            AuthorityRecordV2::outcome(2, outcome)
+                .unwrap()
+                .schema_version(),
+            3
+        );
+    }
+
+    let v2_json = serde_json::to_value(candidate_decision()).unwrap();
+    assert!(v2_json.get("routing").is_none());
+    assert!(!v2_json.to_string().contains("unavailable-cause"));
+}
+
+#[test]
+fn schema_v2_rejects_routing_only_fallback_strings_and_keeps_legacy_bytes() {
+    for value in ["routing-capable", "routing-unavailable"] {
+        assert!(
+            serde_json::from_value::<AuthorityFallbackReasonV2>(serde_json::json!(value)).is_err()
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&AuthorityFallbackReasonV2::GrantMissing).unwrap(),
+        "\"grant-missing\""
+    );
+    assert!(AuthorityFallbackReasonV2::try_from(SelectionReason::RoutingCapable).is_err());
+    assert!(AuthorityFallbackReasonV2::try_from(SelectionReason::RoutingUnavailable).is_err());
+}
+
+#[test]
+fn routing_unavailable_preserves_original_dispatch_in_every_route_mode() {
+    for (mode, evidence_state) in [
+        (RouteMode::Observe, EvidenceState::NotRequired),
+        (RouteMode::Recommend, EvidenceState::Unverified),
+        (RouteMode::CanaryEnforce, EvidenceState::Unverified),
+    ] {
+        let routing = AuthorityRoutingBindingV3::Unavailable {
+            profile_digest: digest("profile"),
+            cause: RoutingUnavailableCauseV3::MissingMetadata,
+            source: RoutingDecisionSourceV3::InferenceGateway,
+        };
+        let mut decision = candidate_decision();
+        decision.mode = mode;
+        decision.reason = SelectionReason::RoutingUnavailable;
+        decision.evidence_state = evidence_state;
+        decision.target = PlanTarget::Original;
+        decision.intended_dispatch = 1;
+        decision.selection_facts =
+            AuthoritySelectionFactsV2::canonical_non_authority(KillReadResult::Armed);
+        decision.grant = None;
+        decision.selected_supply_id = decision.baseline_supply_id.clone();
+        decision.actuator_identity_digest = None;
+        decision.actuator_config_digest = None;
+        decision.model_rewritten = false;
+        decision.routing = Some(routing.clone());
+        decision
+            .validate()
+            .unwrap_or_else(|error| panic!("{mode:?}: {error}"));
+
+        let mut outcome = success_outcome();
+        outcome.mode = mode;
+        outcome.target = PlanTarget::Original;
+        outcome.actual_dispatch = 1;
+        outcome.fallback_reason = None;
+        outcome.selection_facts = decision.selection_facts.clone();
+        outcome.grant_digest = None;
+        outcome.grant_expires_at_ms = None;
+        outcome.model_rewritten = false;
+        outcome.selected_supply_id = outcome.baseline_supply_id.clone();
+        outcome.actuator_identity_digest = None;
+        outcome.actuator_config_digest = None;
+        outcome.circuit_before = decision.selection_facts.circuit_before;
+        outcome.circuit_after = decision.selection_facts.circuit_before;
+        outcome.observed_actual_cost_micros = None;
+        outcome.approved_counterfactual_cost_micros = None;
+        outcome.enforced_modeled_delta_micros = None;
+        outcome.routing = Some(routing);
+        validate_authority_run_v2(
+            &{
+                let mut manifest = manifest(2);
+                manifest.schema_version = 3;
+                manifest
+            },
+            &[
+                AuthorityRecordV2::decision(1, decision).unwrap(),
+                AuthorityRecordV2::outcome(2, outcome).unwrap(),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("{mode:?}: {error}"));
+    }
 }
 
 fn candidate_decision() -> AuthorityDecisionV2 {
@@ -49,6 +281,7 @@ fn candidate_decision() -> AuthorityDecisionV2 {
         enforcement_config_digest: digest("enforcement"),
         route_config_digest: digest("route"),
         model_rewritten: true,
+        routing: None,
     }
 }
 
@@ -180,6 +413,7 @@ fn success_outcome() -> AuthorityOutcomeV2 {
         observed_actual_cost_micros: Some(10),
         approved_counterfactual_cost_micros: Some(20),
         enforced_modeled_delta_micros: Some(10),
+        routing: None,
     }
 }
 

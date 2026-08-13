@@ -232,6 +232,8 @@ fn file_config(
             poll_interval_ms: 25,
             takeover_timeout_ms: 1_000,
         }),
+        routing: None,
+        switchyard_observe: None,
         trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().unwrap()],
         runtime: RuntimeConfig::default(),
     }

@@ -68,6 +68,11 @@ pub struct PublicEnforcementHealth {
     pub grant_freshness: GrantFreshnessCounts,
     pub candidate_admission: CandidateAdmissionHealth,
     pub active_fail_closed_routes_on_unavailable_actuators: usize,
+    /// True when at least one route has a deterministic routing profile.  A configured but
+    /// unavailable state store is visible as degraded rather than being hidden as unconfigured.
+    pub routing_configured: bool,
+    pub routing: Option<crate::routing_state::RoutingStateHealth>,
+    pub switchyard_observe: Option<crate::switchyard_observe::SwitchyardObserveHealth>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -152,13 +157,23 @@ impl GatewayHealth {
             && enforcement.evidence_valid
             && enforcement.grant_freshness.stale == 0
             && enforcement.grant_freshness.unverified == 0
-            && enforcement.active_fail_closed_routes_on_unavailable_actuators == 0;
+            && enforcement.active_fail_closed_routes_on_unavailable_actuators == 0
+            && (!enforcement.routing_configured
+                || enforcement
+                    .routing
+                    .as_ref()
+                    .is_some_and(|routing| routing.ready));
         let degraded = enforcement.kill_state != KillReadResult::Armed
             || enforcement.circuits.open > 0
             || enforcement.circuits.half_open > 0
             || enforcement.grant_freshness.stale > 0
             || enforcement.grant_freshness.unverified > 0
-            || enforcement.candidate_admission.saturation_count > 0;
+            || enforcement.candidate_admission.saturation_count > 0
+            || (enforcement.routing_configured
+                && enforcement
+                    .routing
+                    .as_ref()
+                    .is_none_or(|routing| !routing.ready));
         ControlledHealthSnapshot {
             mode: "controlled",
             ready: writer_ready && enforcement_ready,
@@ -335,6 +350,9 @@ mod tests {
                 saturation_count: 1,
             },
             active_fail_closed_routes_on_unavailable_actuators: 0,
+            routing_configured: false,
+            routing: None,
+            switchyard_observe: None,
         };
         let snapshot = health.controlled_snapshot(&enforcement);
         let json = serde_json::to_string(&snapshot).unwrap();

@@ -39,8 +39,15 @@ pub struct ControlledEnforcementTotals {
     pub bypasses: u64,
     pub fail_closed: u64,
     pub failures: u64,
+    /// Failures of a candidate dispatch only. Original-path failures remain in `failures`.
+    pub candidate_failures: u64,
     pub cancellations: u64,
     pub incomplete: u64,
+    /// Routed decisions are counted by semantic routing result. They are not folded into
+    /// authority bypass or candidate-dispatch counts.
+    pub routing_capable: u64,
+    pub routing_efficient: u64,
+    pub routing_unavailable: u64,
     pub observed_enforced_cost_micros: Option<u64>,
     #[serde(with = "controlled_optional_i64")]
     pub enforced_modeled_delta_micros: Option<i64>,
@@ -145,7 +152,11 @@ fn aggregate_controlled_enforcement_report(
         .collect();
     Ok(ControlledEnforcementReport {
         schema_version: 1,
-        authority_schema_version: 2,
+        authority_schema_version: if records.iter().any(|record| record.schema_version() == 3) {
+            3
+        } else {
+            2
+        },
         complete,
         run_id: run_id.to_owned(),
         records_digest: records_digest.to_owned(),
@@ -224,6 +235,28 @@ impl ControlledAccumulator {
         }
         if outcome.mode.grants_authority() && outcome.target == PlanTarget::None {
             Self::increment(&mut self.totals.fail_closed, "fail_closed")?;
+        }
+        if outcome.candidate_failure.is_some() {
+            Self::increment(&mut self.totals.candidate_failures, "candidate_failures")?;
+        }
+        if let Some(crate::ledger::AuthorityRoutingBindingV3::Decision {
+            semantic_target, ..
+        }) = outcome.routing.as_ref()
+        {
+            match semantic_target {
+                crate::routing::RoutingTarget::Capable => {
+                    Self::increment(&mut self.totals.routing_capable, "routing_capable")?
+                }
+                crate::routing::RoutingTarget::Efficient => {
+                    Self::increment(&mut self.totals.routing_efficient, "routing_efficient")?
+                }
+            }
+        }
+        if matches!(
+            outcome.routing.as_ref(),
+            Some(crate::ledger::AuthorityRoutingBindingV3::Unavailable { .. })
+        ) {
+            Self::increment(&mut self.totals.routing_unavailable, "routing_unavailable")?;
         }
         match outcome.completion {
             CompletionStateV2::Failed => Self::increment(&mut self.totals.failures, "failures")?,
@@ -359,6 +392,7 @@ mod controlled_aggregation_tests {
             observed_actual_cost_micros: cost,
             approved_counterfactual_cost_micros: counterfactual,
             enforced_modeled_delta_micros: delta,
+            routing: None,
         }
     }
 

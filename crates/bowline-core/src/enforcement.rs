@@ -11,11 +11,13 @@ use url::Url;
 
 use crate::{
     config::OwnedCostCatalog, policy::PolicyBundle, quality::PromotionVerdict,
-    quality_report::quality_workload_identity_digest, supply::TaskClass,
+    quality_report::quality_workload_identity_digest, routing::StageRoutingProfile,
+    supply::TaskClass,
 };
 
 pub const MAX_ACTUATORS: usize = 64;
 pub const MAX_ROUTES: usize = 256;
+pub const MAX_ROUTING_PROFILES: usize = 64;
 pub const MAX_IDENTIFIER_BYTES: usize = crate::identifier::MAX_IDENTIFIER_BYTES;
 pub const MAX_TAGS: usize = 64;
 pub const MAX_TAG_BYTES: usize = crate::quality::MAX_IDENTIFIER_BYTES;
@@ -54,6 +56,72 @@ pub struct EnforcementConfigV1 {
     pub kill_switch: KillSwitchConfig,
     pub actuators: Vec<ActuatorConfig>,
     pub routes: Vec<EnforcementRoute>,
+}
+
+/// Explicit version dispatch keeps the established V1 contract strict.  In particular, V1 does
+/// not silently accept a routing field: routing is available only from an explicit V2 bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnforcementConfig {
+    V1(EnforcementConfigV1),
+    V2(EnforcementConfigV2),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnforcementConfigV2 {
+    pub version: u32,
+    pub global_candidate_in_flight: u32,
+    pub kill_switch: KillSwitchConfig,
+    pub actuators: Vec<ActuatorConfig>,
+    pub routes: Vec<EnforcementRouteV2>,
+    pub routing_profiles: Vec<StageRoutingProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnforcementRouteV2 {
+    pub route_id: String,
+    pub method: String,
+    pub path: String,
+    pub protocol: AuthorityProtocol,
+    #[serde(default)]
+    pub workload: Option<WorkloadSelector>,
+    pub mode: RouteMode,
+    pub rollout_ppm: u32,
+    #[serde(default)]
+    pub promoted_supply_id: Option<String>,
+    #[serde(default)]
+    pub actual_supply_id: Option<String>,
+    #[serde(default)]
+    pub task_class: Option<TaskClass>,
+    #[serde(default)]
+    pub model_authority: Option<ModelAuthority>,
+    #[serde(default)]
+    pub fallback: Option<FallbackMode>,
+    #[serde(default)]
+    pub promotion: Option<PromotionRequirement>,
+    #[serde(default)]
+    pub routing_profile_id: Option<String>,
+}
+
+impl From<&EnforcementRouteV2> for EnforcementRoute {
+    fn from(route: &EnforcementRouteV2) -> Self {
+        Self {
+            route_id: route.route_id.clone(),
+            method: route.method.clone(),
+            path: route.path.clone(),
+            protocol: route.protocol,
+            workload: route.workload.clone(),
+            mode: route.mode,
+            rollout_ppm: route.rollout_ppm,
+            promoted_supply_id: route.promoted_supply_id.clone(),
+            actual_supply_id: route.actual_supply_id.clone(),
+            task_class: route.task_class,
+            model_authority: route.model_authority,
+            fallback: route.fallback,
+            promotion: route.promotion.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +418,12 @@ pub enum SelectionReason {
     AdmissionSaturated,
     CandidateUnavailable,
     ActuatorUnavailable,
+    /// A configured stage profile deliberately retained the exact capable upstream. This is a
+    /// routing decision, not a failed candidate attempt or a promotion fallback.
+    RoutingCapable,
+    /// Routing metadata or durable state was unavailable. The safe behavior is the capable
+    /// original upstream; it does not consume candidate authority.
+    RoutingUnavailable,
     CandidateSelected,
 }
 
@@ -486,6 +560,9 @@ pub struct ValidatedEnforcement {
     routes: BTreeMap<String, usize>,
     normalized_digest: String,
     digest_document: EnforcementDigestDocument,
+    version: u32,
+    routing_profiles: BTreeMap<String, StageRoutingProfile>,
+    route_profile_ids: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -612,13 +689,132 @@ impl EnforcementConfigV1 {
             routes: route_index,
             normalized_digest,
             digest_document,
+            version: 1,
+            routing_profiles: BTreeMap::new(),
+            route_profile_ids: BTreeMap::new(),
         })
     }
+}
+
+impl EnforcementConfig {
+    pub fn from_yaml(source: &str) -> Result<Self, EnforcementError> {
+        let value: serde_yaml::Value = serde_yaml::from_str(source)
+            .map_err(|error| EnforcementError::Parse(error.to_string()))?;
+        let version = value
+            .get("version")
+            .and_then(serde_yaml::Value::as_u64)
+            .ok_or_else(|| EnforcementError::invalid("version", "must be an integer"))?;
+        match version {
+            1 => serde_yaml::from_value(value)
+                .map(Self::V1)
+                .map_err(|error| EnforcementError::Parse(error.to_string())),
+            2 => serde_yaml::from_value(value)
+                .map(Self::V2)
+                .map_err(|error| EnforcementError::Parse(error.to_string())),
+            _ => Err(EnforcementError::invalid("version", "must equal 1 or 2")),
+        }
+    }
+
+    pub fn validate(&self) -> Result<ValidatedEnforcement, EnforcementError> {
+        match self {
+            Self::V1(config) => config.validate(),
+            Self::V2(config) => validate_v2(config),
+        }
+    }
+}
+
+fn validate_v2(config: &EnforcementConfigV2) -> Result<ValidatedEnforcement, EnforcementError> {
+    if config.version != 2 {
+        return Err(EnforcementError::invalid("version", "must equal 2"));
+    }
+    if config.routing_profiles.is_empty() || config.routing_profiles.len() > MAX_ROUTING_PROFILES {
+        return Err(EnforcementError::invalid(
+            "routing_profiles",
+            "must contain 1..=64 profiles",
+        ));
+    }
+    let mut profiles = BTreeMap::new();
+    for profile in &config.routing_profiles {
+        profile
+            .validate()
+            .map_err(|error| EnforcementError::invalid("routing_profiles", error.to_string()))?;
+        if profiles
+            .insert(profile.profile_id.clone(), profile.clone())
+            .is_some()
+        {
+            return Err(EnforcementError::invalid(
+                "routing_profiles",
+                "duplicate profile id",
+            ));
+        }
+    }
+    let mut route_profile_ids = BTreeMap::new();
+    for route in &config.routes {
+        if let Some(profile_id) = &route.routing_profile_id {
+            validate_id("routes.routing_profile_id", profile_id)?;
+            if !profiles.contains_key(profile_id) {
+                return Err(EnforcementError::invalid(
+                    "routes.routing_profile_id",
+                    "references an unknown profile",
+                ));
+            }
+            if !matches!(
+                route.protocol,
+                AuthorityProtocol::ChatCompletions | AuthorityProtocol::Responses
+            ) {
+                return Err(EnforcementError::invalid(
+                    "routes.routing_profile_id",
+                    "routing is limited to Chat Completions and Responses",
+                ));
+            }
+            if route.actual_supply_id.is_none() || route.promoted_supply_id.is_none() {
+                return Err(EnforcementError::invalid(
+                    "routes.routing_profile_id",
+                    "requires actual supply and promoted supply",
+                ));
+            }
+            route_profile_ids.insert(route.route_id.clone(), profile_id.clone());
+        }
+    }
+    let v1 = EnforcementConfigV1 {
+        version: 1,
+        global_candidate_in_flight: config.global_candidate_in_flight,
+        kill_switch: config.kill_switch.clone(),
+        actuators: config.actuators.clone(),
+        routes: config.routes.iter().map(EnforcementRoute::from).collect(),
+    };
+    let mut validated = v1.validate()?;
+    let profile_digests = profiles
+        .iter()
+        .map(|(id, profile)| (id, profile.digest()))
+        .collect::<BTreeMap<_, _>>();
+    let bytes = serde_json::to_vec(&(
+        2_u32,
+        validated.normalized_digest.clone(),
+        &profile_digests,
+        &route_profile_ids,
+    ))
+    .map_err(|error| EnforcementError::Parse(error.to_string()))?;
+    validated.normalized_digest = domain_digest(b"bowline.enforcement.config.v2", &bytes);
+    validated.version = 2;
+    validated.routing_profiles = profiles;
+    validated.route_profile_ids = route_profile_ids;
+    Ok(validated)
 }
 
 impl ValidatedEnforcement {
     pub fn routes(&self) -> impl Iterator<Item = &EnforcementRoute> {
         self.config.routes.iter()
+    }
+
+    pub fn kill_switch(&self) -> &KillSwitchConfig {
+        &self.config.kill_switch
+    }
+    pub fn global_candidate_in_flight(&self) -> u32 {
+        self.config.global_candidate_in_flight
+    }
+    pub fn actuators(&self) -> impl Iterator<Item = &ActuatorConfig> {
+        self.config.actuators.iter()
     }
 
     pub fn route(&self, route_id: &str) -> Option<&EnforcementRoute> {
@@ -635,6 +831,25 @@ impl ValidatedEnforcement {
 
     pub fn normalized_digest(&self) -> &str {
         &self.normalized_digest
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn routing_profile_for_route(&self, route_id: &str) -> Option<&StageRoutingProfile> {
+        self.route_profile_ids
+            .get(route_id)
+            .and_then(|id| self.routing_profiles.get(id))
+    }
+
+    pub fn routing_profile_id_for_route(&self, route_id: &str) -> Option<&str> {
+        self.route_profile_ids.get(route_id).map(String::as_str)
+    }
+
+    pub fn routing_profile_digest_for_route(&self, route_id: &str) -> Option<String> {
+        self.routing_profile_for_route(route_id)
+            .map(StageRoutingProfile::digest)
     }
 
     pub fn digest_document(&self) -> &EnforcementDigestDocument {
@@ -671,7 +886,16 @@ impl ValidatedEnforcement {
             .iter()
             .find(|route| route.route_id == route_id)
             .and_then(|route| serde_json::to_vec(route).ok())
-            .map(|bytes| domain_digest(b"bowline.enforcement.route.v1", &bytes))
+            .map(|bytes| {
+                if self.version == 1 {
+                    domain_digest(b"bowline.enforcement.route.v1", &bytes)
+                } else {
+                    let profile = self.routing_profile_digest_for_route(route_id);
+                    let normalized =
+                        serde_json::to_vec(&(bytes, profile)).expect("route digest serialization");
+                    domain_digest(b"bowline.enforcement.route.v2", &normalized)
+                }
+            })
     }
 }
 
@@ -2287,4 +2511,66 @@ pub fn economics_opportunity_digest(
         &serde_json::to_vec(opportunity)
             .map_err(|error| EnforcementError::Parse(error.to_string()))?,
     ))
+}
+
+#[cfg(test)]
+mod routing_v2_tests {
+    use super::*;
+
+    fn v2_source() -> &'static str {
+        r#"
+version: 2
+global_candidate_in_flight: 1
+kill_switch: { trust_root: /private/bowline-kill, relative_path: state }
+actuators: []
+routing_profiles:
+  - profile_id: stage-main
+    kind: stage
+    recent_window: 4
+    error_threshold: 2
+    exploration_threshold: 2
+    progress_threshold: 2
+    default_target: capable
+routes:
+  - route_id: observe-chat
+    method: POST
+    path: /v1/chat/completions
+    protocol: chat-completions
+    mode: observe
+    rollout_ppm: 0
+"#
+    }
+
+    #[test]
+    fn v2_is_explicit_strict_and_profile_digest_is_available_only_by_reference() {
+        let parsed = EnforcementConfig::from_yaml(v2_source()).unwrap();
+        let validated = parsed.validate().unwrap();
+        assert_eq!(validated.version(), 2);
+        assert!(validated
+            .routing_profile_for_route("observe-chat")
+            .is_none());
+        assert!(validated
+            .routing_profile_digest_for_route("observe-chat")
+            .is_none());
+        assert!(
+            EnforcementConfig::from_yaml(&format!("{}unexpected: true\n", v2_source())).is_err()
+        );
+        assert!(
+            EnforcementConfig::from_yaml(&v2_source().replace("version: 2", "version: 3")).is_err()
+        );
+        assert!(
+            EnforcementConfigV1::from_yaml(&v2_source().replace("version: 2", "version: 1"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn synthetic_routing_v2_example_parses_and_validates() {
+        let config = EnforcementConfig::from_yaml(include_str!(
+            "../../../examples/enforcement/routing-v2.yaml"
+        ))
+        .expect("routing example parses");
+        let validated = config.validate().expect("routing example validates");
+        assert!(validated.routing_profile_for_route("chat-stage").is_some());
+    }
 }

@@ -16,9 +16,12 @@ pub mod protocol;
 mod provenance_digest;
 pub mod proxy;
 pub mod quality_writer;
+pub mod routing_api;
+pub mod routing_state;
 pub mod serving_lease;
 pub mod state_backend;
 pub mod supervisor;
+pub mod switchyard_observe;
 pub mod writer;
 
 pub use proxy::{

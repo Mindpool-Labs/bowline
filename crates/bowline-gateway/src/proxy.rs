@@ -31,9 +31,9 @@ use bowline_core::{
     decision::{decide, Decision, QualityFloors},
     enforcement::{
         operator_safe_route_id, rewrite_top_level_model, ActiveRuntimeProvenance,
-        AuthorityProtocol, CandidateAvailability, EnforcementConfigV1, EnforcementPlan,
-        FallbackMode, KillReadResult, PlanTarget, RewriteLimits, SelectionReason,
-        SelectionRequestFacts, ValidatedEnforcement,
+        AuthorityProtocol, CandidateAvailability, EnforcementConfig, EnforcementPlan, FallbackMode,
+        KillReadResult, PlanTarget, RewriteLimits, SelectionReason, SelectionRequestFacts,
+        ValidatedEnforcement,
     },
     ledger::{
         CandidateFailureClassV2, CircuitStateV2, CompletionStateV2, DecisionRecord, UsageSource,
@@ -47,6 +47,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use uuid::Uuid;
+
+#[cfg(test)]
+use bowline_core::enforcement::EnforcementConfigV1;
 
 use crate::health::{
     CandidateAdmissionHealth, CircuitCounts, GatewayHealth, GrantFreshnessCounts,
@@ -69,7 +72,10 @@ use crate::{
         BoundedKillStateReader, KillStateReader, PromotionGrantLoad, VerifiedPromotionGrant,
         VerifiedRecommendationEvidence,
     },
-    identity::{extract_identity, resolve_request_context, ResolvedRequestContext},
+    identity::{
+        extract_identity, resolve_request_context, resolve_routing_metadata,
+        ResolvedRequestContext, RoutingMetadataResolution,
+    },
     observation::{
         actual_cost, apply_attribution_coverage, build_decision_record,
         prepare_candidate_authority_decision_v2, prepare_zero_authority_decision_v2,
@@ -81,6 +87,11 @@ use crate::{
         FinalDispatchAuthorization, LedgerWriter, ManagedAuthorityWriter, ManagedWriter,
         RecordContext,
     },
+};
+use crate::{
+    routing_api::RoutingApiState,
+    routing_state::{RoutingStateLimits, RoutingStateStore},
+    switchyard_observe::SwitchyardObserveAdapter,
 };
 
 #[cfg(test)]
@@ -304,6 +315,9 @@ struct EnforcementRuntime {
     writer: ManagedAuthorityWriter,
     terminal_tracker: Arc<AuthorityTerminalTracker>,
     last_kill_state: Mutex<KillReadResult>,
+    routing_state: Option<Arc<RoutingStateStore>>,
+    routing_startup_unavailable: Option<bowline_core::ledger::RoutingUnavailableCauseV3>,
+    switchyard_observe: Option<Arc<SwitchyardObserveAdapter>>,
 }
 
 #[derive(Default)]
@@ -396,6 +410,28 @@ async fn cleanup_failed_activation(
 }
 
 impl GatewayState {
+    pub(crate) fn routing_api_state(
+        &self,
+        authorization_env: &str,
+    ) -> anyhow::Result<RoutingApiState> {
+        let runtime = self
+            .runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .context("routing runtime is inactive")?;
+        let enforcement = runtime
+            .enforcement
+            .as_ref()
+            .context("routing enforcement is unavailable")?;
+        RoutingApiState::from_validated(
+            &enforcement.validated,
+            authorization_env,
+            enforcement.routing_state.clone(),
+            enforcement.routing_startup_unavailable,
+        )
+    }
     pub fn new(upstream_base: impl Into<String>, deps: GatewayDeps) -> Self {
         let runtime = RuntimeConfig::default();
         let trusted_proxy_cidrs = vec![
@@ -816,6 +852,17 @@ async fn public_enforcement_health(runtime: &EnforcementRuntime) -> PublicEnforc
             saturation_count: actuator.saturation_count,
         },
         active_fail_closed_routes_on_unavailable_actuators: fail_closed_unavailable,
+        routing_configured: runtime.validated.routes().any(|route| {
+            runtime
+                .validated
+                .routing_profile_for_route(&route.route_id)
+                .is_some()
+        }),
+        routing: runtime.routing_state.as_ref().map(|store| store.health()),
+        switchyard_observe: runtime
+            .switchyard_observe
+            .as_ref()
+            .map(|adapter| adapter.health()),
     }
 }
 
@@ -899,9 +946,19 @@ where
         crate::serving_lease::LocalServingLease,
     )?;
     supervisor.activate(&mut factory).await?;
+    let routing_server = match start_routing_api(&config, &supervisor).await {
+        Ok(server) => server,
+        Err(error) => {
+            supervisor.deactivate(shutdown_grace).await?;
+            return Err(error);
+        }
+    };
     let listener = match TcpListener::bind(&config.listen).await {
         Ok(listener) => listener,
         Err(error) => {
+            if let Some(server) = routing_server {
+                server.shutdown(shutdown_grace).await?;
+            }
             supervisor.deactivate(shutdown_grace).await?;
             return Err(error)
                 .with_context(|| format!("failed to bind gateway listener {}", config.listen));
@@ -913,11 +970,43 @@ where
             .router()
             .into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
+    .with_graceful_shutdown(async move {
+        shutdown.await;
+    })
     .await
     .context("gateway server failed");
+    if let Some(server) = routing_server {
+        server.shutdown(shutdown_grace).await?;
+    }
     supervisor.deactivate(shutdown_grace).await?;
     serve_result
+}
+
+async fn start_routing_api<L>(
+    config: &Config,
+    supervisor: &crate::supervisor::GatewaySupervisor<L>,
+) -> anyhow::Result<Option<crate::routing_api::RoutingApiServer>>
+where
+    L: crate::serving_lease::ServingLease,
+{
+    let Some(routing) = config.routing.as_ref() else {
+        return Ok(None);
+    };
+    let state = supervisor.routing_api_state(&routing.authorization_env)?;
+    let address = routing
+        .listen
+        .parse::<SocketAddr>()
+        .context("invalid routing listener")?;
+    if !address.ip().is_loopback() {
+        anyhow::bail!("routing decision listener must bind to loopback");
+    }
+    let listener = TcpListener::bind(address)
+        .await
+        .context("failed to bind routing decision listener")?;
+    Ok(Some(crate::routing_api::RoutingApiServer::start(
+        listener,
+        state.router(),
+    )))
 }
 
 async fn serve_with_file_lease<D, F>(
@@ -956,6 +1045,19 @@ where
     if let Err(error) = supervisor.reconcile(&mut factory, shutdown_grace).await {
         tracing::warn!(error = %error, "gateway activation failed; remaining in standby");
     }
+    let mut routing_server = if supervisor.is_active() {
+        match start_routing_api(&config, &supervisor).await {
+            Ok(server) => server,
+            Err(error) => {
+                supervisor.deactivate(shutdown_grace).await?;
+                server.abort();
+                let _ = server.await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -965,16 +1067,35 @@ where
                     Err(error) => Err(anyhow::Error::from(error)
                         .context("gateway server task failed")),
                 };
+                if let Some(routing_server) = routing_server.take() {
+                    routing_server.shutdown(shutdown_grace).await?;
+                }
                 supervisor.deactivate(shutdown_grace).await?;
                 return server_result;
             }
             _ = tokio::time::sleep(poll_interval) => {
                 let was_active = supervisor.is_active();
+                if was_active && !supervisor.may_admit() {
+                    if let Some(routing_server) = routing_server.take() {
+                        routing_server.shutdown(shutdown_grace).await?;
+                    }
+                }
                 if let Err(error) = supervisor.reconcile(&mut factory, shutdown_grace).await {
                     if was_active {
                         return Err(error).context("gateway deactivation failed after serving lease loss");
                     }
                     tracing::warn!(error = %error, "gateway activation failed; remaining in standby");
+                }
+                if supervisor.is_active() && routing_server.is_none() {
+                    routing_server = match start_routing_api(&config, &supervisor).await {
+                        Ok(server) => server,
+                        Err(error) => {
+                            supervisor.deactivate(shutdown_grace).await?;
+                            server.abort();
+                            let _ = server.await;
+                            return Err(error);
+                        }
+                    };
                 }
                 if supervisor.is_active() {
                     standby_since = tokio::time::Instant::now();
@@ -1066,6 +1187,9 @@ async fn proxy_admitted_handler(
         .trusted_proxy_cidrs
         .iter()
         .any(|network| network.contains(&peer.ip()));
+    // Parse at the trusted boundary. The value is deliberately not part of shadow observations or
+    // upstream forwarding; all `x-bowline-*` headers are stripped by `should_forward_header`.
+    let routing_metadata = resolve_routing_metadata(&headers, trusted_peer);
     let resolved_context = protocol
         .and_then(authority_protocol)
         .and_then(|authority_protocol| {
@@ -1102,6 +1226,7 @@ async fn proxy_admitted_handler(
         &body,
         protocol,
         resolved_context.as_ref(),
+        &routing_metadata,
         &mut pending_shadow,
     )
     .await
@@ -1175,6 +1300,7 @@ async fn controlled_enforcement_response(
     body: &Bytes,
     protocol: Option<ProtocolKind>,
     request_context: Option<&ResolvedRequestContext>,
+    routing_metadata: &RoutingMetadataResolution,
     pending_shadow: &mut Option<PendingShadow>,
 ) -> Option<Response<Body>> {
     let runtime = Arc::clone(gateway_runtime.enforcement.as_ref()?);
@@ -1303,16 +1429,117 @@ async fn controlled_enforcement_response(
             select_enforcement_target_without_grant(&runtime.validated, &route.route_id, &facts)
         }
     };
-    let gateway_plan = match gateway_plan {
+    let mut gateway_plan = match gateway_plan {
         Ok(plan) => plan,
         Err(error) => {
             tracing::error!(error = %error, "controlled enforcement selection failed");
             return Some(evidence_unavailable_response());
         }
     };
+    let mut routing = None;
+    if let Some(profile) = runtime.validated.routing_profile_for_route(&route.route_id) {
+        let selected = match (routing_metadata, runtime.routing_state.as_ref()) {
+            (RoutingMetadataResolution::Valid(metadata), Some(store)) => {
+                let Some(route_digest) = runtime.validated.route_digest(&route.route_id) else {
+                    return Some(evidence_unavailable_response());
+                };
+                store
+                    .decide_with_source(
+                        &metadata.task_id,
+                        metadata.step_id,
+                        &route_digest,
+                        profile,
+                        metadata.signals.clone(),
+                        bowline_core::ledger::RoutingDecisionSourceV3::TrustedImmediatePeer,
+                    )
+                    .map_err(|error| {
+                        error.unavailable_cause().unwrap_or(
+                            bowline_core::ledger::RoutingUnavailableCauseV3::StartupUnavailable,
+                        )
+                    })
+            }
+            (RoutingMetadataResolution::Valid(_), None) => Err(runtime
+                .routing_startup_unavailable
+                .unwrap_or(bowline_core::ledger::RoutingUnavailableCauseV3::StartupUnavailable)),
+            (RoutingMetadataResolution::Unavailable(cause), _) => Err(*cause),
+        };
+        match selected {
+            Ok(decision) => {
+                routing = Some(bowline_core::ledger::AuthorityRoutingBindingV3::Decision {
+                    routing_decision_digest: decision.decision_digest.clone(),
+                    routing_state_digest: decision.state_digest.clone(),
+                    profile_digest: decision.profile_digest.clone(),
+                    task_reference_digest: decision.task_ref.clone(),
+                    step_id: decision.step_id,
+                    semantic_target: decision.target,
+                    reason: decision.reason,
+                    // A replay preserves the source that first committed the durable decision.
+                    // In particular, an API-created decision remains LocalDecisionApi when the
+                    // inference path later replays it.
+                    source: decision.source,
+                });
+                if decision.target == bowline_core::routing::RoutingTarget::Capable
+                    && gateway_plan
+                        .retain_capable(SelectionReason::RoutingCapable)
+                        .is_err()
+                {
+                    return Some(evidence_unavailable_response());
+                }
+            }
+            Err(cause) => {
+                routing = Some(routing_unavailable_binding(profile, cause));
+                if gateway_plan
+                    .retain_capable(SelectionReason::RoutingUnavailable)
+                    .is_err()
+                {
+                    return Some(evidence_unavailable_response());
+                }
+            }
+        }
+        // The observer receives only a committed routing decision after Bowline has made its
+        // final native selection. Unavailable routing has no task/step binding and is never
+        // enqueued. Its proposal is never available to authority, planning, or dispatch.
+        if let Some(adapter) = runtime
+            .switchyard_observe
+            .as_ref()
+            .filter(|adapter| adapter.matches_profile(&profile.profile_id))
+        {
+            let native_target = if gateway_plan.target() == PlanTarget::Candidate {
+                bowline_core::routing::RoutingTarget::Efficient
+            } else {
+                bowline_core::routing::RoutingTarget::Capable
+            };
+            let protocol = match protocol {
+                AuthorityProtocol::ChatCompletions => "chat-completions",
+                AuthorityProtocol::Responses => "responses",
+                AuthorityProtocol::Embeddings => "embeddings",
+            };
+            if let Some(bowline_core::ledger::AuthorityRoutingBindingV3::Decision {
+                task_reference_digest,
+                step_id,
+                ..
+            }) = routing.as_ref()
+            {
+                let signals = match routing_metadata {
+                    RoutingMetadataResolution::Valid(metadata) => metadata.signals.clone(),
+                    RoutingMetadataResolution::Unavailable(_) => {
+                        unreachable!("decision requires routing metadata")
+                    }
+                };
+                adapter.observe(
+                    task_reference_digest.clone(),
+                    protocol,
+                    *step_id,
+                    signals,
+                    native_target,
+                );
+            }
+        }
+    }
     let original_body = body.clone();
     if gateway_plan.target() != PlanTarget::Candidate {
-        let context = zero_authority_context(&route, &facts, kill, now_ms());
+        let mut context = zero_authority_context(&route, &facts, kill, now_ms());
+        context.routing = routing.clone();
         let prepared = match prepare_zero_authority_decision_v2(gateway_plan.plan(), context) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1360,6 +1587,7 @@ async fn controlled_enforcement_response(
         gateway_plan,
         grant.clone(),
         Uuid::new_v4().to_string(),
+        routing,
         &runtime.kill_reader,
     )
     .await
@@ -1514,6 +1742,32 @@ async fn controlled_enforcement_response(
     }
 }
 
+fn routing_unavailable_binding(
+    profile: &bowline_core::routing::StageRoutingProfile,
+    cause: bowline_core::ledger::RoutingUnavailableCauseV3,
+) -> bowline_core::ledger::AuthorityRoutingBindingV3 {
+    use bowline_core::ledger::{
+        AuthorityRoutingBindingV3, RoutingDecisionSourceV3, RoutingUnavailableCauseV3,
+    };
+
+    let source = match cause {
+        RoutingUnavailableCauseV3::MissingMetadata
+        | RoutingUnavailableCauseV3::UntrustedMetadata
+        | RoutingUnavailableCauseV3::MalformedMetadata => RoutingDecisionSourceV3::InferenceGateway,
+        RoutingUnavailableCauseV3::StepConflict
+        | RoutingUnavailableCauseV3::CapacityExhausted
+        | RoutingUnavailableCauseV3::WriterFailure => RoutingDecisionSourceV3::TrustedImmediatePeer,
+        RoutingUnavailableCauseV3::StateCorrupt | RoutingUnavailableCauseV3::StartupUnavailable => {
+            RoutingDecisionSourceV3::ConfiguredStartup
+        }
+    };
+    AuthorityRoutingBindingV3::Unavailable {
+        profile_digest: profile.digest(),
+        cause,
+        source,
+    }
+}
+
 fn authority_protocol(protocol: ProtocolKind) -> Option<AuthorityProtocol> {
     match protocol {
         ProtocolKind::ChatCompletions => Some(AuthorityProtocol::ChatCompletions),
@@ -1551,6 +1805,7 @@ fn zero_authority_context(
         resolved_tags: facts.resolved_tags.clone(),
         request_body_digest: facts.request_body_digest,
         requested_supply_id: facts.requested_supply_id.clone(),
+        routing: None,
     }
 }
 
@@ -2822,16 +3077,14 @@ fn load_enforcement_runtime(
 
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read enforcement bundle {}", path.display()))?;
-    let raw =
-        EnforcementConfigV1::from_yaml(&source).context("failed to parse enforcement bundle")?;
-    let route_ids = raw
-        .routes
-        .iter()
-        .map(|route| route.route_id.clone())
-        .collect::<Vec<_>>();
-    let validated = raw
+    let validated = EnforcementConfig::from_yaml(&source)
+        .context("failed to parse enforcement bundle")?
         .validate()
         .context("failed to validate enforcement bundle")?;
+    let route_ids = validated
+        .routes()
+        .map(|route| route.route_id.clone())
+        .collect::<Vec<_>>();
     let evidence_root = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let mut grants = BTreeMap::new();
     let mut grant_rejections = BTreeMap::new();
@@ -2903,19 +3156,20 @@ fn load_enforcement_runtime(
             recommendations.insert(route.route_id.clone(), evidence);
         }
     }
-    let kill = &raw.kill_switch;
+    let configured_actuators = validated.actuators().cloned().collect::<Vec<_>>();
+    let kill = validated.kill_switch();
     let kill_reader = BoundedKillStateReader::new(
         KillStateReader::open(std::path::Path::new(&kill.trust_root), &kill.relative_path)
             .context("failed to open enforcement kill switch")?,
         config.runtime.writer_queue_capacity.max(1),
     );
     let actuators = ActuatorRegistry::new(
-        raw.global_candidate_in_flight,
-        raw.actuators.iter().cloned(),
+        validated.global_candidate_in_flight(),
+        configured_actuators.iter().cloned(),
     )
     .context("failed to initialize actuator registry")?;
     let mut targets = BTreeMap::new();
-    for actuator in &raw.actuators {
+    for actuator in &configured_actuators {
         let secret = env::var(&actuator.authorization_env).with_context(|| {
             format!(
                 "missing actuator authorization environment variable {}",
@@ -2959,8 +3213,7 @@ fn load_enforcement_runtime(
         )
     })?;
     fs::set_permissions(&authority_directory, fs::Permissions::from_mode(0o700))?;
-    let actuator_digests = raw
-        .actuators
+    let actuator_digests = configured_actuators
         .iter()
         .filter_map(|actuator| validated.actuator_digest(&actuator.supply_id))
         .collect();
@@ -2977,6 +3230,47 @@ fn load_enforcement_runtime(
         max_records_bytes: config.runtime.ledger_segment_bytes,
     })
     .context("failed to start authority evidence writer")?;
+    let (routing_state, routing_startup_unavailable) = if validated.routes().any(|route| {
+        validated
+            .routing_profile_for_route(&route.route_id)
+            .is_some()
+    }) {
+        let limits = config.routing.as_ref().map_or(
+            RoutingStateLimits {
+                max_active_tasks: crate::routing_state::DEFAULT_MAX_ACTIVE_TASKS,
+                segment_bytes: config.runtime.ledger_segment_bytes,
+                max_segments: config.runtime.ledger_max_segments,
+            },
+            |routing| RoutingStateLimits {
+                max_active_tasks: routing.max_active_tasks,
+                segment_bytes: routing.segment_bytes,
+                max_segments: routing.max_segments,
+            },
+        );
+        match RoutingStateStore::open(&config.ledger_dir, limits) {
+            Ok(store) => (Some(Arc::new(store)), None),
+            Err(error) => {
+                tracing::error!(error = %error, "routing state is unavailable; routed requests retain capable upstream");
+                (None, Some(error.startup_unavailable_cause()))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let switchyard_observe = config
+        .switchyard_observe
+        .as_ref()
+        .map(|switchyard| {
+            if !validated
+                .routes()
+                .filter_map(|route| validated.routing_profile_for_route(&route.route_id))
+                .any(|profile| profile.profile_id == switchyard.profile_id)
+            {
+                anyhow::bail!("switchyard observe profile is not configured for a routed route");
+            }
+            SwitchyardObserveAdapter::new(switchyard).map(Arc::new)
+        })
+        .transpose()?;
     Ok(EnforcementRuntime {
         validated,
         route_ids,
@@ -2989,6 +3283,9 @@ fn load_enforcement_runtime(
         writer,
         terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
         last_kill_state: Mutex::new(KillReadResult::Unreadable),
+        routing_state,
+        routing_startup_unavailable,
+        switchyard_observe,
     })
 }
 
@@ -3083,6 +3380,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unavailable_routing_binding_keeps_each_cause_and_source_coherent() {
+        let profile = bowline_core::routing::StageRoutingProfile {
+            profile_id: "stage-main".into(),
+            kind: bowline_core::routing::StageProfileKind::Stage,
+            recent_window: 4,
+            error_threshold: 2,
+            exploration_threshold: 2,
+            progress_threshold: 1,
+            default_target: bowline_core::routing::RoutingTarget::Capable,
+        };
+        use bowline_core::ledger::{
+            AuthorityRoutingBindingV3, RoutingDecisionSourceV3, RoutingUnavailableCauseV3,
+        };
+        for (cause, source) in [
+            (
+                RoutingUnavailableCauseV3::MissingMetadata,
+                RoutingDecisionSourceV3::InferenceGateway,
+            ),
+            (
+                RoutingUnavailableCauseV3::UntrustedMetadata,
+                RoutingDecisionSourceV3::InferenceGateway,
+            ),
+            (
+                RoutingUnavailableCauseV3::MalformedMetadata,
+                RoutingDecisionSourceV3::InferenceGateway,
+            ),
+            (
+                RoutingUnavailableCauseV3::StepConflict,
+                RoutingDecisionSourceV3::TrustedImmediatePeer,
+            ),
+            (
+                RoutingUnavailableCauseV3::CapacityExhausted,
+                RoutingDecisionSourceV3::TrustedImmediatePeer,
+            ),
+            (
+                RoutingUnavailableCauseV3::StateCorrupt,
+                RoutingDecisionSourceV3::ConfiguredStartup,
+            ),
+            (
+                RoutingUnavailableCauseV3::WriterFailure,
+                RoutingDecisionSourceV3::TrustedImmediatePeer,
+            ),
+            (
+                RoutingUnavailableCauseV3::StartupUnavailable,
+                RoutingDecisionSourceV3::ConfiguredStartup,
+            ),
+        ] {
+            let binding = routing_unavailable_binding(&profile, cause);
+            assert_eq!(
+                binding,
+                AuthorityRoutingBindingV3::Unavailable {
+                    profile_digest: profile.digest(),
+                    cause,
+                    source,
+                }
+            );
+            binding.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn configured_enforcement_with_corrupt_legacy_observation_evidence_refuses_startup() {
         let root = tempfile::tempdir().unwrap();
         let policy_path = root.path().join("policy.yaml");
@@ -3126,6 +3484,8 @@ rules:
             authority_signing: None,
             promotion_approval: None,
             state_backend: None,
+            routing: None,
+            switchyard_observe: None,
             trusted_proxy_cidrs: vec![],
             runtime: RuntimeConfig::default(),
         };
@@ -3276,6 +3636,9 @@ routes:
             writer: authority_writer,
             terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
             last_kill_state: Mutex::new(KillReadResult::Unreadable),
+            routing_state: None,
+            routing_startup_unavailable: None,
+            switchyard_observe: None,
         });
 
         let health = public_enforcement_health(&runtime).await;
@@ -3553,6 +3916,9 @@ routes:
             writer: authority_writer.clone(),
             terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
             last_kill_state: Mutex::new(KillReadResult::Unreadable),
+            routing_state: None,
+            routing_startup_unavailable: None,
+            switchyard_observe: None,
         });
         let startup_open = public_enforcement_health(&runtime).await;
         assert_eq!(
@@ -4027,5 +4393,218 @@ ledger_dir: ledger
             bowline_core::attribution::AttributionStatus::StaticConfigured
         );
         assert_eq!(result.supply_id.as_deref(), Some("baseline"));
+    }
+
+    #[tokio::test]
+    async fn file_lease_routing_listener_follows_activation_and_recovers_shared_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn unused_address() -> SocketAddr {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            address
+        }
+
+        async fn decide(
+            client: &reqwest::Client,
+            address: SocketAddr,
+        ) -> Option<serde_json::Value> {
+            let response = client
+                .post(format!("http://{address}/v1/routing/decision"))
+                .header("authorization", "Bearer routing-test")
+                .json(&serde_json::json!({
+                    "schema_version": 1,
+                    "route_id": "route",
+                    "task_id": "lease-task",
+                    "step_id": 1,
+                    "signals": ["write"],
+                }))
+                .send()
+                .await
+                .ok()?;
+            if response.status() != StatusCode::OK {
+                eprintln!("routing {address} returned {}", response.status());
+                return None;
+            }
+            response.json().await.ok()
+        }
+
+        async fn wait_for_decision(
+            client: &reqwest::Client,
+            address: SocketAddr,
+        ) -> serde_json::Value {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(value) = decide(client, address).await {
+                    return value;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{address} did not accept routing"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let system_temp = std::env::temp_dir().canonicalize().unwrap();
+        let root = tempfile::tempdir_in(system_temp).unwrap();
+        let lease_dir = root.path().join("lease");
+        fs::create_dir(&lease_dir).unwrap();
+        fs::set_permissions(&lease_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let lease = lease_dir.join("active.lock");
+        let ledger = root.path().join("ledger");
+        let kill = root.path().join("kill");
+        fs::create_dir(&kill).unwrap();
+        fs::set_permissions(&kill, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(kill.join("state"), b"armed\n").unwrap();
+        fs::set_permissions(kill.join("state"), fs::Permissions::from_mode(0o600)).unwrap();
+        let policy = root.path().join("policy.yaml");
+        fs::write(&policy, "version: 1\nidentities: []\nrules:\n  - name: default\n    default: true\n    require: {supply_class: [public-api, owned]}\n").unwrap();
+        let registry = root.path().join("registry.json");
+        fs::write(&registry, r#"{"feed_version":"test","entries":[
+          {"id":"baseline","model":"baseline-model","location":"public","attributes":{"class":"public-api","jurisdiction":"us","retention":"none","training_use":false,"cloud_act_exposure":false},"price":{"input_per_mtok_usd":1.0,"output_per_mtok_usd":1.0},"ratings":{"unclassified":0.9}},
+          {"id":"candidate","model":"candidate-model","location":"local","attributes":{"class":"owned","jurisdiction":"local","retention":"none","training_use":false,"cloud_act_exposure":false},"price":null,"ratings":{"unclassified":0.9}}
+        ]}"#).unwrap();
+        let enforcement = root.path().join("enforcement.yaml");
+        fs::write(
+            &enforcement,
+            format!(
+                r#"version: 2
+global_candidate_in_flight: 1
+kill_switch: {{trust_root: {}, relative_path: state}}
+actuators:
+  - supply_id: candidate
+    base_url: http://127.0.0.1:9
+    authorization_env: TEST_CANDIDATE_TOKEN
+    connect_timeout_ms: 20
+    response_header_timeout_ms: 20
+    stream_idle_timeout_ms: 20
+    concurrency: 1
+    probe_timeout_ms: 20
+    probe_max_bytes: 1024
+    breaker_consecutive_failures: 1
+    breaker_cooldown_ms: 20
+routing_profiles:
+  - profile_id: stage-main
+    kind: stage
+    recent_window: 4
+    error_threshold: 2
+    exploration_threshold: 2
+    progress_threshold: 1
+    default_target: capable
+routes:
+  - route_id: route
+    method: POST
+    path: /v1/responses
+    protocol: responses
+    workload: {{app: support, resolved_tags: []}}
+    mode: observe
+    rollout_ppm: 0
+    promoted_supply_id: candidate
+    actual_supply_id: baseline
+    task_class: unclassified
+    routing_profile_id: stage-main
+"#,
+                kill.display()
+            ),
+        )
+        .unwrap();
+        std::env::set_var("TEST_CANDIDATE_TOKEN", "Bearer candidate-test");
+        std::env::set_var("BOWLINE_ROUTING_LEASE_AUTH", "Bearer routing-test");
+
+        let first_gateway = unused_address();
+        let second_gateway = unused_address();
+        let first_routing = unused_address();
+        let second_routing = unused_address();
+        let config = |listen: SocketAddr, routing_listen: SocketAddr| Config {
+            listen: listen.to_string(),
+            upstream: "http://127.0.0.1:9".into(),
+            actual_supply_id: "baseline".into(),
+            policy_bundle: policy.clone(),
+            registry_feed: registry.clone(),
+            local_endpoints: Vec::new(),
+            ledger_dir: ledger.clone(),
+            tco: None,
+            attribution: None,
+            floors: None,
+            enforcement: Some(enforcement.clone()),
+            authority_signing: None,
+            promotion_approval: None,
+            state_backend: Some(StateBackendConfig::FileLease {
+                version: 1,
+                path: lease.clone(),
+                poll_interval_ms: 20,
+                takeover_timeout_ms: 1_000,
+            }),
+            routing: Some(bowline_core::config::RoutingApiConfig {
+                version: 1,
+                listen: routing_listen.to_string(),
+                authorization_env: "BOWLINE_ROUTING_LEASE_AUTH".into(),
+                max_active_tasks: 16,
+                segment_bytes: 64 * 1024,
+                max_segments: 4,
+            }),
+            switchyard_observe: None,
+            trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().unwrap()],
+            runtime: RuntimeConfig::default(),
+        };
+        let first = config(first_gateway, first_routing);
+        let second = config(second_gateway, second_routing);
+        let first_factory_config = first.clone();
+        let second_factory_config = second.clone();
+        let (first_shutdown_tx, first_shutdown_rx) = tokio::sync::oneshot::channel();
+        let (second_shutdown_tx, second_shutdown_rx) = tokio::sync::oneshot::channel();
+        let first_task = tokio::spawn(async move {
+            let result = serve_with_runtime_factory(
+                first,
+                move || deps_from_config(&first_factory_config),
+                async move {
+                    let _ = first_shutdown_rx.await;
+                },
+            )
+            .await;
+            result
+        });
+        let second_task = tokio::spawn(async move {
+            serve_with_runtime_factory(
+                second,
+                move || deps_from_config(&second_factory_config),
+                async move {
+                    let _ = second_shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let first_value = wait_for_decision(&client, first_routing).await;
+        assert!(
+            decide(&client, second_routing).await.is_none(),
+            "standby bound a routing listener"
+        );
+
+        first_shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), first_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second_value = wait_for_decision(&client, second_routing).await;
+        assert!(
+            decide(&client, first_routing).await.is_none(),
+            "released owner retained a routing listener"
+        );
+        for field in ["task_ref", "target", "state_digest"] {
+            assert_eq!(first_value[field], second_value[field], "durable {field}");
+        }
+        second_shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), second_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

@@ -17,6 +17,7 @@ pub mod quality;
 pub mod quality_report;
 pub mod quality_run;
 pub mod report;
+pub mod routing;
 pub mod run;
 pub mod supply;
 pub mod traffic;

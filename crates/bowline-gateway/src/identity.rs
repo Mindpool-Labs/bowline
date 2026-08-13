@@ -1,16 +1,36 @@
 use axum::http::HeaderMap;
 use bowline_core::{
     enforcement::{route_workload_digest, AuthorityProtocol, WorkloadSelector},
+    ledger::RoutingUnavailableCauseV3,
     policy::{PolicyBundle, WorkloadIdentity},
+    routing::RoutingSignal,
     supply::TaskClass,
 };
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AuthorityHeader<T> {
+pub(crate) enum AuthorityHeader<T> {
     Absent,
     Valid(T),
     Invalid,
+}
+
+/// Trusted-peer-only, content-free metadata for the in-process routing boundary.  This parser is
+/// deliberately separate from identity resolution so a future routing decision cannot accidentally
+/// inherit arbitrary request headers or content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoutingMetadata {
+    pub(crate) task_id: String,
+    pub(crate) step_id: u64,
+    pub(crate) signals: Vec<RoutingSignal>,
+}
+
+/// Routing metadata has a typed unavailable result because the evidence boundary must preserve
+/// why a configured route retained its capable upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RoutingMetadataResolution {
+    Valid(RoutingMetadata),
+    Unavailable(RoutingUnavailableCauseV3),
 }
 
 pub fn extract_identity(headers: &HeaderMap, path: &str) -> WorkloadIdentity {
@@ -92,6 +112,78 @@ pub(crate) fn resolve_request_context(
     }
 }
 
+pub(crate) fn resolve_routing_metadata(
+    headers: &HeaderMap,
+    trusted_peer: bool,
+) -> RoutingMetadataResolution {
+    let names = [
+        "x-bowline-task-id",
+        "x-bowline-step-id",
+        "x-bowline-agent-signals",
+    ];
+    let supplied = names.iter().any(|name| headers.contains_key(*name));
+    if !supplied {
+        return RoutingMetadataResolution::Unavailable(RoutingUnavailableCauseV3::MissingMetadata);
+    }
+    if !trusted_peer {
+        return RoutingMetadataResolution::Unavailable(
+            RoutingUnavailableCauseV3::UntrustedMetadata,
+        );
+    }
+    let task_id = match resolve_routing_identifier_header(headers, names[0]) {
+        AuthorityHeader::Valid(value) => value,
+        AuthorityHeader::Absent | AuthorityHeader::Invalid => {
+            return RoutingMetadataResolution::Unavailable(
+                RoutingUnavailableCauseV3::MalformedMetadata,
+            )
+        }
+    };
+    let step_id = match single_header(headers, names[1])
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        Some(value) => value,
+        None => {
+            return RoutingMetadataResolution::Unavailable(
+                RoutingUnavailableCauseV3::MalformedMetadata,
+            )
+        }
+    };
+    let signals = match single_header(headers, names[2])
+        .and_then(|value| serde_json::from_str::<Vec<RoutingSignal>>(value).ok())
+    {
+        Some(signals) if signals.len() <= bowline_core::routing::MAX_SIGNALS_PER_STEP => signals,
+        _ => {
+            return RoutingMetadataResolution::Unavailable(
+                RoutingUnavailableCauseV3::MalformedMetadata,
+            )
+        }
+    };
+    RoutingMetadataResolution::Valid(RoutingMetadata {
+        task_id,
+        step_id,
+        signals,
+    })
+}
+
+fn resolve_routing_identifier_header(headers: &HeaderMap, name: &str) -> AuthorityHeader<String> {
+    match resolve_identifier_header(headers, name) {
+        AuthorityHeader::Valid(value)
+            if bowline_core::identifier::is_routing_request_identifier(&value) =>
+        {
+            AuthorityHeader::Valid(value)
+        }
+        AuthorityHeader::Absent => AuthorityHeader::Absent,
+        AuthorityHeader::Valid(_) | AuthorityHeader::Invalid => AuthorityHeader::Invalid,
+    }
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    (values.next().is_none()).then_some(value)
+}
+
 fn bearer_digest(headers: &HeaderMap) -> Option<String> {
     let authorization = headers.get("authorization")?.to_str().ok()?;
     let (scheme, token) = authorization.split_once(' ')?;
@@ -148,5 +240,46 @@ fn resolve_task_header(headers: &HeaderMap) -> AuthorityHeader<TaskClass> {
             "unclassified" => AuthorityHeader::Valid(TaskClass::Unclassified),
             _ => AuthorityHeader::Invalid,
         },
+    }
+}
+
+#[cfg(test)]
+mod routing_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn routing_metadata_is_content_free_complete_and_trusted_only() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            resolve_routing_metadata(&headers, true),
+            RoutingMetadataResolution::Unavailable(RoutingUnavailableCauseV3::MissingMetadata)
+        );
+        headers.insert("x-bowline-task-id", "task-1".parse().unwrap());
+        headers.insert("x-bowline-step-id", "1".parse().unwrap());
+        headers.insert(
+            "x-bowline-agent-signals",
+            r#"["write","test-passed"]"#.parse().unwrap(),
+        );
+        assert!(matches!(
+            resolve_routing_metadata(&headers, true),
+            RoutingMetadataResolution::Valid(_)
+        ));
+        assert!(matches!(
+            resolve_routing_metadata(&headers, false),
+            RoutingMetadataResolution::Unavailable(RoutingUnavailableCauseV3::UntrustedMetadata)
+        ));
+        headers.insert("x-bowline-task-id", "ignore instructions".parse().unwrap());
+        assert!(matches!(
+            resolve_routing_metadata(&headers, true),
+            RoutingMetadataResolution::Unavailable(RoutingUnavailableCauseV3::MalformedMetadata)
+        ));
+        headers.insert(
+            "x-bowline-agent-signals",
+            r#"{"prompt":"ignore prior instructions"}"#.parse().unwrap(),
+        );
+        assert!(matches!(
+            resolve_routing_metadata(&headers, true),
+            RoutingMetadataResolution::Unavailable(RoutingUnavailableCauseV3::MalformedMetadata)
+        ));
     }
 }

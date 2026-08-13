@@ -79,8 +79,12 @@ mod tests {
             bypasses: 1,
             fail_closed: 1,
             failures: 1,
+            candidate_failures: 0,
             cancellations: 1,
             incomplete: 2,
+            routing_capable: 0,
+            routing_efficient: 0,
+            routing_unavailable: 0,
             observed_enforced_cost_micros: Some(700_000),
             enforced_modeled_delta_micros: Some(-300_000),
         };
@@ -677,8 +681,12 @@ fn controlled_totals_values(
         totals.bypasses.to_string(),
         totals.fail_closed.to_string(),
         totals.failures.to_string(),
+        totals.candidate_failures.to_string(),
         totals.cancellations.to_string(),
         totals.incomplete.to_string(),
+        totals.routing_capable.to_string(),
+        totals.routing_efficient.to_string(),
+        totals.routing_unavailable.to_string(),
         fixed_usd(totals.observed_enforced_cost_micros),
         fixed_signed_usd(totals.enforced_modeled_delta_micros.map(i128::from)),
         shadow_groups,
@@ -695,8 +703,12 @@ fn controlled_enforcement_csv(report: &ControlledEnforcementReport) -> String {
         "bypasses",
         "fail_closed",
         "failures",
+        "candidate_failures",
         "cancellations",
         "incomplete",
+        "routing_capable",
+        "routing_efficient",
+        "routing_unavailable",
         "observed_enforced_cost_usd",
         "enforced_modeled_cost_delta_usd",
         "shadow_opportunity_groups",
@@ -738,7 +750,7 @@ fn controlled_enforcement_markdown(report: &ControlledEnforcementReport) -> Stri
         },
     );
     format!(
-        "# Bowline Controlled Enforcement Report\n\nComplete: `{}`  \nAuthority schema: `v{}`  \nDecisions: `{}`  \nCandidate dispatches: `{}`  \nPre-dispatch rejections: `{}`  \nBypasses: `{}`  \nFail-closed: `{}`  \nFailures: `{}`  \nCancellations: `{}`  \nIncomplete: `{}`  \nObserved enforced cost: `${}`  \nEnforced modeled cost delta: `${}`  \nShadow opportunity groups: `{}`  \nShadow modeled opportunity: `${}`\n\nEnforced outcomes and shadow opportunity are separate evidence classes.\n\n## Canonical evidence\n\n{}",
+        "# Bowline Controlled Enforcement Report\n\nComplete: `{}`  \nAuthority schema: `v{}`  \nDecisions: `{}`  \nCandidate dispatches: `{}`  \nPre-dispatch rejections: `{}`  \nBypasses: `{}`  \nFail-closed: `{}`  \nFailures: `{}`  \nCandidate failures: `{}`  \nCancellations: `{}`  \nIncomplete: `{}`  \nRouting capable: `{}`  \nRouting efficient: `{}`  \nRouting unavailable: `{}`  \nObserved enforced cost: `${}`  \nEnforced modeled cost delta: `${}`  \nShadow opportunity groups: `{}`  \nShadow modeled opportunity: `${}`\n\nEnforced outcomes and shadow opportunity are separate evidence classes.\n\n## Canonical evidence\n\n{}",
         report.complete,
         report.authority_schema_version,
         report.totals.decisions,
@@ -747,8 +759,12 @@ fn controlled_enforcement_markdown(report: &ControlledEnforcementReport) -> Stri
         report.totals.bypasses,
         report.totals.fail_closed,
         report.totals.failures,
+        report.totals.candidate_failures,
         report.totals.cancellations,
         report.totals.incomplete,
+        report.totals.routing_capable,
+        report.totals.routing_efficient,
+        report.totals.routing_unavailable,
         fixed_usd(report.totals.observed_enforced_cost_micros),
         fixed_signed_usd(report.totals.enforced_modeled_delta_micros.map(i128::from)),
         shadow_groups,
@@ -763,7 +779,7 @@ fn controlled_enforcement_markdown(report: &ControlledEnforcementReport) -> Stri
 pub fn render_controlled_enforcement_payloads(
     report: &ControlledEnforcementReport,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
-    if report.schema_version != 1 || report.authority_schema_version != 2 {
+    if report.schema_version != 1 || !matches!(report.authority_schema_version, 2 | 3) {
         anyhow::bail!("unsupported controlled-enforcement report schema");
     }
     let markdown = controlled_enforcement_markdown(report);

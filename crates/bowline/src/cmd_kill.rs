@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
 use anyhow::Context;
-use bowline_core::enforcement::EnforcementConfigV1;
+use bowline_core::enforcement::EnforcementConfig;
 use bowline_gateway::enforcement_loader::{atomic_write_kill_state, KillWriteState};
 use clap::{Args as ClapArgs, Subcommand};
 
@@ -35,13 +35,13 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         )
     })?;
     let config =
-        EnforcementConfigV1::from_yaml(&source).context("failed to parse enforcement bundle")?;
-    config
+        EnforcementConfig::from_yaml(&source).context("failed to parse enforcement bundle")?;
+    let validated = config
         .validate()
         .context("failed to validate enforcement bundle")?;
     atomic_write_kill_state(
-        config.kill_switch.trust_root.as_ref(),
-        &config.kill_switch.relative_path,
+        validated.kill_switch().trust_root.as_ref(),
+        &validated.kill_switch().relative_path,
         state,
     )
     .context("failed to atomically update kill state")?;

@@ -1,5 +1,9 @@
 # Threat model
 
+## External proposer boundary
+
+Switchyard is an experimental observe-only external proposer, not an allocator. Timeout, authentication failure, malformed replies, invalid backend IDs, unavailability, and queue saturation are visible aggregate telemetry but cannot delay or change Bowline authority. The adapter has no prompt or response-content channel.
+
 ## Assets and actors
 
 Assets are response integrity, authorization confidentiality, policy/registry/TCO correctness,

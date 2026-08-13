@@ -127,6 +127,8 @@ impl TryFrom<SelectionReason> for AuthorityFallbackReasonV2 {
             SelectionReason::ActuatorUnavailable => Self::ActuatorUnavailable,
             SelectionReason::ObserveOnly
             | SelectionReason::RecommendationOnly
+            | SelectionReason::RoutingCapable
+            | SelectionReason::RoutingUnavailable
             | SelectionReason::CandidateSelected => {
                 return Err(AuthorityRecordError::InvalidDecision);
             }
@@ -371,6 +373,122 @@ pub struct AuthorityDecisionV2 {
     pub enforcement_config_digest: String,
     pub route_config_digest: String,
     pub model_rewritten: bool,
+    /// Present only in authority-record schema v3. Keeping this optional preserves exact
+    /// deserialization of sealed schema-v2 evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<AuthorityRoutingBindingV3>,
+}
+
+/// Content-free linkage between a routed authority decision and the deterministic routing
+/// state that proposed its semantic target. This is evidence, never a dispatch capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum AuthorityRoutingBindingV3 {
+    /// A normal semantic selection. It can retain the capable upstream, but that is distinct
+    /// from an unavailable routing decision.
+    Decision {
+        routing_decision_digest: String,
+        routing_state_digest: String,
+        profile_digest: String,
+        task_reference_digest: String,
+        step_id: u64,
+        semantic_target: crate::routing::RoutingTarget,
+        reason: crate::routing::RoutingReason,
+        source: RoutingDecisionSourceV3,
+    },
+    /// Routing could not make a decision. This still binds a routed request to its configured
+    /// profile without fabricating a state or task digest that was never available.
+    Unavailable {
+        profile_digest: String,
+        cause: RoutingUnavailableCauseV3,
+        source: RoutingDecisionSourceV3,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutingDecisionSourceV3 {
+    TrustedImmediatePeer,
+    LocalDecisionApi,
+    InferenceGateway,
+    ConfiguredStartup,
+}
+
+/// Stable, content-free reason why a configured routing boundary was unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutingUnavailableCauseV3 {
+    MissingMetadata,
+    UntrustedMetadata,
+    MalformedMetadata,
+    StepConflict,
+    CapacityExhausted,
+    StateCorrupt,
+    WriterFailure,
+    StartupUnavailable,
+}
+
+impl AuthorityRoutingBindingV3 {
+    pub fn validate(&self) -> Result<(), AuthorityRecordError> {
+        match self {
+            Self::Decision {
+                routing_decision_digest,
+                routing_state_digest,
+                profile_digest,
+                task_reference_digest,
+                step_id,
+                semantic_target,
+                reason,
+                source,
+            } if valid_authority_digest(routing_decision_digest)
+                && valid_authority_digest(routing_state_digest)
+                && valid_authority_digest(profile_digest)
+                && valid_authority_digest(task_reference_digest)
+                && *step_id > 0
+                && matches!(
+                    source,
+                    RoutingDecisionSourceV3::TrustedImmediatePeer
+                        | RoutingDecisionSourceV3::LocalDecisionApi
+                )
+                && crate::routing::target_reason_coherent(*reason, *semantic_target) =>
+            {
+                Ok(())
+            }
+            Self::Unavailable {
+                profile_digest,
+                cause,
+                source,
+            } if valid_authority_digest(profile_digest)
+                && unavailable_source_coherent(*cause, *source) =>
+            {
+                Ok(())
+            }
+            _ => Err(AuthorityRecordError::InvalidDecision),
+        }
+    }
+}
+
+fn unavailable_source_coherent(
+    cause: RoutingUnavailableCauseV3,
+    source: RoutingDecisionSourceV3,
+) -> bool {
+    matches!(
+        (cause, source),
+        (
+            RoutingUnavailableCauseV3::MissingMetadata
+                | RoutingUnavailableCauseV3::UntrustedMetadata
+                | RoutingUnavailableCauseV3::MalformedMetadata,
+            RoutingDecisionSourceV3::InferenceGateway,
+        ) | (
+            RoutingUnavailableCauseV3::StepConflict
+                | RoutingUnavailableCauseV3::CapacityExhausted
+                | RoutingUnavailableCauseV3::WriterFailure,
+            RoutingDecisionSourceV3::TrustedImmediatePeer,
+        ) | (
+            RoutingUnavailableCauseV3::StateCorrupt | RoutingUnavailableCauseV3::StartupUnavailable,
+            RoutingDecisionSourceV3::ConfiguredStartup,
+        )
+    )
 }
 
 impl AuthorityDecisionV2 {
@@ -406,7 +524,25 @@ impl AuthorityDecisionV2 {
             && self
                 .baseline_supply_id
                 .as_deref()
-                .is_none_or(bounded_authority_identifier);
+                .is_none_or(bounded_authority_identifier)
+            && self
+                .routing
+                .as_ref()
+                .is_none_or(|routing| routing.validate().is_ok())
+            && match self.reason {
+                SelectionReason::RoutingCapable => matches!(
+                    self.routing,
+                    Some(AuthorityRoutingBindingV3::Decision {
+                        semantic_target: crate::routing::RoutingTarget::Capable,
+                        ..
+                    })
+                ),
+                SelectionReason::RoutingUnavailable => matches!(
+                    self.routing,
+                    Some(AuthorityRoutingBindingV3::Unavailable { .. })
+                ),
+                _ => true,
+            };
         if !common_valid {
             return Err(AuthorityRecordError::InvalidDecision);
         }
@@ -468,19 +604,37 @@ impl AuthorityDecisionV2 {
         }
         if !candidate {
             match self.reason {
-                SelectionReason::ObserveOnly | SelectionReason::RecommendationOnly => {
-                    let expected_mode = if self.reason == SelectionReason::ObserveOnly {
-                        RouteMode::Observe
-                    } else {
-                        RouteMode::Recommend
+                SelectionReason::ObserveOnly
+                | SelectionReason::RecommendationOnly
+                | SelectionReason::RoutingCapable
+                | SelectionReason::RoutingUnavailable => {
+                    let expected_mode = match self.reason {
+                        SelectionReason::ObserveOnly => RouteMode::Observe,
+                        SelectionReason::RecommendationOnly => RouteMode::Recommend,
+                        // Routing is advisory for both non-authority modes. It must never turn
+                        // an original dispatch into a candidate dispatch, including when the
+                        // enclosing route is enforce mode.
+                        SelectionReason::RoutingCapable | SelectionReason::RoutingUnavailable => {
+                            self.mode
+                        }
+                        _ => unreachable!("matched above"),
                     };
-                    let evidence_valid = if self.mode == RouteMode::Observe {
-                        self.evidence_state == EvidenceState::NotRequired
-                    } else {
-                        matches!(
+                    let evidence_valid = match self.reason {
+                        SelectionReason::ObserveOnly => {
+                            self.evidence_state == EvidenceState::NotRequired
+                        }
+                        SelectionReason::RecommendationOnly => matches!(
                             self.evidence_state,
                             EvidenceState::Presented | EvidenceState::Unverified
-                        )
+                        ),
+                        SelectionReason::RoutingCapable | SelectionReason::RoutingUnavailable => {
+                            if self.mode == RouteMode::Observe {
+                                self.evidence_state == EvidenceState::NotRequired
+                            } else {
+                                self.evidence_state == EvidenceState::Unverified
+                            }
+                        }
+                        _ => unreachable!("matched above"),
                     };
                     if self.mode != expected_mode
                         || self.target != PlanTarget::Original
@@ -587,6 +741,9 @@ pub struct AuthorityOutcomeV2 {
     pub approved_counterfactual_cost_micros: Option<u64>,
     #[serde(with = "optional_i128_json")]
     pub enforced_modeled_delta_micros: Option<i128>,
+    /// Must exactly match the routing linkage on the paired schema-v3 decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<AuthorityRoutingBindingV3>,
 }
 
 pub fn modeled_delta_applicable(outcome: &AuthorityOutcomeV2) -> bool {
@@ -718,6 +875,10 @@ impl AuthorityOutcomeV2 {
             || self
                 .approved_counterfactual_cost_micros
                 .is_some_and(|value| value > i64::MAX as u64)
+            || self
+                .routing
+                .as_ref()
+                .is_some_and(|routing| routing.validate().is_err())
         {
             return Err(AuthorityRecordError::InvalidOutcome);
         }
@@ -776,7 +937,12 @@ impl AuthorityOutcomeV2 {
                     self.selection_facts.kill_state,
                 )
                 || self.target != PlanTarget::Original
-                || !matches!(self.mode, RouteMode::Observe | RouteMode::Recommend)
+                || (!matches!(self.mode, RouteMode::Observe | RouteMode::Recommend)
+                    && !matches!(
+                        self.routing,
+                        Some(AuthorityRoutingBindingV3::Decision { .. })
+                            | Some(AuthorityRoutingBindingV3::Unavailable { .. })
+                    ))
             {
                 return Err(AuthorityRecordError::InvalidOutcome);
             }
@@ -932,7 +1098,7 @@ impl AuthorityRecordV2 {
         }
         decision.validate()?;
         Ok(Self::Decision {
-            schema_version: 2,
+            schema_version: if decision.routing.is_some() { 3 } else { 2 },
             sequence,
             decision,
         })
@@ -947,7 +1113,7 @@ impl AuthorityRecordV2 {
         }
         outcome.validate()?;
         Ok(Self::Outcome {
-            schema_version: 2,
+            schema_version: if outcome.routing.is_some() { 3 } else { 2 },
             sequence,
             outcome,
         })
@@ -956,6 +1122,14 @@ impl AuthorityRecordV2 {
     pub fn sequence(&self) -> u64 {
         match self {
             Self::Decision { sequence, .. } | Self::Outcome { sequence, .. } => *sequence,
+        }
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        match self {
+            Self::Decision { schema_version, .. } | Self::Outcome { schema_version, .. } => {
+                *schema_version
+            }
         }
     }
 }
@@ -1095,7 +1269,9 @@ pub fn validate_authority_pair_v2(
     let fallback_matches = match decision.reason {
         SelectionReason::CandidateSelected
         | SelectionReason::ObserveOnly
-        | SelectionReason::RecommendationOnly => outcome.fallback_reason.is_none(),
+        | SelectionReason::RecommendationOnly
+        | SelectionReason::RoutingCapable
+        | SelectionReason::RoutingUnavailable => outcome.fallback_reason.is_none(),
         reason => AuthorityFallbackReasonV2::try_from(reason)
             .is_ok_and(|reason| outcome.fallback_reason == Some(reason)),
     };
@@ -1131,6 +1307,7 @@ pub fn validate_authority_pair_v2(
             != outcome.grant_digest.as_deref()
         || decision.grant.as_ref().map(|grant| grant.expires_at_ms) != outcome.grant_expires_at_ms
         || decision.selection_facts.circuit_before != outcome.circuit_before
+        || decision.routing != outcome.routing
     {
         Err(AuthorityRunValidationError::PairMismatch)
     } else {
@@ -1174,7 +1351,7 @@ fn validate_authority_run_structure_v2_inner(
 ) -> Result<AuthorityRunDiagnosticsV2, AuthorityRunValidationError> {
     let expected_records =
         u64::try_from(records.len()).map_err(|_| AuthorityRunValidationError::InvalidManifest)?;
-    if manifest.schema_version != 2
+    if !matches!(manifest.schema_version, 2 | 3)
         || !manifest.clean_shutdown
         || !manifest.writer_healthy
         || manifest.writer_error.is_some()
@@ -1211,7 +1388,12 @@ fn validate_authority_run_structure_v2_inner(
                 decision,
                 ..
             } => {
-                if *schema_version != 2 || decision.validate().is_err() {
+                if !matches!(*schema_version, 2 | 3)
+                    || (*schema_version == 2 && decision.routing.is_some())
+                    || (*schema_version == 3 && decision.routing.is_none())
+                    || (manifest.schema_version == 2 && *schema_version != 2)
+                    || decision.validate().is_err()
+                {
                     return Err(AuthorityRunValidationError::PairMismatch);
                 }
                 if decision.enforcement_config_digest != manifest.enforcement_digest {
@@ -1230,7 +1412,10 @@ fn validate_authority_run_structure_v2_inner(
                 outcome,
                 ..
             } => {
-                if *schema_version != 2
+                if !matches!(*schema_version, 2 | 3)
+                    || (*schema_version == 2 && outcome.routing.is_some())
+                    || (*schema_version == 3 && outcome.routing.is_none())
+                    || (manifest.schema_version == 2 && *schema_version != 2)
                     || outcome.validate().is_err()
                     || (!allow_cancelled && outcome.completion == CompletionStateV2::Cancelled)
                 {
@@ -2627,6 +2812,7 @@ mod tests {
             enforcement_config_digest: remediation_digest(8),
             route_config_digest: remediation_digest(9),
             model_rewritten: true,
+            routing: None,
         }
     }
 
@@ -2670,6 +2856,7 @@ mod tests {
             observed_actual_cost_micros: None,
             approved_counterfactual_cost_micros: None,
             enforced_modeled_delta_micros: None,
+            routing: None,
         }
     }
 
@@ -2730,6 +2917,7 @@ mod tests {
             observed_actual_cost_micros: None,
             approved_counterfactual_cost_micros: None,
             enforced_modeled_delta_micros: None,
+            routing: None,
         }
     }
 

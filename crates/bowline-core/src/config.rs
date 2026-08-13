@@ -49,10 +49,61 @@ pub struct Config {
     pub promotion_approval: Option<PromotionApprovalConfig>,
     #[serde(default)]
     pub state_backend: Option<StateBackendConfig>,
+    #[serde(default)]
+    pub routing: Option<RoutingApiConfig>,
+    #[serde(default)]
+    pub switchyard_observe: Option<SwitchyardObserveConfig>,
     #[serde(default = "default_trusted_proxy_cidrs")]
     pub trusted_proxy_cidrs: Vec<IpNet>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+}
+
+/// Local, advisory-only routing decision listener.  This is deliberately not part of the
+/// OpenAI-compatible listener and cannot grant dispatch authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingApiConfig {
+    pub version: u32,
+    pub listen: String,
+    pub authorization_env: String,
+    #[serde(default = "default_routing_max_active_tasks")]
+    pub max_active_tasks: usize,
+    #[serde(default = "default_routing_segment_bytes")]
+    pub segment_bytes: u64,
+    #[serde(default = "default_routing_max_segments")]
+    pub max_segments: u32,
+}
+
+/// Bounded, observe-only external proposal pilot. It is never an allocation or dispatch policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchyardObserveConfig {
+    pub version: u32,
+    pub decision_api_url: String,
+    pub profile_id: String,
+    pub authorization_env: String,
+    #[serde(default = "default_switchyard_timeout_ms")]
+    pub timeout_ms: u64,
+    pub capable_backend_id: String,
+    pub efficient_backend_id: String,
+    pub observation_queue_capacity: usize,
+    #[serde(default)]
+    pub remote_acknowledged: bool,
+}
+
+fn default_switchyard_timeout_ms() -> u64 {
+    25
+}
+
+fn default_routing_max_active_tasks() -> usize {
+    1_024
+}
+fn default_routing_segment_bytes() -> u64 {
+    1_048_576
+}
+fn default_routing_max_segments() -> u32 {
+    16
 }
 
 /// Optional, bring-your-own-key signing policy for promotion/authority evidence. When absent,
@@ -483,6 +534,108 @@ impl Config {
                 }
             }
         }
+        if let Some(routing) = self.routing.as_ref() {
+            if routing.version != 1 {
+                return Err(ConfigError::invalid("routing.version", "must equal 1"));
+            }
+            let listener = routing.listen.parse::<SocketAddr>().map_err(|_| {
+                ConfigError::invalid(
+                    "routing.listen",
+                    "must be a valid loopback IP socket address",
+                )
+            })?;
+            if !listener.ip().is_loopback() {
+                return Err(ConfigError::invalid(
+                    "routing.listen",
+                    "version 1 must bind only to loopback",
+                ));
+            }
+            validate_secret_environment_reference(
+                "routing.authorization_env",
+                &routing.authorization_env,
+            )?;
+            if routing.max_active_tasks == 0 || routing.max_active_tasks > 16_384 {
+                return Err(ConfigError::invalid(
+                    "routing.max_active_tasks",
+                    "must be within 1..=16384",
+                ));
+            }
+            if routing.segment_bytes == 0 || routing.segment_bytes > MAX_SEGMENT_BYTES {
+                return Err(ConfigError::invalid(
+                    "routing.segment_bytes",
+                    "must be positive and within the compiled bound",
+                ));
+            }
+            if routing.max_segments == 0 || routing.max_segments > MAX_SEGMENTS {
+                return Err(ConfigError::invalid(
+                    "routing.max_segments",
+                    "must be positive and within the compiled bound",
+                ));
+            }
+        }
+        if let Some(switchyard) = self.switchyard_observe.as_ref() {
+            if switchyard.version != 1 {
+                return Err(ConfigError::invalid(
+                    "switchyard_observe.version",
+                    "must equal 1",
+                ));
+            }
+            let url = Url::parse(&switchyard.decision_api_url).map_err(|_| {
+                ConfigError::invalid(
+                    "switchyard_observe.decision_api_url",
+                    "must be an absolute URL",
+                )
+            })?;
+            let loopback = matches!(url.host(), Some(Host::Ipv4(ip)) if ip.is_loopback())
+                || matches!(url.host(), Some(Host::Ipv6(ip)) if ip.is_loopback());
+            if !(url.scheme() == "http" && loopback)
+                && !(url.scheme() == "https" && !loopback && switchyard.remote_acknowledged)
+            {
+                return Err(ConfigError::invalid(
+                    "switchyard_observe.decision_api_url",
+                    "must be loopback HTTP or acknowledged remote HTTPS",
+                ));
+            }
+            for (field, value) in [
+                ("switchyard_observe.profile_id", &switchyard.profile_id),
+                (
+                    "switchyard_observe.capable_backend_id",
+                    &switchyard.capable_backend_id,
+                ),
+                (
+                    "switchyard_observe.efficient_backend_id",
+                    &switchyard.efficient_backend_id,
+                ),
+            ] {
+                if !crate::identifier::is_bounded_identifier(value) {
+                    return Err(ConfigError::invalid(field, "must be a bounded identifier"));
+                }
+            }
+            if switchyard.capable_backend_id == switchyard.efficient_backend_id {
+                return Err(ConfigError::invalid(
+                    "switchyard_observe",
+                    "backend IDs must differ",
+                ));
+            }
+            validate_secret_environment_reference(
+                "switchyard_observe.authorization_env",
+                &switchyard.authorization_env,
+            )?;
+            if switchyard.timeout_ms == 0 || switchyard.timeout_ms > 1_000 {
+                return Err(ConfigError::invalid(
+                    "switchyard_observe.timeout_ms",
+                    "must be within 1..=1000",
+                ));
+            }
+            if switchyard.observation_queue_capacity == 0
+                || switchyard.observation_queue_capacity > 1_024
+            {
+                return Err(ConfigError::invalid(
+                    "switchyard_observe.observation_queue_capacity",
+                    "must be within 1..=1024",
+                ));
+            }
+        }
         self.runtime.validate()
     }
 
@@ -515,6 +668,32 @@ impl Config {
             serde_json::to_vec(&(1_u32, header, namespace, resolver.normalized_digest()))
                 .map_err(|error| ConfigError::Parse(error.to_string()))?;
         Ok(format!("sha256:{:x}", Sha256::digest(normalized)))
+    }
+}
+
+fn validate_secret_environment_reference(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && ["TOKEN", "KEY", "SECRET", "AUTH"]
+            .iter()
+            .any(|word| value.contains(word));
+    if valid {
+        Ok(())
+    } else {
+        Err(ConfigError::invalid(
+            field,
+            "must be a bounded uppercase credential environment reference",
+        ))
     }
 }
 
@@ -857,6 +1036,46 @@ mod tests {
         assert_eq!(config.registry_feed, PathBuf::from("registry/feed.json"));
         assert_eq!(config.ledger_dir, PathBuf::from("./ledger"));
         assert_eq!(config.tco, None);
+    }
+
+    #[test]
+    fn switchyard_observe_is_strict_and_remote_transport_is_explicit() {
+        let source = format!(
+            "{}\nswitchyard_observe:\n  version: 1\n  decision_api_url: http://127.0.0.1:8081/decision\n  profile_id: stage-main\n  authorization_env: BOWLINE_SWITCHYARD_AUTH\n  capable_backend_id: capable-backend\n  efficient_backend_id: efficient-backend\n  observation_queue_capacity: 8\n",
+            valid_yaml()
+        );
+        let config = Config::from_yaml(&source).unwrap();
+        config.validate().unwrap();
+        assert!(Config::from_yaml(&source.replace(
+            "observation_queue_capacity: 8",
+            "observation_queue_capacity: 8\n  prompt: leaked"
+        ))
+        .is_err());
+        let remote = source.replace(
+            "http://127.0.0.1:8081/decision",
+            "https://relay.example/decision",
+        );
+        assert!(Config::from_yaml(&remote).unwrap().validate().is_err());
+        assert!(
+            Config::from_yaml(&(remote + "  remote_acknowledged: true\n"))
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        assert!(Config::from_yaml(&source.replace(
+            "http://127.0.0.1:8081/decision",
+            "http://relay.example/decision"
+        ))
+        .unwrap()
+        .validate()
+        .is_err());
+        assert!(Config::from_yaml(&source.replace(
+            "http://127.0.0.1:8081/decision",
+            "http://localhost:8081/decision"
+        ))
+        .unwrap()
+        .validate()
+        .is_err());
     }
 
     #[test]

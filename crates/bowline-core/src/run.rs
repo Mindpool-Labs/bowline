@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 pub const RUN_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const AUTHORITY_RUN_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const AUTHORITY_RUN_MANIFEST_ROUTING_SCHEMA_VERSION: u32 = 3;
 pub const MAX_RUN_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_RUN_MANIFESTS: usize = 4096;
 const MAX_RUN_MANIFEST_FILENAME_BYTES: usize = 160;
@@ -203,6 +204,29 @@ impl AuthorityRunStoreV2 {
         increment(&mut self.lock_authority_manifest().recorded, "recorded")
     }
 
+    /// Upgrade this run only when the first routed record is committed. Schema-v2 readers remain
+    /// able to read sealed v2 manifests, while a v3 manifest explicitly declares mixed v2/v3
+    /// authority records.
+    pub fn recorded_with_schema(
+        &self,
+        sequence: u64,
+        record_schema_version: u32,
+    ) -> Result<(), RunError> {
+        if !matches!(record_schema_version, 2 | 3) {
+            return Err(RunError::UnsupportedSchema(record_schema_version));
+        }
+        self.validate_authority_sequence(sequence)?;
+        let manifest = {
+            let mut manifest = self.lock_authority_manifest();
+            if record_schema_version == 3 {
+                manifest.schema_version = AUTHORITY_RUN_MANIFEST_ROUTING_SCHEMA_VERSION;
+            }
+            increment(&mut manifest.recorded, "recorded")?;
+            manifest.clone()
+        };
+        atomic_write_authority_manifest(&self.directory, &self.manifest_path, &manifest)
+    }
+
     pub fn dropped(&self, sequence: u64) -> Result<(), RunError> {
         self.validate_authority_sequence(sequence)?;
         increment(&mut self.lock_authority_manifest().dropped, "dropped")
@@ -317,7 +341,10 @@ pub(crate) fn load_authority_manifest_at(
         return Err(RunError::ManifestLimit);
     }
     let manifest: AuthorityRunManifestV2 = serde_json::from_slice(&bytes)?;
-    if manifest.schema_version != AUTHORITY_RUN_MANIFEST_SCHEMA_VERSION {
+    if !matches!(
+        manifest.schema_version,
+        AUTHORITY_RUN_MANIFEST_SCHEMA_VERSION | AUTHORITY_RUN_MANIFEST_ROUTING_SCHEMA_VERSION
+    ) {
         return Err(RunError::UnsupportedSchema(manifest.schema_version));
     }
     if filename != format!("authority-run-{}.json", manifest.run_id)

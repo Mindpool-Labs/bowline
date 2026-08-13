@@ -1,5 +1,9 @@
 # Production PoV runbook
 
+## Optional bounded routing phase
+
+Keep routing advisory during observation. Use the safe sequence: observe -> canary -> economics -> configure profile -> seal -> optional signature/approval -> preflight -> organizational approval -> arm. Review task-state capacity separately. Circuit and admission state remains volatile. Switchyard remains observe-only; only the in-process controlled gateway can exercise candidate authority.
+
 This runbook first produces decision-grade shadow evidence. A separately approved controlled phase
 may then grant exact, bounded Chat/Responses authority. Agree on the window, traffic scope,
 integrity threshold, cost inputs, reviewers, and sign-off owner before deployment.

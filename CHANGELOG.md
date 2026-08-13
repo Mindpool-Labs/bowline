@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add bounded schema-v2 stage routing, durable content-free task state, an advisory local decision API, and an observe-only Switchyard pilot adapter; none grants external allocation authority.
+
 All notable changes are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 

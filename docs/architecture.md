@@ -1,5 +1,9 @@
 # Architecture
 
+## Bounded routing extension
+
+Task state is durable below the ledger directory and contains only task-reference digests and enumerated signals. Circuit and admission state remains volatile per activation. The decision listener is advisory-only; inference uses the in-process selector. Switchyard receives only digest, protocol, step, and signals, and cannot modify a plan, target, kill state, fallback, or dispatch.
+
 ## Logical role in the stack
 
 Bowline is the task-allocation intelligence between the systems that create enterprise AI work and

@@ -59,6 +59,34 @@ for field in listen upstream actual_supply_id policy_bundle registry_feed local_
   fi
 done
 
+for field in routing switchyard_observe routing_profiles routing_profile_id version listen \
+  authorization_env max_active_tasks segment_bytes max_segments decision_api_url profile_id \
+  timeout_ms capable_backend_id efficient_backend_id observation_queue_capacity \
+  remote_acknowledged; do
+  if ! grep -Fq "\`$field\`" docs/configuration.md; then
+    printf '%s\n' "routing configuration field is undocumented: $field" >&2
+    failures=$((failures + 1))
+  fi
+done
+
+for claim in \
+  'Enforcement version 1 has no routing fields and rejects them.' \
+  'exclusive-writer, CRC-checked durable' \
+  'A listener stops before lease-loss state drain' \
+  'The decision API accepts only `POST /v1/routing/decision`' \
+  'exactly one `Authorization` header' \
+  'JSON no larger than 65536 bytes' \
+  '`missing-metadata`, `untrusted-metadata`, `malformed-metadata`, `step-conflict`' \
+  '`capacity-exhausted`, `state-corrupt`, `writer-failure`, or `startup-unavailable`' \
+  'headers are accepted only from a configured trusted immediate peer' \
+  'The adapter disables redirects, bounds a successful response' \
+  'Switchyard is observe-only: it cannot change'; do
+  if ! grep -Fq "$claim" docs/configuration.md; then
+    printf '%s\n' "routing contract claim is undocumented: $claim" >&2
+    failures=$((failures + 1))
+  fi
+done
+
 for command in 'bowline health' 'bowline preflight' 'bowline serve' 'bowline report' \
   'bowline import observations' 'bowline policy validate' 'bowline registry show' \
   'bowline registry probe' 'bowline canary validate' 'bowline canary run' \
@@ -80,6 +108,17 @@ done
 for command in 'bowline kill arm' 'bowline kill bypass'; do
   if ! grep -R -Fq "$command" README.md docs; then
     printf '%s\n' "controlled-enforcement command is undocumented: $command" >&2
+    failures=$((failures + 1))
+  fi
+done
+
+for claim in \
+  'The decision API is advisory-only.' \
+  'Switchyard is observe-only.' \
+  'Only the in-process controlled gateway can exercise candidate authority.' \
+  'observe -> canary -> economics -> configure profile -> seal -> optional signature/approval -> preflight -> organizational approval -> arm'; do
+  if ! printf '%s' "$public_markdown_text" | grep -Fq "$claim"; then
+    printf '%s\n' "required bounded-routing claim is missing: $claim" >&2
     failures=$((failures + 1))
   fi
 done
@@ -204,6 +243,7 @@ has_unsupported_controlled_claim() {
       q{bowline has no dashboard and does not provide secure multi-tenancy},
       q{bowline does not isolate different customers inside one process},
       q{bowline does not use learned routing},
+      q{bounded routing claim bowline does not use learned routing},
       q{bowline never follows redirects, retries a completion, or falls back after a candidate attempt},
       q{never retries or sends the original request after a candidate attempt},
       q{a candidate stream failure after response headers terminates that stream without retry or fallback to the original upstream},

@@ -1,5 +1,11 @@
 # Controlled enforcement
 
+## Routing sequence
+
+Use this safe sequence exactly: observe -> canary -> economics -> configure profile -> seal -> optional signature/approval -> preflight -> organizational approval -> arm.
+
+The decision API is advisory-only. Only the in-process controlled gateway can exercise candidate authority after normal grant, kill, rollout, circuit, admission, and dispatch checks. A capable routing result is the configured original target, not a fallback. Switchyard is observe-only.
+
 Controlled enforcement is an optional serving mode for narrowly scoped, operator-approved
 allocation. Observe is the default when `enforcement` is absent. Observe and recommend routes send
 the original request and body to the configured upstream; recommend may attach verified advisory
