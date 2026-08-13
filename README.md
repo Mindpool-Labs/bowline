@@ -2,7 +2,34 @@
 
 ## Bounded task routing
 
-Bowline can use explicit stage profiles for exact Chat Completions and Responses routes. The decision API is advisory-only. Only the in-process controlled gateway can exercise candidate authority. Bowline does not use learned routing. Controlled enforcement does not inspect prompt or response content. Promotion remains an external approval sequence. See the synthetic [routing v2 example](examples/enforcement/routing-v2.yaml).
+Bowline can route explicit task stages on exact Chat Completions and Responses routes. It applies
+operator-configured thresholds to content-free runtime signals. Controlled enforcement does not
+inspect prompt or response content. Bowline does not use learned routing.
+
+| Capability | Behavior and boundary |
+| --- | --- |
+| Deterministic selection | A strict stage profile evaluates `exploration`, `write`, `test-passed`, `test-failed`, `tool-error`, `no-progress`, `critical-error`, and `context-pressure` signals. The result is the semantic `capable` or `efficient` target with a stable reason. The default target is `capable`. |
+| Durable task state | Task-reference digests and enumerated signals are stored in a private, exclusive-writer, CRC-checked segmented prefix below the ledger directory. Task, byte, and segment limits are explicit. Raw task IDs and request or response content are not stored. |
+| In-process authority | Observe and recommend routes always retain the original capable target. An efficient dispatch is possible only inside the controlled gateway when the route already has valid promotion, kill, rollout, circuit, admission, and dispatch authority. Routing does not create authority. |
+| Advisory decision API | An optional loopback listener provides authenticated `POST /v1/routing/decision` recommendations from the same durable state. It is advisory-only and cannot dispatch requests or grant candidate authority. |
+| Trusted inline metadata | A configured trusted immediate peer can send one task ID, step ID, and enumerated signal array. Bowline validates these headers and strips them before upstream forwarding. Missing, untrusted, malformed, conflicting, corrupt, full, or unavailable routing state retains the capable target. |
+| Evidence and reports | Schema-v3 authority decision and outcome records bind the routing decision, profile, task reference, step, target, reason, state digest, and source. Reports count capable, efficient, and unavailable routing outcomes separately. Schema-v2 evidence remains readable. |
+| Active-passive operation | Routing state follows the file-lease runtime lifecycle. A standby does not bind the advisory listener or write routing state. The listener drains before lease-loss deactivation and starts only after takeover activation. |
+| Switchyard observation | The optional Switchyard adapter sends bounded content-free observations and records agreement, latency, and error aggregates. It is observe-only: it cannot change the plan, target, authority, dispatch, fallback, kill state, or native result. Remote use requires acknowledged HTTPS. |
+
+The authority sequence remains explicit:
+
+```text
+observe -> canary -> economics -> configure profile -> seal
+        -> optional signature/approval -> preflight
+        -> organizational approval -> arm
+```
+
+Start with the synthetic [routing v2 example](examples/enforcement/routing-v2.yaml). See
+[configuration](docs/configuration.md#advisory-routing-and-switchyard),
+[controlled enforcement](docs/controlled-enforcement.md#routing-sequence),
+[operations](docs/operations.md#routing-operations), and
+[security](docs/security.md#routing-boundary) for the complete contracts and limits.
 
 Bowline is the intelligence layer for enterprise AI. It turns task distribution into an evidenced
 decision: which class of work runs on which supply, at what modeled cost, with what measured
