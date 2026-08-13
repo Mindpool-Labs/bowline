@@ -13,9 +13,12 @@ permissions:
 
 jobs:
   secrets:
+    name: Full-history secret scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install pinned gitleaks
         shell: bash
         run: |
@@ -30,9 +33,9 @@ jobs:
             "$RUNNER_TEMP/$archive" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
           "$RUNNER_TEMP/gitleaks" version
-      - name: Scan exact checkout bytes
+      - name: Scan full Git history
         run: |
-          "$RUNNER_TEMP/gitleaks" dir . --config .gitleaks.toml --redact --no-banner
+          "$RUNNER_TEMP/gitleaks" git . --config .gitleaks.toml --redact --no-banner
 
   rustsec:
     runs-on: ubuntu-latest

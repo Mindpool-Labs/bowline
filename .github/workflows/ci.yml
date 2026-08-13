@@ -50,3 +50,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/docker-smoke.sh
+
+  quality-release-gates:
+    name: Quality and release gates
+    if: ${{ always() }}
+    needs:
+      - rust
+      - contracts
+      - docker-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI gate to succeed
+        env:
+          RUST_RESULT: ${{ needs.rust.result }}
+          CONTRACTS_RESULT: ${{ needs.contracts.result }}
+          DOCKER_SMOKE_RESULT: ${{ needs.docker-smoke.result }}
+        run: |
+          test "$RUST_RESULT" = success
+          test "$CONTRACTS_RESULT" = success
+          test "$DOCKER_SMOKE_RESULT" = success

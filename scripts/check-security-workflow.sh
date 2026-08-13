@@ -76,6 +76,26 @@ if ! awk '
   exit 1
 fi
 
+if ! perl -0777 -e '
+  use strict;
+  use warnings;
+  my $text = <>;
+  my @matches = $text =~ m{
+    ^[ ]{2}secrets:\n
+    [ ]{4}name:[ ]Full-history[ ]secret[ ]scan\n
+    [ ]{4}runs-on:[ ]ubuntu-latest\n
+    [ ]{4}steps:\n
+    [ ]{6}-[ ]uses:[ ]actions/checkout\@v4\n
+    [ ]{8}with:\n
+    [ ]{10}fetch-depth:[ ]0\n
+  }gmx;
+  exit(@matches == 1 ? 0 : 1);
+' "$workflow"; then
+  printf '%s\n' \
+    'security workflow history contract failed: require the exact named gate and a full-history checkout' >&2
+  exit 1
+fi
+
 if ! awk '
   BEGIN {
     scan_name_count = 0
@@ -97,7 +117,7 @@ if ! awk '
   }
 
   state == 2 {
-    if ($0 == "          \"$RUNNER_TEMP/gitleaks\" dir . --config .gitleaks.toml --redact --no-banner") {
+    if ($0 == "          \"$RUNNER_TEMP/gitleaks\" git . --config .gitleaks.toml --redact --no-banner") {
       scan_command_count++
       state = 3
       next
@@ -117,7 +137,7 @@ if ! awk '
     state = 0
   }
 
-  $0 == "      - name: Scan exact checkout bytes" {
+  $0 == "      - name: Scan full Git history" {
     scan_name_count++
     state = 1
     next
@@ -131,9 +151,10 @@ if ! awk '
   }
 ' "$workflow"; then
   printf '%s\n' \
-    'security workflow scan contract failed: require exactly one Scan exact checkout bytes step with the canonical block-scalar gitleaks command' >&2
+    'security workflow scan contract failed: require exactly one full-history gitleaks scan step with the canonical block-scalar command' >&2
   exit 1
 fi
 
 printf '%s\n' 'security workflow trigger contract: PASS'
+printf '%s\n' 'security workflow history contract: PASS'
 printf '%s\n' 'security workflow scan contract: PASS'

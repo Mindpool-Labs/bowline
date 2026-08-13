@@ -44,6 +44,24 @@ require 'controlled-enforcement.md' README.md
 require 'examples/enforcement/validate-offline.sh' README.md
 
 ci=.github/workflows/ci.yml
+require 'name: Quality and release gates' "$ci"
+if ! perl -0777 -e '
+  use strict;
+  use warnings;
+  my $text = <>;
+  exit($text =~ m{
+    ^[ ]{2}quality-release-gates:\n
+    [ ]{4}name:[ ]Quality[ ]and[ ]release[ ]gates\n
+    [ ]{4}if:[ ].*always\(\).*\n
+    [ ]{4}needs:\n
+    [ ]{6}-[ ]rust\n
+    [ ]{6}-[ ]contracts\n
+    [ ]{6}-[ ]docker-smoke\n
+  }mx ? 0 : 1);
+' "$ci"; then
+  printf '%s\n' 'missing aggregate quality gate dependency contract' >&2
+  failures=$((failures + 1))
+fi
 for gate in 'cargo fmt --check' 'cargo clippy --workspace --all-targets -- -D warnings' \
   'cargo +1.95.0 check --workspace --all-targets' 'cargo test --workspace' 'cargo deny check' 'cargo audit' './scripts/check-docs.sh' \
   './scripts/check-deployment.sh' './scripts/check-repo.sh' './scripts/docker-smoke.sh' \
@@ -57,7 +75,9 @@ require 'cargo deny check' "$security"
 require 'cargo audit' "$security"
 require 'version=8.30.1' "$security"
 require '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' "$security"
-require 'gitleaks" dir . --config .gitleaks.toml --redact --no-banner' "$security"
+require 'name: Full-history secret scan' "$security"
+require 'fetch-depth: 0' "$security"
+require 'gitleaks" git . --config .gitleaks.toml --redact --no-banner' "$security"
 
 [ "$failures" -eq 0 ] || exit 1
 printf '%s\n' 'repository contract: PASS'
