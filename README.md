@@ -1,5 +1,55 @@
 # Bowline
 
+**Choose where AI work should run, with evidence.**
+
+Bowline is the task-allocation intelligence layer for enterprise AI. It helps AI platform teams
+decide which class of work belongs on which model and supply, at what modeled cost, with what
+measured quality, and under which policy and sovereignty constraints.
+
+The unit is the task, not the request. Bowline evaluates owned infrastructure, VPC-hosted models,
+and public APIs through one supply-neutral decision framework. It produces an evidence-bound
+placement decision or narrowly scoped authority for your existing control plane, scheduler,
+gateway, or model router to enact.
+
+## What Bowline solves
+
+Enterprise AI estates have more model and infrastructure choices than one routing rule can
+represent. A request can run successfully in many places, but the right placement depends on the
+task, required quality, policy, location, capacity, and cost. These inputs often live in separate
+systems, so teams cannot easily explain why work ran on one supply, test a different placement
+safely, or connect a serving change to reviewed evidence.
+
+Bowline brings those inputs into one controlled decision path:
+
+- **Make task placement explicit.** Match repeatable workload classes to supplies that meet their
+  configured policy and quality floors.
+- **Compare unlike supply on common terms.** Evaluate owned, VPC-hosted, and public supply with the
+  same policy, ratings, cost, sovereignty, and confidence rules.
+- **Measure before changing traffic.** Start in shadow mode, record what Bowline would choose, and
+  review bounded evidence without changing the upstream destination.
+- **Connect economics to quality.** Reconcile observed usage, modeled cost, and exact-supply
+  quality evidence while keeping modeled opportunity separate from observed outcomes.
+- **Turn evidence into controlled action.** Move from observation to narrowly scoped authority
+  only through explicit configuration, verified evidence, approval, and operator arming.
+- **Keep the execution stack you already use.** Bowline works with existing routers, gateways,
+  schedulers, runtimes, and hardware instead of replacing them.
+
+## How Bowline is different
+
+**Routers move requests. Bowline decides where work belongs.**
+
+| System | Primary responsibility |
+| --- | --- |
+| Model router or gateway | Select and reach an endpoint, balance traffic, and handle transport. |
+| Evaluation system | Measure model behavior on a selected dataset and evaluator. |
+| Cost or observability system | Report usage, spend, latency, and operational signals. |
+| Bowline | Join workload identity, policy, quality, economics, sovereignty, and supply evidence into a task-placement decision with an auditable path to limited authority. |
+
+Bowline is not an agent framework, inference runtime, provider proxy, or general-purpose router. It
+does not infer task intent from prompt content. Bowline does not use learned routing. It does not
+promote or arm authority by itself. Its role is to make placement decisions explainable, reviewable,
+and safe to operationalize.
+
 ## Bounded task routing
 
 Bowline can route explicit task stages on exact Chat Completions and Responses routes. It applies
@@ -30,27 +80,6 @@ Start with the synthetic [routing v2 example](examples/enforcement/routing-v2.ya
 [controlled enforcement](docs/controlled-enforcement.md#routing-sequence),
 [operations](docs/operations.md#routing-operations), and
 [security](docs/security.md#routing-boundary) for the complete contracts and limits.
-
-Bowline is the intelligence layer for enterprise AI. It turns task distribution into an evidenced
-decision: which class of work runs on which supply, at what modeled cost, with what measured
-quality.
-
-**Routers move requests. Bowline decides where work belongs.**
-
-The unit is the task, not the request. Bowline evaluates where each workload should run across
-owned, VPC-hosted, and public supply using workload identity, policy, quality, economics,
-sovereignty, and integrity-bound evidence.
-
-Bowline can observe inline through its OpenAI-compatible listener or off the request path through
-bounded, content-free observations imported from existing routers. Existing control planes,
-schedulers, gateways, and model routers enact any decision or narrowly scoped authority they
-receive.
-
-Bowline v0.1 can deploy as a local OpenAI-compatible observation and evidence point. Without an
-enforcement bundle it forwards requests to the configured upstream in shadow mode. Optional
-controlled enforcement is limited to exact allowlisted Chat Completions and Responses workloads
-with a fresh verified promotion grant. Startup never arms authority automatically or rewrites an
-existing valid kill state.
 
 ## Status
 
