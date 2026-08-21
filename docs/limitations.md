@@ -1,7 +1,7 @@
 # Phase 1 limitations
 
 - Task state is durable and bounded, but circuit and admission state remains volatile and resets on restart or file-lease takeover. Bowline does not use learned routing. Controlled enforcement does not inspect prompt or response content. Promotion remains an external approval sequence.
-- Switchyard is observe-only. It is not an authority service, runtime dependency, provider proxy, or dispatch path.
+- Switchyard is observe-only. It is not an authority service, runtime dependency, provider proxy, or dispatch path. The adapter targets the experimental NVIDIA NeMo Relay 0.6.0 Switchyard decision API. NVIDIA removes the `nemo-relay-switchyard` plugin in NeMo Relay 0.8, so this external contract will change and Bowline does not depend on it.
 
 - Shadow is the default. Controlled authority exists only for exact verified Chat/Responses grants;
   all other traffic retains the original upstream or configured local failure behavior.
