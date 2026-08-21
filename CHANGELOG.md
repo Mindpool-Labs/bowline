@@ -1,9 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Add bounded schema-v2 stage routing, durable content-free task state, an advisory local decision API, and an observe-only Switchyard pilot adapter; none grants external allocation authority.
-
 All notable changes are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
@@ -58,6 +54,20 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A neutrality charter (`docs/neutrality-charter.md`) stating the commitments that govern how
   affiliated supply is treated, anchored in a public transparency log with the Sigstore bundle
   committed for offline verification (`docs/anchors.md`).
+- Bounded task-stage routing on exact Chat Completions and Responses routes. Enforcement bundle
+  version 2 carries `routing_profiles`; durable, content-free task state lives in a private
+  exclusive-writer prefix below the ledger directory; and an optional loopback-only advisory
+  listener answers `POST /v1/routing/decision`. Routing never creates authority, and every
+  missing, untrusted, malformed, conflicting, capacity-exhausted, corrupt, or unavailable case
+  retains the capable target. Authority decision and outcome records that carry a routing
+  decision are written at evidence schema version 3; records without routing stay at version 2,
+  and both remain readable.
+- An optional observe-only adapter for the NVIDIA NeMo Relay 0.6.0 Switchyard decision API. It
+  sends only a task-reference digest, protocol, step, and enumerated signals, and records
+  agreement, latency, and error aggregates. It cannot change a plan, target, authority, dispatch,
+  fallback, kill state, or the native result. NVIDIA ships `nemo-relay-switchyard` as an
+  experimental plugin and removes it in NeMo Relay 0.8, so this adapter is a pilot against a
+  moving external contract.
 
 ### Fixed
 

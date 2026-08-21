@@ -178,7 +178,9 @@ forwarding. Missing, untrusted, malformed, conflicting, capacity-exhausted, corr
 or unavailable routing retains the capable/original target. Schema-v3 authority decision and
 outcome evidence binds either the durable routing decision or that unavailable cause and source.
 
-`switchyard_observe` is optional. Its complete version-1 fields are `version`,
+`switchyard_observe` is optional. It targets the experimental NVIDIA NeMo Relay 0.6.0 Switchyard
+decision API, a plugin NVIDIA removes in NeMo Relay 0.8; Bowline treats it as a pilot and never
+depends on it. Its complete version-1 fields are `version`,
 `decision_api_url`, `profile_id`, `authorization_env`, `timeout_ms`, `capable_backend_id`,
 `efficient_backend_id`, `observation_queue_capacity`, and `remote_acknowledged`. Backend and
 profile IDs are bounded and the backend IDs differ. `timeout_ms` defaults to 25 and is
