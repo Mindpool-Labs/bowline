@@ -92,6 +92,16 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   configuration; an Enforce route with no configured fallback fails closed instead of bypassing.
 - Canary input files are opened with `O_NOFOLLOW` and validated through the open handle, removing a
   symlink check-then-use window.
+- Routing task references are now HMAC-SHA256 (`hmac-sha256:` prefix) keyed by a 32-byte per-install
+  salt, rather than an unkeyed digest over the bounded, low-entropy, operator-chosen task ID; the
+  prior form was reversible by dictionary. **This is a breaking on-disk change**: the routing state
+  metadata schema is bumped, and a directory recorded before the bump refuses to open and needs a
+  one-time reset (stop the gateway, delete the routing state directory — safe only for a directory
+  that predates this change; a directory written by a *newer* Bowline release fails closed with a
+  distinct error and must not be deleted). The salt is minted only for a genuinely empty store and
+  is bound to the metadata that describes its history by a derived fingerprint, so losing or
+  replacing the salt file refuses to open rather than silently mint a second key over surviving
+  history. The salt is read via `getrandom` rather than a raw `/dev/urandom` file read.
 
 ## [0.1.0] - Unreleased
 

@@ -273,7 +273,9 @@ pub fn task_reference(salt: &[u8; 32], task_id: &str) -> Result<String, RoutingE
     let mut outer = Sha256::new();
     outer.update(outer_key);
     outer.update(inner);
-    Ok(format!("sha256:{:x}", outer.finalize()))
+    // Named `hmac-sha256:` rather than `sha256:` because it is keyed: an unqualified `sha256:`
+    // prefix would misrepresent it as the same plain-digest grammar as route/profile digests.
+    Ok(format!("hmac-sha256:{:x}", outer.finalize()))
 }
 
 #[cfg(test)]
@@ -401,6 +403,16 @@ mod tests {
             "the same task id under two installs must not share a reference"
         );
         assert_eq!(a, task_reference(&salt_a, "PROJ-1234").expect("stable"));
-        assert!(a.starts_with("sha256:"));
+        assert!(a.starts_with("hmac-sha256:"));
+    }
+
+    #[test]
+    fn the_task_reference_matches_a_known_hmac_sha256_vector() {
+        // Verified independently against a reference HMAC-SHA256 implementation.
+        let reference = task_reference(&[7u8; 32], "PROJ-1234").expect("valid identifier");
+        assert_eq!(
+            reference,
+            "hmac-sha256:5d9c31392c4edb1022d37bfb1b8a2828a097ea6fb64b33f8bf3964e5253bf4aa"
+        );
     }
 }

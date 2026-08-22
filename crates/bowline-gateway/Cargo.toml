@@ -27,6 +27,7 @@ thiserror.workspace = true
 ipnet.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+getrandom.workspace = true
 tempfile.workspace = true
 url.workspace = true
 csv.workspace = true
