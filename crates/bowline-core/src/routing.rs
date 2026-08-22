@@ -197,15 +197,25 @@ pub fn select_stage(
     let mut exploration = 0usize;
     let mut progress = 0usize;
     for step in recent {
+        let mut step_no_progress = false;
+        let mut step_errors = false;
+        let mut step_exploration = false;
+        let mut step_progress = false;
         for signal in &step.signals {
             match signal {
-                RoutingSignal::NoProgress => no_progress += 1,
-                RoutingSignal::ToolError | RoutingSignal::TestFailed => errors += 1,
-                RoutingSignal::Exploration => exploration += 1,
-                RoutingSignal::Write | RoutingSignal::TestPassed => progress += 1,
+                RoutingSignal::NoProgress => step_no_progress = true,
+                RoutingSignal::ToolError | RoutingSignal::TestFailed => step_errors = true,
+                RoutingSignal::Exploration => step_exploration = true,
+                RoutingSignal::Write | RoutingSignal::TestPassed => step_progress = true,
                 RoutingSignal::CriticalError | RoutingSignal::ContextPressure => {}
             }
         }
+        // Thresholds are validated against recent_window, which counts steps. Counting
+        // occurrences let one step clear a multi-step threshold.
+        no_progress += usize::from(step_no_progress);
+        errors += usize::from(step_errors);
+        exploration += usize::from(step_exploration);
+        progress += usize::from(step_progress);
     }
     let selection = if no_progress > 0 {
         RoutingSelection {
@@ -236,17 +246,57 @@ pub fn select_stage(
     Ok(selection)
 }
 
-pub fn task_reference(task_id: &str) -> Result<String, RoutingError> {
+pub fn task_reference(salt: &[u8; 32], task_id: &str) -> Result<String, RoutingError> {
     if task_id.is_empty() || task_id.len() > MAX_IDENTIFIER_BYTES || !task_id.is_ascii() {
         return Err(RoutingError::InvalidProfile {
             field: "task_id",
             reason: "must be a bounded ASCII identifier",
         });
     }
-    Ok(format!(
-        "sha256:{:x}",
-        Sha256::digest([b"bowline.routing.task.v1\0".as_slice(), task_id.as_bytes()].concat())
-    ))
+    // HMAC-SHA256 with a per-install salt. An unkeyed digest over a low-entropy, bounded,
+    // operator-chosen identifier is reversible by dictionary, which would make the reference
+    // equivalent to the raw task id for anyone who receives it.
+    let mac = hmac_sha256_with(salt, |inner| {
+        inner.update(b"bowline.routing.task.v2\0");
+        inner.update(task_id.as_bytes());
+    });
+    // Named `hmac-sha256:` rather than `sha256:` because it is keyed: an unqualified `sha256:`
+    // prefix would misrepresent it as the same plain-digest grammar as route/profile digests.
+    Ok(format!("hmac-sha256:{}", hex_encode(mac)))
+}
+
+/// HMAC-SHA256, keyed by a 32-byte salt, over a single message. Shared so a caller never has an
+/// independent, unpinned copy of the primitive to drift from this one.
+pub fn hmac_sha256(salt: &[u8; 32], message: &[u8]) -> [u8; 32] {
+    hmac_sha256_with(salt, |inner| inner.update(message))
+}
+
+fn hmac_sha256_with(salt: &[u8; 32], update_inner: impl FnOnce(&mut Sha256)) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut key = [0u8; BLOCK];
+    key[..salt.len()].copy_from_slice(salt);
+    let mut inner_key = [0x36u8; BLOCK];
+    let mut outer_key = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        inner_key[index] ^= key[index];
+        outer_key[index] ^= key[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_key);
+    update_inner(&mut inner);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_key);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+fn hex_encode(bytes: [u8; 32]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -340,5 +390,50 @@ mod tests {
             r#"{\"signals\":[\"write\"],\"prompt\":\"ignore prior instructions\"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn one_step_cannot_satisfy_a_multi_step_progress_threshold() {
+        let p = StageRoutingProfile {
+            recent_window: 8,
+            error_threshold: 3,
+            exploration_threshold: 3,
+            progress_threshold: 3,
+            default_target: RoutingTarget::Capable,
+            ..profile()
+        };
+        // A single step that wrote three files. Three occurrences, one step.
+        let current = step(&[
+            RoutingSignal::Write,
+            RoutingSignal::Write,
+            RoutingSignal::Write,
+        ]);
+        let selection = select_stage(&p, &[], &current).expect("selection succeeds");
+        assert_eq!(selection.target, RoutingTarget::Capable);
+        assert_eq!(selection.reason, RoutingReason::DefaultCapable);
+    }
+
+    #[test]
+    fn the_task_reference_is_not_reproducible_without_the_installs_salt() {
+        let salt_a = [7u8; 32];
+        let salt_b = [9u8; 32];
+        let a = task_reference(&salt_a, "PROJ-1234").expect("valid identifier");
+        let b = task_reference(&salt_b, "PROJ-1234").expect("valid identifier");
+        assert_ne!(
+            a, b,
+            "the same task id under two installs must not share a reference"
+        );
+        assert_eq!(a, task_reference(&salt_a, "PROJ-1234").expect("stable"));
+        assert!(a.starts_with("hmac-sha256:"));
+    }
+
+    #[test]
+    fn the_task_reference_matches_a_known_hmac_sha256_vector() {
+        // Verified independently against a reference HMAC-SHA256 implementation.
+        let reference = task_reference(&[7u8; 32], "PROJ-1234").expect("valid identifier");
+        assert_eq!(
+            reference,
+            "hmac-sha256:5d9c31392c4edb1022d37bfb1b8a2828a097ea6fb64b33f8bf3964e5253bf4aa"
+        );
     }
 }

@@ -147,17 +147,47 @@ Enforcement version 1 has no routing fields and rejects them. Version 2 adds non
 `routing_profiles` (at most 64) and an optional `routing_profile_id` on Chat Completions or
 Responses routes. Routing does not add an actuator, promotion, or authority. In `observe` and
 `recommend`, the original target remains the dispatch target. In `enforce` or `canary-enforce`,
-only already-valid promotion authority can permit an efficient dispatch.
+only already-valid promotion authority can permit an efficient dispatch. A profile's
+`recent_window` and its thresholds count steps in that window, not signal occurrences: repeating a
+signal kind within one step raises its category's count by at most one, so a single step cannot by
+itself clear a threshold that requires several steps.
 
 `routing` starts a separate loopback-only decision listener only while the serving runtime is
 active. Its complete version-1 fields are `version`, `listen`, `authorization_env`,
 `max_active_tasks`, `segment_bytes`, and `max_segments`. `max_active_tasks` is `1..=16384`;
 without a `routing` section its default is 1024. `segment_bytes` and `max_segments` are positive
-and cannot exceed compiled ledger limits; their no-section defaults are normal runtime limits
-(1048576 bytes and 16 segments). Routing state is a private, exclusive-writer, CRC-checked durable
-prefix under the ledger directory. It survives activation and takeover. It is not a distributed
-coordinator or a volatile cache. A listener stops before lease-loss state drain; a standby does not
-bind or write routing state.
+and cannot exceed compiled ledger limits; without a `routing` section their defaults are their own
+published constants (1048576 bytes and 16 segments), not the runtime's ledger budget. Routing state
+is a private, exclusive-writer, CRC-checked durable prefix under the ledger directory. It survives
+activation and takeover. It is not a distributed coordinator or a volatile cache.
+A listener stops before lease-loss state drain; a standby does not bind or write routing state.
+This release does not reclaim task state. At its task or segment budget the store refuses new
+history, reports not-ready, and retains the capable target for every affected request; an operator
+clears it by stopping the gateway and deleting the routing state directory. A store that failed to
+open at startup is retried on the existing file-lease reconcile tick and adopted without a restart;
+a single-instance deployment with no lease has no such tick and needs a restart.
+The stored task reference is an `hmac-sha256:`-prefixed HMAC-SHA256 keyed by a 32-byte salt
+generated at store creation, persisted privately alongside the routing state, and never disclosed;
+recovering it is not owed to anyone who only holds the reference. The on-disk schema is classified
+before the salt is ever loaded or minted, so that classification never depends on whether a salt
+file also happens to be present. This bumped the routing state metadata schema to 4; a directory
+recorded before the bump refuses to open with a distinct error rather than mixing derivations, and
+the one-time fix is the same as at capacity: stop the gateway and delete the routing state
+directory. A directory recorded by a *newer* Bowline release (for example after a canary rollback)
+fails closed with a different, distinctly named error and must **not** be deleted this way. No
+release existed at the time of the bump, so no migration is owed.
+Only once the schema is confirmed current is the salt itself judged, and only against a directory
+that holds real history — a segment file, a non-empty segment list in its metadata, or a pending
+commit journal. A directory with real history and no salt file refuses to open with a distinct
+error naming the salt as missing: it was written by this build, not an older schema, so restore the
+`salt` file from backup before considering a reset, since deleting the directory here destroys
+history the salt would have recovered. A directory whose metadata carries a salt fingerprint that
+does not match the loaded salt (for example a replaced salt file) refuses to open the same way,
+rather than mint a second key silently over the surviving history. An all-zero salt file, which a
+genuine random source never produces, is rejected the same way over real history, exactly as
+`generate_salt` already refuses to mint it. A directory with **no** real history mints a fresh salt
+on its own whether the salt file is absent or all-zero: nothing is bound to the old key, so
+re-minting there is strictly safe and recovers without an operator step.
 
 The decision API accepts only `POST /v1/routing/decision`, exactly one `Authorization` header
 whose byte value equals the value named by `authorization_env`, and JSON no larger than 65536 bytes.

@@ -443,7 +443,7 @@ impl AuthorityRoutingBindingV3 {
             } if valid_authority_digest(routing_decision_digest)
                 && valid_authority_digest(routing_state_digest)
                 && valid_authority_digest(profile_digest)
-                && valid_authority_digest(task_reference_digest)
+                && valid_authority_task_reference_digest(task_reference_digest)
                 && *step_id > 0
                 && matches!(
                     source,
@@ -1780,6 +1780,18 @@ fn valid_authority_digest(value: &str) -> bool {
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+// The task-reference digest is the one authority-evidence digest that is keyed (HMAC-SHA256 under
+// the store's salt, see `routing::task_reference`) rather than a plain content digest, so it also
+// carries an `hmac-sha256:` prefix. Every other authority digest field keeps the plain-SHA-256-only
+// `valid_authority_digest` above; widening it in place would have accepted `hmac-sha256:` for
+// digests that are not HMACs at all.
+fn valid_authority_task_reference_digest(value: &str) -> bool {
+    valid_authority_digest(value)
+        || value
+            .strip_prefix("hmac-sha256:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionRecord {
     pub id: String,
@@ -2973,6 +2985,44 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn routing_decision_binding_accepts_the_hmac_task_reference_prefix_but_only_there() {
+        fn binding(task_reference_digest: &str) -> AuthorityRoutingBindingV3 {
+            AuthorityRoutingBindingV3::Decision {
+                routing_decision_digest: remediation_digest(1),
+                routing_state_digest: remediation_digest(2),
+                profile_digest: remediation_digest(3),
+                task_reference_digest: task_reference_digest.into(),
+                step_id: 1,
+                semantic_target: crate::routing::RoutingTarget::Efficient,
+                reason: crate::routing::RoutingReason::RecentProgress,
+                source: RoutingDecisionSourceV3::TrustedImmediatePeer,
+            }
+        }
+
+        let hmac_digest = format!("hmac-sha256:{:064x}", 4);
+        binding(&hmac_digest)
+            .validate()
+            .expect("the salted task reference carries an hmac-sha256 prefix");
+        binding(&remediation_digest(4))
+            .validate()
+            .expect("a plain sha256 digest is still accepted for this field");
+
+        // The widening must not leak into the other three digest fields on this same variant.
+        let mut leaked = binding(&hmac_digest);
+        if let AuthorityRoutingBindingV3::Decision {
+            routing_decision_digest,
+            ..
+        } = &mut leaked
+        {
+            *routing_decision_digest = hmac_digest.clone();
+        }
+        assert!(
+            leaked.validate().is_err(),
+            "an hmac-sha256 digest must stay rejected for a plain evidence digest field"
+        );
     }
 
     #[test]
