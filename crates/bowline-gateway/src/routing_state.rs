@@ -37,6 +37,11 @@ pub const MAX_REQUEST_SIGNALS: usize = 32;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const DEFAULT_ROUTING_SEGMENT_BYTES: u64 = 1_048_576;
 pub const DEFAULT_ROUTING_MAX_SEGMENTS: u32 = 16;
+// Bumped from 2 to 3 with the move to a salted, keyed task reference (bowline.routing.task.v2).
+// A store recorded under an older schema used an unkeyed digest for every stored `task_ref`; its
+// history is unreadable under a salted derivation, so recovery refuses it outright rather than
+// silently minting new, unrelated task references over old history.
+const ROUTING_STATE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingStateLimits {
@@ -189,6 +194,10 @@ pub struct RoutingStateStore {
     root: PathBuf,
     limits: RoutingStateLimits,
     data: Mutex<StateData>,
+    // Generated once at store creation and never sent anywhere. Every caller of `task_reference`
+    // must go through this store rather than deriving its own, so a task reference cannot be
+    // reproduced off-host.
+    salt: [u8; 32],
     // The handle retains the advisory lock for this process lifetime.  A second active gateway
     // must fail closed rather than interleave frames with this writer.
     _writer_lock: File,
@@ -204,6 +213,8 @@ pub enum RoutingStateError {
     StepConflict,
     #[error("routing state is corrupt or undecodable")]
     Corrupt,
+    #[error("routing state predates salted task references and must be reset")]
+    LegacyTaskReferenceSchema,
     #[error("routing state I/O failed")]
     Io,
     #[error("routing state writer failed")]
@@ -221,7 +232,11 @@ impl RoutingStateError {
             Self::Capacity => Some(RoutingUnavailableCauseV3::CapacityExhausted),
             Self::Corrupt => Some(RoutingUnavailableCauseV3::StateCorrupt),
             Self::WriterFailure => Some(RoutingUnavailableCauseV3::WriterFailure),
-            Self::UnsafePath | Self::Io | Self::Locked | Self::Invalid => None,
+            Self::UnsafePath
+            | Self::Io
+            | Self::Locked
+            | Self::Invalid
+            | Self::LegacyTaskReferenceSchema => None,
         }
     }
 
@@ -250,14 +265,24 @@ impl RoutingStateStore {
         let root = ledger_dir.as_ref().join("routing-state");
         ensure_private_dir(&root)?;
         let writer_lock = acquire_writer_lock(&root)?;
+        let salt = load_or_create_salt(&root)?;
         let data = recover(&root, limits)?;
         write_metadata(&root, &data.segments)?;
         Ok(Self {
             root,
             limits,
             data: Mutex::new(data),
+            salt,
             _writer_lock: writer_lock,
         })
+    }
+
+    /// The per-install salt generated at store creation. Never persisted anywhere but the
+    /// store's own private, 0600 `salt` file, and never sent anywhere. Callers use it to derive a
+    /// task reference through `bowline_core::routing::task_reference` rather than loading it
+    /// themselves.
+    pub fn salt(&self) -> &[u8; 32] {
+        &self.salt
     }
 
     pub fn decide(
@@ -290,7 +315,8 @@ impl RoutingStateStore {
         if step_id == 0 || signals.len() > MAX_REQUEST_SIGNALS || route_digest.is_empty() {
             return Err(RoutingStateError::Invalid);
         }
-        let task_ref = task_reference(task_id).map_err(|_| RoutingStateError::Invalid)?;
+        let task_ref =
+            task_reference(&self.salt, task_id).map_err(|_| RoutingStateError::Invalid)?;
         let current = RoutingStep { signals };
         current.validate().map_err(|_| RoutingStateError::Invalid)?;
         let profile_digest = profile.digest();
@@ -883,8 +909,10 @@ fn segment_paths(root: &Path) -> Result<Vec<(u32, PathBuf)>, RoutingStateError> 
         } else if name == "writer.lock"
             || name == "metadata.json"
             || name == METADATA_COMMIT_JOURNAL
+            || name == "salt"
             || is_metadata_temp(name)
             || is_journal_temp(name)
+            || is_salt_temp(name)
         {
             validate_private_regular_file(&entry.path())?;
         } else {
@@ -969,6 +997,9 @@ fn load_metadata(
     let bytes = read_private_bounded(&path, max_metadata_bytes(limits))?;
     let metadata: StateMetadata =
         serde_json::from_slice(&bytes).map_err(|_| RoutingStateError::Corrupt)?;
+    if metadata.schema_version != ROUTING_STATE_SCHEMA_VERSION {
+        return Err(RoutingStateError::LegacyTaskReferenceSchema);
+    }
     if !metadata_shape_is_valid(&metadata) {
         return Err(RoutingStateError::Corrupt);
     }
@@ -986,6 +1017,11 @@ fn load_metadata_commit_journal(
     let bytes = read_private_bounded(&path, max_journal_bytes(limits))?;
     let journal: MetadataCommitJournal =
         serde_json::from_slice(&bytes).map_err(|_| RoutingStateError::Corrupt)?;
+    if journal.committed.schema_version != ROUTING_STATE_SCHEMA_VERSION
+        || journal.pending.schema_version != ROUTING_STATE_SCHEMA_VERSION
+    {
+        return Err(RoutingStateError::LegacyTaskReferenceSchema);
+    }
     if journal.schema_version != 1
         || !metadata_shape_is_valid(&journal.committed)
         || !metadata_shape_is_valid(&journal.pending)
@@ -1026,11 +1062,10 @@ fn read_private_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, RoutingSta
 }
 
 fn metadata_shape_is_valid(metadata: &StateMetadata) -> bool {
-    metadata.schema_version == 2
-        && !metadata
-            .segments
-            .windows(2)
-            .any(|window| window[0].index >= window[1].index)
+    !metadata
+        .segments
+        .windows(2)
+        .any(|window| window[0].index >= window[1].index)
         && metadata.active_segment == metadata.segments.last().map(|segment| segment.index)
 }
 
@@ -1082,7 +1117,7 @@ fn write_metadata(root: &Path, segments: &[SegmentState]) -> Result<(), RoutingS
 
 fn metadata_from_segments(segments: &[SegmentState]) -> StateMetadata {
     StateMetadata {
-        schema_version: 2,
+        schema_version: ROUTING_STATE_SCHEMA_VERSION,
         segments: segments
             .iter()
             .map(|segment| MetadataSegment {
@@ -1160,6 +1195,48 @@ fn write_metadata_value(
     Ok(())
 }
 
+fn load_or_create_salt(root: &Path) -> Result<[u8; 32], RoutingStateError> {
+    if let Some(salt) = load_salt(root)? {
+        return Ok(salt);
+    }
+    let salt = generate_salt()?;
+    write_salt(root, &salt)?;
+    Ok(salt)
+}
+
+fn load_salt(root: &Path) -> Result<Option<[u8; 32]>, RoutingStateError> {
+    let path = root.join("salt");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = read_private_bounded(&path, 32)?;
+    let salt: [u8; 32] = bytes.try_into().map_err(|_| RoutingStateError::Corrupt)?;
+    Ok(Some(salt))
+}
+
+fn generate_salt() -> Result<[u8; 32], RoutingStateError> {
+    // Deliberately bypasses `open_private_file`: that helper's regular-file and single-hard-link
+    // validation rejects a character device. This is the one read in the store that is not of a
+    // file this process wrote.
+    let mut urandom = File::open("/dev/urandom").map_err(|_| RoutingStateError::Io)?;
+    let mut salt = [0u8; 32];
+    urandom
+        .read_exact(&mut salt)
+        .map_err(|_| RoutingStateError::Io)?;
+    Ok(salt)
+}
+
+fn write_salt(root: &Path, salt: &[u8; 32]) -> Result<(), RoutingStateError> {
+    let destination = root.join("salt");
+    let temporary = root.join(format!(".routing-state-salt-{}.tmp", Uuid::new_v4()));
+    let mut file = open_private_file(&temporary, true, true)?;
+    file.write_all(salt)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| RoutingStateError::Io)?;
+    fs::rename(&temporary, &destination).map_err(|_| RoutingStateError::Io)?;
+    sync_directory(root)
+}
+
 fn sync_directory(root: &Path) -> Result<(), RoutingStateError> {
     File::open(root)
         .and_then(|directory| directory.sync_all())
@@ -1168,6 +1245,10 @@ fn sync_directory(root: &Path) -> Result<(), RoutingStateError> {
 
 fn is_metadata_temp(name: &str) -> bool {
     name.starts_with(".routing-state-metadata-") && name.ends_with(".tmp")
+}
+
+fn is_salt_temp(name: &str) -> bool {
+    name.starts_with(".routing-state-salt-") && name.ends_with(".tmp")
 }
 
 fn is_journal_temp(name: &str) -> bool {
@@ -1672,6 +1753,29 @@ mod tests {
         }
         let reopened = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
         assert_eq!(reopened.active_tasks(), 1);
+    }
+
+    #[test]
+    fn a_pre_salt_schema_prefix_refuses_to_open_instead_of_mixing_derivations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        drop(store);
+        let path = dir.path().join("routing-state").join("metadata.json");
+        // The schema this repeats is the field shape a store wrote before task references were
+        // salted. Recovery must not treat this as ordinary corruption: mistaking it for `Corrupt`
+        // would invite an operator to "recover" a directory whose `task_ref` values were derived
+        // under a different, unkeyed algorithm.
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"schema_version":2,"segments":[],"active_segment":null}"#)
+            .unwrap();
+        assert!(matches!(
+            RoutingStateStore::open(dir.path(), RoutingStateLimits::default()),
+            Err(RoutingStateError::LegacyTaskReferenceSchema)
+        ));
     }
 
     #[test]

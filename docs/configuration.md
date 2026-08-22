@@ -163,6 +163,12 @@ history, reports not-ready, and retains the capable target for every affected re
 clears it by stopping the gateway and deleting the routing state directory. A store that failed to
 open at startup is retried on the existing file-lease reconcile tick and adopted without a restart;
 a single-instance deployment with no lease has no such tick and needs a restart.
+The stored task reference is HMAC-SHA256 keyed by a 32-byte salt generated at store creation,
+persisted privately alongside the routing state, and never disclosed; recovering it is not owed to
+anyone who only holds the reference. This bumped the routing state metadata schema; a store
+recorded before the bump refuses to open with a distinct error rather than mixing derivations, and
+the one-time fix is the same as at capacity: stop the gateway and delete the routing state
+directory. No release existed at the time of the bump, so no migration is owed.
 
 The decision API accepts only `POST /v1/routing/decision`, exactly one `Authorization` header
 whose byte value equals the value named by `authorization_env`, and JSON no larger than 65536 bytes.

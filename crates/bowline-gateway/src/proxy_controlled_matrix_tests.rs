@@ -442,6 +442,20 @@ async fn real_proxy_switchyard_wire_uses_only_the_routed_binding_and_skips_unava
         .unwrap(),
     );
 
+    // Opened and dropped before the harness reopens the same directory, so the salt this test
+    // asserts against is the one the harness's store persisted rather than a second, unrelated one.
+    let capable_root = tempfile::tempdir().unwrap();
+    let capable_salt = *crate::routing_state::RoutingStateStore::open(
+        capable_root.path(),
+        crate::routing_state::RoutingStateLimits {
+            max_active_tasks: 16,
+            segment_bytes: 64 * 1024,
+            max_segments: 4,
+        },
+    )
+    .unwrap()
+    .salt();
+
     run_case_with_switchyard(
         MatrixCase {
             name: "proxy-switchyard-capable",
@@ -454,6 +468,7 @@ async fn real_proxy_switchyard_wire_uses_only_the_routed_binding_and_skips_unava
             ..base_case("proxy-switchyard-capable")
         },
         Some(Arc::clone(&adapter)),
+        capable_root,
     )
     .await;
     let payload = tokio::time::timeout(Duration::from_secs(1), payload_rx.recv())
@@ -480,7 +495,7 @@ async fn real_proxy_switchyard_wire_uses_only_the_routed_binding_and_skips_unava
     assert_eq!(payload["step_id"], 1);
     assert_eq!(
         payload["task_ref"],
-        bowline_core::routing::task_reference("routed-task").unwrap()
+        bowline_core::routing::task_reference(&capable_salt, "routed-task").unwrap()
     );
     assert_eq!(payload["signals"], serde_json::json!(["critical-error"]));
     let wire = payload.to_string();
@@ -514,6 +529,7 @@ async fn real_proxy_switchyard_wire_uses_only_the_routed_binding_and_skips_unava
             ..base_case("proxy-switchyard-unavailable")
         },
         Some(adapter),
+        tempfile::tempdir().unwrap(),
     )
     .await;
     assert!(
@@ -1336,14 +1352,14 @@ fn startup_case(
 }
 
 async fn run_case(case: MatrixCase) -> Option<ShadowParityEvidence> {
-    run_case_with_switchyard(case, None).await
+    run_case_with_switchyard(case, None, tempfile::tempdir().unwrap()).await
 }
 
 async fn run_case_with_switchyard(
     case: MatrixCase,
     switchyard_observe: Option<Arc<crate::switchyard_observe::SwitchyardObserveAdapter>>,
+    root: tempfile::TempDir,
 ) -> Option<ShadowParityEvidence> {
-    let root = tempfile::tempdir().unwrap();
     let redirect_target_count = Arc::new(AtomicUsize::new(0));
     let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let redirect_address = redirect_listener.local_addr().unwrap();
