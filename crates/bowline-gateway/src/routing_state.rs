@@ -16,6 +16,8 @@ use std::{
     sync::Mutex,
 };
 
+use getrandom::fill;
+
 #[cfg(test)]
 use std::cell::Cell;
 
@@ -1215,14 +1217,8 @@ fn load_salt(root: &Path) -> Result<Option<[u8; 32]>, RoutingStateError> {
 }
 
 fn generate_salt() -> Result<[u8; 32], RoutingStateError> {
-    // Deliberately bypasses `open_private_file`: that helper's regular-file and single-hard-link
-    // validation rejects a character device. This is the one read in the store that is not of a
-    // file this process wrote.
-    let mut urandom = File::open("/dev/urandom").map_err(|_| RoutingStateError::Io)?;
-    let mut salt = [0u8; 32];
-    urandom
-        .read_exact(&mut salt)
-        .map_err(|_| RoutingStateError::Io)?;
+    let mut salt: [u8; 32] = Default::default();
+    fill(&mut salt).map_err(|_| RoutingStateError::Io)?;
     Ok(salt)
 }
 
