@@ -86,6 +86,9 @@ pub struct RoutingStoredDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RoutingStateHealth {
     pub ready: bool,
+    /// Set when the store refused a decision for a reason retention cannot clear — a frame
+    /// larger than one segment. Distinct from `failed`, which means the writer itself broke.
+    pub capacity_exhausted: bool,
     pub active_tasks: usize,
     pub active_task_capacity: usize,
     pub segments: usize,
@@ -105,6 +108,10 @@ struct StateData {
     /// overwrites its entry when refounded, so a stale founding segment can never evict a task's
     /// current history.
     task_founding_segment: BTreeMap<String, u32>,
+    /// Set by the one genuinely terminal `Capacity` case — a frame larger than one segment — and
+    /// cleared by the next successful commit. Never persisted: a restart has no prior refusal to
+    /// remember.
+    capacity_exhausted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,7 +408,10 @@ impl RoutingStateStore {
         // prefix and the exact next prefix, so a failed call can never become a later decision.
         let segments = match planned_segments(&record, self.limits, &data.segments) {
             Ok(segments) => segments,
-            Err(RoutingStateError::Capacity) => return Err(RoutingStateError::Capacity),
+            Err(RoutingStateError::Capacity) => {
+                data.capacity_exhausted = true;
+                return Err(RoutingStateError::Capacity);
+            }
             Err(_) => {
                 data.failed = true;
                 return Err(RoutingStateError::WriterFailure);
@@ -489,6 +499,7 @@ impl RoutingStateStore {
         data.tasks.entry(task_ref.clone()).or_default().push(record);
         data.tasks_order.retain(|candidate| candidate != &task_ref);
         data.tasks_order.push_back(task_ref.clone());
+        data.capacity_exhausted = false;
         Ok(RoutingStoredDecision {
             task_ref,
             step_id,
@@ -516,7 +527,8 @@ impl RoutingStateStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         RoutingStateHealth {
-            ready: !data.failed,
+            ready: !data.failed && !data.capacity_exhausted,
+            capacity_exhausted: data.capacity_exhausted,
             active_tasks: data.tasks.len(),
             active_task_capacity: self.limits.max_active_tasks,
             segments: data.segments.len(),
@@ -1953,6 +1965,28 @@ mod tests {
             ),
             Err(RoutingStateError::StepConflict)
         ));
+    }
+
+    #[test]
+    fn a_saturated_store_reports_not_ready_rather_than_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        // One segment, and a frame larger than it can ever hold: the one genuinely terminal case.
+        let limits = RoutingStateLimits {
+            max_active_tasks: 8,
+            segment_bytes: 64,
+            max_segments: 1,
+        };
+        let store = RoutingStateStore::open(dir.path(), limits).unwrap();
+
+        let err = decide_once(&store, "task-a", 1).expect_err("frame cannot fit");
+        assert!(matches!(err, RoutingStateError::Capacity));
+
+        let health = store.health();
+        assert!(
+            !health.ready,
+            "a store that cannot accept any decision is not ready"
+        );
+        assert!(health.capacity_exhausted);
     }
 
     #[test]

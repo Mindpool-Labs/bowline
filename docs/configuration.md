@@ -153,11 +153,15 @@ only already-valid promotion authority can permit an efficient dispatch.
 active. Its complete version-1 fields are `version`, `listen`, `authorization_env`,
 `max_active_tasks`, `segment_bytes`, and `max_segments`. `max_active_tasks` is `1..=16384`;
 without a `routing` section its default is 1024. `segment_bytes` and `max_segments` are positive
-and cannot exceed compiled ledger limits; their no-section defaults are normal runtime limits
-(1048576 bytes and 16 segments). Routing state is a private, exclusive-writer, CRC-checked durable
-prefix under the ledger directory. It survives activation and takeover. It is not a distributed
-coordinator or a volatile cache. A listener stops before lease-loss state drain; a standby does not
-bind or write routing state.
+and cannot exceed compiled ledger limits; without a `routing` section their defaults are their own
+published constants (1048576 bytes and 16 segments), not the runtime's ledger budget. Routing state
+is a private, exclusive-writer, CRC-checked durable prefix under the ledger directory. It survives
+activation and takeover. It is not a distributed coordinator or a volatile cache.
+A listener stops before lease-loss state drain; a standby does not bind or write routing state.
+Task state is retained by segment roll-off and LRU task eviction, not compaction: once the segment
+budget is reached, the oldest task history is discarded and that task's next step conflicts and
+retains the capable target rather than reading a truncated history. A store that failed to open at
+startup is retried on the reconcile tick and adopted without a restart.
 
 The decision API accepts only `POST /v1/routing/decision`, exactly one `Authorization` header
 whose byte value equals the value named by `authorization_env`, and JSON no larger than 65536 bytes.

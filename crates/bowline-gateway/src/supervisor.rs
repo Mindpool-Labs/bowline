@@ -130,6 +130,12 @@ where
         self.lease.may_admit()
     }
 
+    /// Retries a previously failed routing state store open. Only meaningful while this instance
+    /// is active: a standby has no runtime to retry against, so this is a no-op for it.
+    pub(crate) fn retry_routing_state(&self) {
+        self.state.retry_routing_state();
+    }
+
     pub async fn activate<F>(&mut self, factory: &mut F) -> anyhow::Result<ActivationSummary>
     where
         F: FnMut() -> anyhow::Result<GatewayDeps>,

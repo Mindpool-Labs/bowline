@@ -315,9 +315,64 @@ struct EnforcementRuntime {
     writer: ManagedAuthorityWriter,
     terminal_tracker: Arc<AuthorityTerminalTracker>,
     last_kill_state: Mutex<KillReadResult>,
-    routing_state: Option<Arc<RoutingStateStore>>,
-    routing_startup_unavailable: Option<bowline_core::ledger::RoutingUnavailableCauseV3>,
+    routing: Mutex<RoutingRuntimeState>,
+    /// Root directory and limits used to (re)open the routing state store. `None` when no route
+    /// in this configuration uses routing, so a retry never attempts to open anything.
+    routing_open: Option<(std::path::PathBuf, RoutingStateLimits)>,
     switchyard_observe: Option<Arc<SwitchyardObserveAdapter>>,
+}
+
+/// The routing store and its current unavailable cause, mutated only by a successful or failed
+/// retry after startup. Behind a `Mutex` because every in-flight request holds its own clone of
+/// the surrounding `Arc<EnforcementRuntime>`.
+#[derive(Default)]
+struct RoutingRuntimeState {
+    store: Option<Arc<RoutingStateStore>>,
+    startup_unavailable: Option<bowline_core::ledger::RoutingUnavailableCauseV3>,
+}
+
+impl EnforcementRuntime {
+    /// A cheap snapshot: the store handle is an `Arc` clone, never a reopen.
+    fn routing_snapshot(
+        &self,
+    ) -> (
+        Option<Arc<RoutingStateStore>>,
+        Option<bowline_core::ledger::RoutingUnavailableCauseV3>,
+    ) {
+        let guard = self
+            .routing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (guard.store.clone(), guard.startup_unavailable)
+    }
+
+    /// Retries opening the routing state store after a prior attempt failed. A no-op when routing
+    /// is not configured for this runtime, or the store is already open. Callers must invoke this
+    /// only while this instance holds the serving lease — a standby must never open the store.
+    fn retry_routing_state(&self) {
+        let Some((root, limits)) = self.routing_open.as_ref() else {
+            return;
+        };
+        let mut guard = self
+            .routing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.store.is_some() {
+            return;
+        }
+        match RoutingStateStore::open(root, *limits) {
+            Ok(store) => {
+                tracing::info!(
+                    "routing state store opened; routed requests are no longer forced to retain capable upstream"
+                );
+                guard.store = Some(Arc::new(store));
+                guard.startup_unavailable = None;
+            }
+            Err(error) => {
+                guard.startup_unavailable = Some(error.startup_unavailable_cause());
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -425,11 +480,12 @@ impl GatewayState {
             .enforcement
             .as_ref()
             .context("routing enforcement is unavailable")?;
+        let (routing_state, routing_startup_unavailable) = enforcement.routing_snapshot();
         RoutingApiState::from_validated(
             &enforcement.validated,
             authorization_env,
-            enforcement.routing_state.clone(),
-            enforcement.routing_startup_unavailable,
+            routing_state,
+            routing_startup_unavailable,
         )
     }
     pub fn new(upstream_base: impl Into<String>, deps: GatewayDeps) -> Self {
@@ -535,6 +591,18 @@ impl GatewayState {
 
     pub(crate) fn active_run_id(&self) -> Option<String> {
         self.active_runtime().and_then(|runtime| runtime.run_id())
+    }
+
+    /// Retries a previously failed routing state store open. A no-op when no runtime is active,
+    /// or the active runtime has no routing configured. Called only from the reconcile tick while
+    /// this instance holds the serving lease.
+    pub(crate) fn retry_routing_state(&self) {
+        if let Some(enforcement) = self
+            .active_runtime()
+            .and_then(|runtime| runtime.enforcement.clone())
+        {
+            enforcement.retry_routing_state();
+        }
     }
 
     pub(crate) fn set_serving_state(&self, state: crate::supervisor::ServingState) {
@@ -858,7 +926,7 @@ async fn public_enforcement_health(runtime: &EnforcementRuntime) -> PublicEnforc
                 .routing_profile_for_route(&route.route_id)
                 .is_some()
         }),
-        routing: runtime.routing_state.as_ref().map(|store| store.health()),
+        routing: runtime.routing_snapshot().0.map(|store| store.health()),
         switchyard_observe: runtime
             .switchyard_observe
             .as_ref()
@@ -1098,6 +1166,9 @@ where
                     };
                 }
                 if supervisor.is_active() {
+                    // A prior open failure is retried here rather than latched for the runtime's
+                    // whole lifetime. Gated on is_active(): a standby must never open the store.
+                    supervisor.retry_routing_state();
                     standby_since = tokio::time::Instant::now();
                     takeover_alerted = false;
                 } else if !takeover_alerted && standby_since.elapsed() >= takeover_timeout {
@@ -1438,7 +1509,8 @@ async fn controlled_enforcement_response(
     };
     let mut routing = None;
     if let Some(profile) = runtime.validated.routing_profile_for_route(&route.route_id) {
-        let selected = match (routing_metadata, runtime.routing_state.as_ref()) {
+        let (routing_store, routing_startup_unavailable) = runtime.routing_snapshot();
+        let selected = match (routing_metadata, routing_store.as_ref()) {
             (RoutingMetadataResolution::Valid(metadata), Some(store)) => {
                 let Some(route_digest) = runtime.validated.route_digest(&route.route_id) else {
                     return Some(evidence_unavailable_response());
@@ -1458,8 +1530,7 @@ async fn controlled_enforcement_response(
                         )
                     })
             }
-            (RoutingMetadataResolution::Valid(_), None) => Err(runtime
-                .routing_startup_unavailable
+            (RoutingMetadataResolution::Valid(_), None) => Err(routing_startup_unavailable
                 .unwrap_or(bowline_core::ledger::RoutingUnavailableCauseV3::StartupUnavailable)),
             (RoutingMetadataResolution::Unavailable(cause), _) => Err(*cause),
         };
@@ -3230,16 +3301,18 @@ fn load_enforcement_runtime(
         max_records_bytes: config.runtime.ledger_segment_bytes,
     })
     .context("failed to start authority evidence writer")?;
-    let (routing_state, routing_startup_unavailable) = if validated.routes().any(|route| {
-        validated
-            .routing_profile_for_route(&route.route_id)
-            .is_some()
-    }) {
+    let (routing_state, routing_startup_unavailable, routing_open) = if validated.routes().any(
+        |route| {
+            validated
+                .routing_profile_for_route(&route.route_id)
+                .is_some()
+        },
+    ) {
         let limits = config.routing.as_ref().map_or(
             RoutingStateLimits {
                 max_active_tasks: crate::routing_state::DEFAULT_MAX_ACTIVE_TASKS,
-                segment_bytes: config.runtime.ledger_segment_bytes,
-                max_segments: config.runtime.ledger_max_segments,
+                segment_bytes: crate::routing_state::DEFAULT_ROUTING_SEGMENT_BYTES,
+                max_segments: crate::routing_state::DEFAULT_ROUTING_MAX_SEGMENTS,
             },
             |routing| RoutingStateLimits {
                 max_active_tasks: routing.max_active_tasks,
@@ -3247,15 +3320,16 @@ fn load_enforcement_runtime(
                 max_segments: routing.max_segments,
             },
         );
+        let routing_open = Some((config.ledger_dir.clone(), limits));
         match RoutingStateStore::open(&config.ledger_dir, limits) {
-            Ok(store) => (Some(Arc::new(store)), None),
+            Ok(store) => (Some(Arc::new(store)), None, routing_open),
             Err(error) => {
                 tracing::error!(error = %error, "routing state is unavailable; routed requests retain capable upstream");
-                (None, Some(error.startup_unavailable_cause()))
+                (None, Some(error.startup_unavailable_cause()), routing_open)
             }
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
     let switchyard_observe = config
         .switchyard_observe
@@ -3283,8 +3357,11 @@ fn load_enforcement_runtime(
         writer,
         terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
         last_kill_state: Mutex::new(KillReadResult::Unreadable),
-        routing_state,
-        routing_startup_unavailable,
+        routing: Mutex::new(RoutingRuntimeState {
+            store: routing_state,
+            startup_unavailable: routing_startup_unavailable,
+        }),
+        routing_open,
         switchyard_observe,
     })
 }
@@ -3636,8 +3713,8 @@ routes:
             writer: authority_writer,
             terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
             last_kill_state: Mutex::new(KillReadResult::Unreadable),
-            routing_state: None,
-            routing_startup_unavailable: None,
+            routing: Mutex::new(RoutingRuntimeState::default()),
+            routing_open: None,
             switchyard_observe: None,
         });
 
@@ -3650,6 +3727,103 @@ routes:
                 unverified: 1,
             }
         );
+    }
+
+    #[test]
+    fn a_route_with_no_routing_section_gets_the_documented_default_budget_not_the_ledger_budget() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let kill_root = root.path().join("kill");
+        fs::create_dir(&kill_root).unwrap();
+        fs::set_permissions(&kill_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(kill_root.join("state"), b"armed\n").unwrap();
+        fs::set_permissions(kill_root.join("state"), fs::Permissions::from_mode(0o600)).unwrap();
+        let enforcement_path = root.path().join("enforcement.yaml");
+        fs::write(
+            &enforcement_path,
+            format!(
+                r#"version: 2
+global_candidate_in_flight: 1
+kill_switch: {{trust_root: {}, relative_path: state}}
+actuators: []
+routing_profiles:
+  - profile_id: stage-main
+    kind: stage
+    recent_window: 4
+    error_threshold: 2
+    exploration_threshold: 2
+    progress_threshold: 1
+    default_target: capable
+routes:
+  - route_id: route
+    method: POST
+    path: /v1/responses
+    protocol: responses
+    workload: {{app: support, resolved_tags: []}}
+    mode: observe
+    rollout_ppm: 0
+    promoted_supply_id: candidate
+    actual_supply_id: baseline
+    task_class: unclassified
+    routing_profile_id: stage-main
+"#,
+                kill_root.canonicalize().unwrap().display()
+            ),
+        )
+        .unwrap();
+        let registry = Registry::from_json(r#"{"feed_version":"test","entries":[]}"#).unwrap();
+        let active = ActiveRuntimeProvenance::from_loaded(
+            &test_policy(),
+            "no-section-default registry source\n",
+            &OwnedCostCatalog::default(),
+        );
+        // A wide ledger budget the routing state must NOT inherit when there is no `routing:`
+        // section: the documented no-section default is 1 MiB / 16 segments, not this.
+        let runtime_config = RuntimeConfig {
+            ledger_segment_bytes: 67_108_864,
+            ledger_max_segments: 32,
+            ..RuntimeConfig::default()
+        };
+        let config = Config {
+            listen: "127.0.0.1:0".into(),
+            upstream: "http://127.0.0.1:9".into(),
+            actual_supply_id: "baseline".into(),
+            policy_bundle: root.path().join("unused-policy.yaml"),
+            registry_feed: root.path().join("unused-registry.json"),
+            local_endpoints: Vec::new(),
+            ledger_dir: root.path().join("ledger"),
+            tco: None,
+            attribution: None,
+            floors: None,
+            enforcement: Some(enforcement_path.clone()),
+            authority_signing: None,
+            promotion_approval: None,
+            state_backend: None,
+            routing: None,
+            switchyard_observe: None,
+            trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().unwrap()],
+            runtime: runtime_config,
+        };
+
+        let runtime =
+            load_enforcement_runtime(&config, &enforcement_path, &registry, &active).unwrap();
+        let health = runtime
+            .routing_snapshot()
+            .0
+            .expect("route needs a routing profile so a store opens even with no routing section")
+            .health();
+        assert_eq!(
+            health.segment_capacity, 16,
+            "no-section default must be the published 16 segments, not the ledger's 32"
+        );
+    }
+
+    fn test_policy() -> PolicyBundle {
+        PolicyBundle::from_yaml(
+            "version: 1\nidentities: []\nrules:\n  - name: default\n    default: true\n    require: {supply_class: [public-api]}\n",
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -3916,8 +4090,8 @@ routes:
             writer: authority_writer.clone(),
             terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
             last_kill_state: Mutex::new(KillReadResult::Unreadable),
-            routing_state: None,
-            routing_startup_unavailable: None,
+            routing: Mutex::new(RoutingRuntimeState::default()),
+            routing_open: None,
             switchyard_observe: None,
         });
         let startup_open = public_enforcement_health(&runtime).await;
@@ -4606,5 +4780,152 @@ routes:
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_routing_store_that_fails_to_open_at_startup_is_retried_and_adopted_without_a_restart(
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        async fn decide(router: Router) -> StatusCode {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router.into_make_service())
+                    .await
+                    .unwrap()
+            });
+            let status = reqwest::Client::new()
+                .post(format!("http://{address}/v1/routing/decision"))
+                .header("authorization", "Bearer retry-test")
+                .json(&serde_json::json!({
+                    "schema_version": 1,
+                    "route_id": "route",
+                    "task_id": "retry-task",
+                    "step_id": 1,
+                    "signals": ["write"],
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            server.abort();
+            status
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let kill = root.path().join("kill");
+        fs::create_dir(&kill).unwrap();
+        fs::set_permissions(&kill, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(kill.join("state"), b"armed\n").unwrap();
+        fs::set_permissions(kill.join("state"), fs::Permissions::from_mode(0o600)).unwrap();
+        let policy = root.path().join("policy.yaml");
+        fs::write(&policy, "version: 1\nidentities: []\nrules:\n  - name: default\n    default: true\n    require: {supply_class: [public-api]}\n").unwrap();
+        let registry = root.path().join("registry.json");
+        fs::write(
+            &registry,
+            r#"{"feed_version":"test","entries":[
+          {"id":"baseline","model":"baseline-model","location":"public","attributes":{"class":"public-api","jurisdiction":"us","retention":"none","training_use":false,"cloud_act_exposure":false},"price":{"input_per_mtok_usd":1.0,"output_per_mtok_usd":1.0},"ratings":{"unclassified":0.9}}
+        ]}"#,
+        )
+        .unwrap();
+        let enforcement = root.path().join("enforcement.yaml");
+        fs::write(
+            &enforcement,
+            format!(
+                r#"version: 2
+global_candidate_in_flight: 1
+kill_switch: {{trust_root: {}, relative_path: state}}
+actuators: []
+routing_profiles:
+  - profile_id: stage-main
+    kind: stage
+    recent_window: 4
+    error_threshold: 2
+    exploration_threshold: 2
+    progress_threshold: 1
+    default_target: capable
+routes:
+  - route_id: route
+    method: POST
+    path: /v1/responses
+    protocol: responses
+    workload: {{app: support, resolved_tags: []}}
+    mode: observe
+    rollout_ppm: 0
+    promoted_supply_id: candidate
+    actual_supply_id: baseline
+    task_class: unclassified
+    routing_profile_id: stage-main
+"#,
+                kill.canonicalize().unwrap().display()
+            ),
+        )
+        .unwrap();
+        let ledger = root.path().join("ledger");
+
+        // Pre-create the routing state directory with unsafe permissions so the store fails to
+        // open at startup without failing gateway activation.
+        let routing_state_dir = ledger.join("routing-state");
+        fs::create_dir_all(&routing_state_dir).unwrap();
+        fs::set_permissions(&routing_state_dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let config = Config {
+            listen: "127.0.0.1:0".into(),
+            upstream: "http://127.0.0.1:9".into(),
+            actual_supply_id: "baseline".into(),
+            policy_bundle: policy,
+            registry_feed: registry,
+            local_endpoints: Vec::new(),
+            ledger_dir: ledger,
+            tco: None,
+            attribution: None,
+            floors: None,
+            enforcement: Some(enforcement),
+            authority_signing: None,
+            promotion_approval: None,
+            state_backend: None,
+            routing: None,
+            switchyard_observe: None,
+            trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().unwrap()],
+            runtime: RuntimeConfig::default(),
+        };
+        let factory_config = config.clone();
+        let mut factory = move || deps_from_config(&factory_config);
+
+        let mut supervisor = crate::supervisor::GatewaySupervisor::new(
+            config,
+            crate::serving_lease::LocalServingLease,
+        )
+        .unwrap();
+        supervisor.activate(&mut factory).await.unwrap();
+        std::env::set_var("BOWLINE_RETRY_TEST_AUTH", "Bearer retry-test");
+
+        let unavailable = supervisor
+            .routing_api_state("BOWLINE_RETRY_TEST_AUTH")
+            .unwrap();
+        assert_eq!(
+            decide(unavailable.router()).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unsafe permissions must fail the initial open"
+        );
+
+        // Fix the underlying cause. Nothing here restarts the process.
+        fs::set_permissions(&routing_state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        supervisor.retry_routing_state();
+
+        let recovered = supervisor
+            .routing_api_state("BOWLINE_RETRY_TEST_AUTH")
+            .unwrap();
+        assert_eq!(
+            decide(recovered.router()).await,
+            StatusCode::OK,
+            "the retried store must be adopted without a restart"
+        );
+
+        supervisor.deactivate(Duration::from_secs(1)).await.unwrap();
+
+        // A standby must never open the store: retrying after deactivation is a safe no-op.
+        supervisor.retry_routing_state();
     }
 }
