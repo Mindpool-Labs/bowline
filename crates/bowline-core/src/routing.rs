@@ -256,6 +256,22 @@ pub fn task_reference(salt: &[u8; 32], task_id: &str) -> Result<String, RoutingE
     // HMAC-SHA256 with a per-install salt. An unkeyed digest over a low-entropy, bounded,
     // operator-chosen identifier is reversible by dictionary, which would make the reference
     // equivalent to the raw task id for anyone who receives it.
+    let mac = hmac_sha256_with(salt, |inner| {
+        inner.update(b"bowline.routing.task.v2\0");
+        inner.update(task_id.as_bytes());
+    });
+    // Named `hmac-sha256:` rather than `sha256:` because it is keyed: an unqualified `sha256:`
+    // prefix would misrepresent it as the same plain-digest grammar as route/profile digests.
+    Ok(format!("hmac-sha256:{}", hex_encode(mac)))
+}
+
+/// HMAC-SHA256, keyed by a 32-byte salt, over a single message. Shared so a caller never has an
+/// independent, unpinned copy of the primitive to drift from this one.
+pub fn hmac_sha256(salt: &[u8; 32], message: &[u8]) -> [u8; 32] {
+    hmac_sha256_with(salt, |inner| inner.update(message))
+}
+
+fn hmac_sha256_with(salt: &[u8; 32], update_inner: impl FnOnce(&mut Sha256)) -> [u8; 32] {
     const BLOCK: usize = 64;
     let mut key = [0u8; BLOCK];
     key[..salt.len()].copy_from_slice(salt);
@@ -267,15 +283,20 @@ pub fn task_reference(salt: &[u8; 32], task_id: &str) -> Result<String, RoutingE
     }
     let mut inner = Sha256::new();
     inner.update(inner_key);
-    inner.update(b"bowline.routing.task.v2\0");
-    inner.update(task_id.as_bytes());
+    update_inner(&mut inner);
     let inner = inner.finalize();
     let mut outer = Sha256::new();
     outer.update(outer_key);
     outer.update(inner);
-    // Named `hmac-sha256:` rather than `sha256:` because it is keyed: an unqualified `sha256:`
-    // prefix would misrepresent it as the same plain-digest grammar as route/profile digests.
-    Ok(format!("hmac-sha256:{:x}", outer.finalize()))
+    outer.finalize().into()
+}
+
+fn hex_encode(bytes: [u8; 32]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[cfg(test)]

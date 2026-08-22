@@ -95,13 +95,17 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Routing task references are now HMAC-SHA256 (`hmac-sha256:` prefix) keyed by a 32-byte per-install
   salt, rather than an unkeyed digest over the bounded, low-entropy, operator-chosen task ID; the
   prior form was reversible by dictionary. **This is a breaking on-disk change**: the routing state
-  metadata schema is bumped, and a directory recorded before the bump refuses to open and needs a
-  one-time reset (stop the gateway, delete the routing state directory — safe only for a directory
+  metadata schema is bumped to 4, and a directory recorded before the bump refuses to open and needs
+  a one-time reset (stop the gateway, delete the routing state directory — safe only for a directory
   that predates this change; a directory written by a *newer* Bowline release fails closed with a
-  distinct error and must not be deleted). The salt is minted only for a genuinely empty store and
-  is bound to the metadata that describes its history by a derived fingerprint, so losing or
-  replacing the salt file refuses to open rather than silently mint a second key over surviving
-  history. The salt is read via `getrandom` rather than a raw `/dev/urandom` file read.
+  distinct error and must not be deleted). The salt is minted only for a genuinely empty store; a
+  fingerprint derived from the salt (also `hmac-sha256:`-prefixed) is recorded in `metadata.json` and
+  detects a replaced or lost `salt` file, so losing or replacing it refuses to open rather than
+  silently mint a second key over surviving history. A directory that lost only its `salt` file gets
+  its own distinct error naming the file as missing rather than the "predates this change" message —
+  that directory is never safe to reset; restore the salt file instead. The salt is read via
+  `getrandom` rather than a raw `/dev/urandom` file read, and an all-zero salt is rejected both when
+  generated and when loaded from disk.
 
 ## [0.1.0] - Unreleased
 
