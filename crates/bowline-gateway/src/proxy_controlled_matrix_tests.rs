@@ -1567,23 +1567,26 @@ async fn run_case_with_switchyard(
         writer: writer.clone(),
         terminal_tracker: Arc::new(AuthorityTerminalTracker::default()),
         last_kill_state: Mutex::new(KillReadResult::Unreadable),
-        routing_state: match case.routing {
-            RoutingSetup::None => None,
-            RoutingSetup::Capable
-            | RoutingSetup::Efficient
-            | RoutingSetup::UnavailableMissingMetadata => Some(Arc::new(
-                crate::routing_state::RoutingStateStore::open(
-                    root.path(),
-                    crate::routing_state::RoutingStateLimits {
-                        max_active_tasks: 16,
-                        segment_bytes: 64 * 1024,
-                        max_segments: 4,
-                    },
-                )
-                .unwrap(),
-            )),
-        },
-        routing_startup_unavailable: None,
+        routing: Mutex::new(RoutingRuntimeState {
+            store: match case.routing {
+                RoutingSetup::None => None,
+                RoutingSetup::Capable
+                | RoutingSetup::Efficient
+                | RoutingSetup::UnavailableMissingMetadata => Some(Arc::new(
+                    crate::routing_state::RoutingStateStore::open(
+                        root.path(),
+                        crate::routing_state::RoutingStateLimits {
+                            max_active_tasks: 16,
+                            segment_bytes: 64 * 1024,
+                            max_segments: 4,
+                        },
+                    )
+                    .unwrap(),
+                )),
+            },
+            startup_unavailable: None,
+        }),
+        routing_open: None,
         switchyard_observe,
     });
 

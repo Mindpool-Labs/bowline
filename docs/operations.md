@@ -2,7 +2,7 @@
 
 ## Routing operations
 
-Monitor aggregate routing readiness, task/segment capacity, and dropped observations. Corruption, capacity exhaustion, or writer failure is routing-unavailable and retains the capable target. On file-lease loss, the advisory listener drains before runtime deactivation and starts only after takeover activation. Do not treat Switchyard telemetry as authority.
+Monitor aggregate routing readiness, task/segment capacity, and dropped observations. Corruption, capacity exhaustion, or writer failure is routing-unavailable and retains the capable target. A store that cannot accept any decision — a single frame larger than one segment — reports not-ready; ordinary saturation is handled by segment roll-off and LRU task eviction without operator action. A store that failed to open at startup is retried on the existing reconcile tick and adopted without a restart. On file-lease loss, the advisory listener drains before runtime deactivation and starts only after takeover activation. Do not treat Switchyard telemetry as authority.
 
 ## Health and capacity
 
