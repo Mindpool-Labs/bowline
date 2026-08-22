@@ -147,7 +147,10 @@ Enforcement version 1 has no routing fields and rejects them. Version 2 adds non
 `routing_profiles` (at most 64) and an optional `routing_profile_id` on Chat Completions or
 Responses routes. Routing does not add an actuator, promotion, or authority. In `observe` and
 `recommend`, the original target remains the dispatch target. In `enforce` or `canary-enforce`,
-only already-valid promotion authority can permit an efficient dispatch.
+only already-valid promotion authority can permit an efficient dispatch. A profile's
+`recent_window` and its thresholds count steps in that window, not signal occurrences: repeating a
+signal kind within one step raises its category's count by at most one, so a single step cannot by
+itself clear a threshold that requires several steps.
 
 `routing` starts a separate loopback-only decision listener only while the serving runtime is
 active. Its complete version-1 fields are `version`, `listen`, `authorization_env`,

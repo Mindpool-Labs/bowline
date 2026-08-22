@@ -197,15 +197,25 @@ pub fn select_stage(
     let mut exploration = 0usize;
     let mut progress = 0usize;
     for step in recent {
+        let mut step_no_progress = false;
+        let mut step_errors = false;
+        let mut step_exploration = false;
+        let mut step_progress = false;
         for signal in &step.signals {
             match signal {
-                RoutingSignal::NoProgress => no_progress += 1,
-                RoutingSignal::ToolError | RoutingSignal::TestFailed => errors += 1,
-                RoutingSignal::Exploration => exploration += 1,
-                RoutingSignal::Write | RoutingSignal::TestPassed => progress += 1,
+                RoutingSignal::NoProgress => step_no_progress = true,
+                RoutingSignal::ToolError | RoutingSignal::TestFailed => step_errors = true,
+                RoutingSignal::Exploration => step_exploration = true,
+                RoutingSignal::Write | RoutingSignal::TestPassed => step_progress = true,
                 RoutingSignal::CriticalError | RoutingSignal::ContextPressure => {}
             }
         }
+        // Thresholds are validated against recent_window, which counts steps. Counting
+        // occurrences let one step clear a multi-step threshold.
+        no_progress += usize::from(step_no_progress);
+        errors += usize::from(step_errors);
+        exploration += usize::from(step_exploration);
+        progress += usize::from(step_progress);
     }
     let selection = if no_progress > 0 {
         RoutingSelection {
@@ -357,6 +367,27 @@ mod tests {
             r#"{\"signals\":[\"write\"],\"prompt\":\"ignore prior instructions\"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn one_step_cannot_satisfy_a_multi_step_progress_threshold() {
+        let p = StageRoutingProfile {
+            recent_window: 8,
+            error_threshold: 3,
+            exploration_threshold: 3,
+            progress_threshold: 3,
+            default_target: RoutingTarget::Capable,
+            ..profile()
+        };
+        // A single step that wrote three files. Three occurrences, one step.
+        let current = step(&[
+            RoutingSignal::Write,
+            RoutingSignal::Write,
+            RoutingSignal::Write,
+        ]);
+        let selection = select_stage(&p, &[], &current).expect("selection succeeds");
+        assert_eq!(selection.target, RoutingTarget::Capable);
+        assert_eq!(selection.reason, RoutingReason::DefaultCapable);
     }
 
     #[test]
