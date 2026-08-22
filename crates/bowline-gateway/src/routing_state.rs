@@ -16,8 +16,6 @@ use std::{
     sync::Mutex,
 };
 
-use getrandom::fill;
-
 #[cfg(test)]
 use std::cell::Cell;
 
@@ -125,6 +123,12 @@ struct StateMetadata {
     schema_version: u32,
     segments: Vec<MetadataSegment>,
     active_segment: Option<u32>,
+    // Binds this metadata to the salt that produced the history it describes. Absent (default
+    // empty) only for a pre-3a schema-version-3 directory, which the schema_version check above
+    // already refuses before this field is ever compared. Derived via `salt_fingerprint`; never
+    // the salt itself, so it discloses nothing if it ever leaked.
+    #[serde(default)]
+    salt_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +221,12 @@ pub enum RoutingStateError {
     Corrupt,
     #[error("routing state predates salted task references and must be reset")]
     LegacyTaskReferenceSchema,
+    #[error(
+        "routing state was written by a newer Bowline release and must not be deleted; roll forward instead"
+    )]
+    NewerRoutingStateSchema,
+    #[error("routing state salt does not match the fingerprint recorded in its metadata")]
+    SaltFingerprintMismatch,
     #[error("routing state I/O failed")]
     Io,
     #[error("routing state writer failed")]
@@ -238,7 +248,9 @@ impl RoutingStateError {
             | Self::Io
             | Self::Locked
             | Self::Invalid
-            | Self::LegacyTaskReferenceSchema => None,
+            | Self::LegacyTaskReferenceSchema
+            | Self::NewerRoutingStateSchema
+            | Self::SaltFingerprintMismatch => None,
         }
     }
 
@@ -268,8 +280,8 @@ impl RoutingStateStore {
         ensure_private_dir(&root)?;
         let writer_lock = acquire_writer_lock(&root)?;
         let salt = load_or_create_salt(&root)?;
-        let data = recover(&root, limits)?;
-        write_metadata(&root, &data.segments)?;
+        let data = recover(&root, limits, &salt)?;
+        write_metadata(&root, &data.segments, &salt)?;
         Ok(Self {
             root,
             limits,
@@ -433,8 +445,8 @@ impl RoutingStateStore {
         let mut journal = MetadataCommitJournal {
             schema_version: 1,
             phase: MetadataCommitPhase::Rollback,
-            committed: metadata_from_segments(&data.segments),
-            pending: metadata_from_segments(&segments),
+            committed: metadata_from_segments(&data.segments, &self.salt),
+            pending: metadata_from_segments(&segments, &self.salt),
         };
         if write_metadata_commit_journal(&self.root, &journal)
             .and_then(|_| fail_metadata_at(MetadataFailurePoint::BeforeSegmentMutation))
@@ -624,12 +636,16 @@ fn planned_segments(
     Ok(segments)
 }
 
-fn recover(root: &Path, limits: RoutingStateLimits) -> Result<StateData, RoutingStateError> {
-    cleanup_orphan_journal_temps(root)?;
-    if let Some(journal) = load_metadata_commit_journal(root, limits)? {
-        recover_metadata_journal(root, limits, &journal)?;
+fn recover(
+    root: &Path,
+    limits: RoutingStateLimits,
+    salt: &[u8; 32],
+) -> Result<StateData, RoutingStateError> {
+    cleanup_orphan_temps(root)?;
+    if let Some(journal) = load_metadata_commit_journal(root, limits, salt)? {
+        recover_metadata_journal(root, limits, &journal, salt)?;
     }
-    let metadata = load_metadata(root, limits)?;
+    let metadata = load_metadata(root, limits, salt)?;
     let mut paths = segment_paths(root)?;
     if paths.len() > limits.max_segments as usize {
         return Err(RoutingStateError::Capacity);
@@ -747,8 +763,9 @@ fn recover_metadata_journal(
     root: &Path,
     limits: RoutingStateLimits,
     journal: &MetadataCommitJournal,
+    salt: &[u8; 32],
 ) -> Result<(), RoutingStateError> {
-    let current = load_metadata(root, limits)?;
+    let current = load_metadata(root, limits, salt)?;
     if journal.phase == MetadataCommitPhase::Committed {
         if current.as_ref() != Some(&journal.pending) {
             return Err(RoutingStateError::Corrupt);
@@ -806,8 +823,8 @@ fn validate_record(
     prior_state: Option<&str>,
 ) -> Result<(), RoutingStateError> {
     if record.step_id == 0
-        || record.task_ref.len() != "sha256:".len() + 64
-        || !record.task_ref.starts_with("sha256:")
+        || record.task_ref.len() != "hmac-sha256:".len() + 64
+        || !record.task_ref.starts_with("hmac-sha256:")
         || !valid_digest(&record.route_digest)
         || !valid_digest(&record.profile_digest)
         || (RoutingStep {
@@ -991,6 +1008,7 @@ fn validate_private_regular_file(path: &Path) -> Result<(), RoutingStateError> {
 fn load_metadata(
     root: &Path,
     limits: RoutingStateLimits,
+    salt: &[u8; 32],
 ) -> Result<Option<StateMetadata>, RoutingStateError> {
     let path = root.join("metadata.json");
     if !path.exists() {
@@ -999,11 +1017,12 @@ fn load_metadata(
     let bytes = read_private_bounded(&path, max_metadata_bytes(limits))?;
     let metadata: StateMetadata =
         serde_json::from_slice(&bytes).map_err(|_| RoutingStateError::Corrupt)?;
-    if metadata.schema_version != ROUTING_STATE_SCHEMA_VERSION {
-        return Err(RoutingStateError::LegacyTaskReferenceSchema);
-    }
+    check_schema_direction(metadata.schema_version)?;
     if !metadata_shape_is_valid(&metadata) {
         return Err(RoutingStateError::Corrupt);
+    }
+    if metadata.salt_digest != salt_fingerprint(salt) {
+        return Err(RoutingStateError::SaltFingerprintMismatch);
     }
     Ok(Some(metadata))
 }
@@ -1011,6 +1030,7 @@ fn load_metadata(
 fn load_metadata_commit_journal(
     root: &Path,
     limits: RoutingStateLimits,
+    salt: &[u8; 32],
 ) -> Result<Option<MetadataCommitJournal>, RoutingStateError> {
     let path = root.join(METADATA_COMMIT_JOURNAL);
     if !path.exists() {
@@ -1019,11 +1039,8 @@ fn load_metadata_commit_journal(
     let bytes = read_private_bounded(&path, max_journal_bytes(limits))?;
     let journal: MetadataCommitJournal =
         serde_json::from_slice(&bytes).map_err(|_| RoutingStateError::Corrupt)?;
-    if journal.committed.schema_version != ROUTING_STATE_SCHEMA_VERSION
-        || journal.pending.schema_version != ROUTING_STATE_SCHEMA_VERSION
-    {
-        return Err(RoutingStateError::LegacyTaskReferenceSchema);
-    }
+    check_schema_direction(journal.committed.schema_version)?;
+    check_schema_direction(journal.pending.schema_version)?;
     if journal.schema_version != 1
         || !metadata_shape_is_valid(&journal.committed)
         || !metadata_shape_is_valid(&journal.pending)
@@ -1031,7 +1048,26 @@ fn load_metadata_commit_journal(
     {
         return Err(RoutingStateError::Corrupt);
     }
+    let expected = salt_fingerprint(salt);
+    if journal.committed.salt_digest != expected || journal.pending.salt_digest != expected {
+        return Err(RoutingStateError::SaltFingerprintMismatch);
+    }
     Ok(Some(journal))
+}
+
+/// A store written under an older schema used an unkeyed task reference; its history is unreadable
+/// under a salted derivation, and the one-time fix (delete the directory) is safe. A store written
+/// under a *newer* schema is not something an older build may ever delete: a canary rollback to
+/// this build must fail closed and say so distinctly, rather than repeat the older message and
+/// invite an operator to destroy durable history the newer build could still read.
+fn check_schema_direction(schema_version: u32) -> Result<(), RoutingStateError> {
+    if schema_version < ROUTING_STATE_SCHEMA_VERSION {
+        return Err(RoutingStateError::LegacyTaskReferenceSchema);
+    }
+    if schema_version > ROUTING_STATE_SCHEMA_VERSION {
+        return Err(RoutingStateError::NewerRoutingStateSchema);
+    }
+    Ok(())
 }
 
 fn max_metadata_bytes(limits: RoutingStateLimits) -> u64 {
@@ -1072,6 +1108,9 @@ fn metadata_shape_is_valid(metadata: &StateMetadata) -> bool {
 }
 
 fn metadata_commit_is_coherent(committed: &StateMetadata, pending: &StateMetadata) -> bool {
+    if committed.salt_digest != pending.salt_digest {
+        return false;
+    }
     let committed_segments = &committed.segments;
     let pending_segments = &pending.segments;
     if pending_segments.len() == committed_segments.len() {
@@ -1113,11 +1152,15 @@ fn validate_metadata(metadata: &StateMetadata, segments: &[SegmentState]) -> boo
             })
 }
 
-fn write_metadata(root: &Path, segments: &[SegmentState]) -> Result<(), RoutingStateError> {
-    write_metadata_value(root, &metadata_from_segments(segments), false)
+fn write_metadata(
+    root: &Path,
+    segments: &[SegmentState],
+    salt: &[u8; 32],
+) -> Result<(), RoutingStateError> {
+    write_metadata_value(root, &metadata_from_segments(segments, salt), false)
 }
 
-fn metadata_from_segments(segments: &[SegmentState]) -> StateMetadata {
+fn metadata_from_segments(segments: &[SegmentState], salt: &[u8; 32]) -> StateMetadata {
     StateMetadata {
         schema_version: ROUTING_STATE_SCHEMA_VERSION,
         segments: segments
@@ -1128,6 +1171,7 @@ fn metadata_from_segments(segments: &[SegmentState]) -> StateMetadata {
             })
             .collect(),
         active_segment: segments.last().map(|segment| segment.index),
+        salt_digest: salt_fingerprint(salt),
     }
 }
 
@@ -1201,9 +1245,35 @@ fn load_or_create_salt(root: &Path) -> Result<[u8; 32], RoutingStateError> {
     if let Some(salt) = load_salt(root)? {
         return Ok(salt);
     }
+    // A salt is only ever minted for a genuinely empty store. Minting one over surviving history
+    // (metadata, a pending commit journal, or a segment) would silently start a second key: every
+    // in-flight task would derive a reference that misses its recorded history, conflict forever,
+    // and occupy `max_active_tasks` until the store wedges at capacity, with nothing here naming
+    // the missing salt as the cause. Refusing to open is the same one-time reset as any other
+    // directory that predates this store's salted derivation.
+    if state_history_exists(root)? {
+        return Err(RoutingStateError::LegacyTaskReferenceSchema);
+    }
     let salt = generate_salt()?;
     write_salt(root, &salt)?;
     Ok(salt)
+}
+
+fn state_history_exists(root: &Path) -> Result<bool, RoutingStateError> {
+    if root.join("metadata.json").exists() || root.join(METADATA_COMMIT_JOURNAL).exists() {
+        return Ok(true);
+    }
+    for entry in fs::read_dir(root).map_err(|_| RoutingStateError::Io)? {
+        let entry = entry.map_err(|_| RoutingStateError::Io)?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| parse_segment_name(name).is_some())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn load_salt(root: &Path) -> Result<Option<[u8; 32]>, RoutingStateError> {
@@ -1217,20 +1287,64 @@ fn load_salt(root: &Path) -> Result<Option<[u8; 32]>, RoutingStateError> {
 }
 
 fn generate_salt() -> Result<[u8; 32], RoutingStateError> {
-    let mut salt: [u8; 32] = Default::default();
-    fill(&mut salt).map_err(|_| RoutingStateError::Io)?;
+    let mut salt = [0u8; 32];
+    getrandom::fill(&mut salt).map_err(|_| RoutingStateError::Io)?;
+    // A defence against a silently broken source: `getrandom` never returns success without
+    // filling `salt`, so 32 zero bytes here means the backend is not actually producing randomness.
+    if salt == [0u8; 32] {
+        return Err(RoutingStateError::Io);
+    }
     Ok(salt)
 }
 
 fn write_salt(root: &Path, salt: &[u8; 32]) -> Result<(), RoutingStateError> {
     let destination = root.join("salt");
     let temporary = root.join(format!(".routing-state-salt-{}.tmp", Uuid::new_v4()));
-    let mut file = open_private_file(&temporary, true, true)?;
-    file.write_all(salt)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| RoutingStateError::Io)?;
-    fs::rename(&temporary, &destination).map_err(|_| RoutingStateError::Io)?;
-    sync_directory(root)
+    let result = (|| -> Result<(), RoutingStateError> {
+        let mut file = open_private_file(&temporary, true, true)?;
+        file.write_all(salt)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| RoutingStateError::Io)?;
+        fs::rename(&temporary, &destination).map_err(|_| RoutingStateError::Io)?;
+        sync_directory(root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Binds a metadata object to the salt that produced the history it describes. Keyed by the salt
+/// itself so recovering the digest requires already holding the salt; it never appears in a log,
+/// an error, or a response, and the salt cannot be recovered from it.
+fn salt_fingerprint(salt: &[u8; 32]) -> String {
+    let mac = hmac_sha256(salt, b"bowline.routing.salt.v1");
+    let mut fingerprint = String::with_capacity("sha256:".len() + mac.len() * 2);
+    fingerprint.push_str("sha256:");
+    for byte in mac {
+        fingerprint.push_str(&format!("{byte:02x}"));
+    }
+    fingerprint
+}
+
+fn hmac_sha256(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut key_block = [0u8; BLOCK];
+    key_block[..key.len()].copy_from_slice(key);
+    let mut inner_key = [0x36u8; BLOCK];
+    let mut outer_key = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        inner_key[index] ^= key_block[index];
+        outer_key[index] ^= key_block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_key);
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_key);
+    outer.update(inner);
+    outer.finalize().into()
 }
 
 fn sync_directory(root: &Path) -> Result<(), RoutingStateError> {
@@ -1258,13 +1372,16 @@ fn journal_temp_id(name: &str) -> Option<Uuid> {
     Uuid::parse_str(id).ok()
 }
 
-fn cleanup_orphan_journal_temps(root: &Path) -> Result<(), RoutingStateError> {
+/// Sweeps every kind of private temp file this store creates: a crash between `create` and
+/// `rename` in the journal, metadata, or salt writers otherwise leaves that temp forever, one per
+/// crash, and a salt temp is a 32-byte key-shaped file.
+fn cleanup_orphan_temps(root: &Path) -> Result<(), RoutingStateError> {
     let mut removed = false;
     for entry in fs::read_dir(root).map_err(|_| RoutingStateError::Io)? {
         let entry = entry.map_err(|_| RoutingStateError::Io)?;
         let name = entry.file_name();
         let name = name.to_str().ok_or(RoutingStateError::UnsafePath)?;
-        if journal_temp_id(name).is_some() {
+        if journal_temp_id(name).is_some() || is_salt_temp(name) || is_metadata_temp(name) {
             let path = entry.path();
             validate_private_regular_file(&path)?;
             fs::remove_file(path).map_err(|_| RoutingStateError::Io)?;
@@ -1343,7 +1460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let limits = RoutingStateLimits {
             max_active_tasks: 8,
-            segment_bytes: 512,
+            segment_bytes: 640,
             // This makes the schema-derived bound larger than one filesystem block, so
             // set_len creates a detectable sparse hole while still staying within the bound.
             max_segments: 128,
@@ -1395,7 +1512,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let limits = RoutingStateLimits {
             max_active_tasks: 8,
-            segment_bytes: 512,
+            segment_bytes: 640,
             max_segments: 3,
         };
         let store = RoutingStateStore::open(dir.path(), limits).unwrap();
@@ -1423,7 +1540,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let limits = RoutingStateLimits {
             max_active_tasks: 8,
-            segment_bytes: 512,
+            segment_bytes: 640,
             max_segments: 1,
         };
         let store = RoutingStateStore::open(dir.path(), limits).unwrap();
@@ -1455,7 +1572,7 @@ mod tests {
     fn oversized_and_sparse_metadata_files_are_rejected_before_reading() {
         let limits = RoutingStateLimits {
             max_active_tasks: 8,
-            segment_bytes: 512,
+            segment_bytes: 640,
             // This makes the schema-derived bound larger than one filesystem block, so
             // set_len creates a detectable sparse hole while still staying within the bound.
             max_segments: 128,
@@ -1555,7 +1672,7 @@ mod tests {
             assert_rollback_fault_never_replays_unreturned(
                 RoutingStateLimits {
                     max_active_tasks: 8,
-                    segment_bytes: 512,
+                    segment_bytes: 640,
                     max_segments: 3,
                 },
                 point,
@@ -1578,7 +1695,7 @@ mod tests {
             assert_rollback_fault_never_replays_unreturned(
                 RoutingStateLimits {
                     max_active_tasks: 8,
-                    segment_bytes: 512,
+                    segment_bytes: 640,
                     max_segments: 3,
                 },
                 point,
@@ -1658,7 +1775,7 @@ mod tests {
             assert_committed_cleanup_fault_preserves_returned_decision(
                 RoutingStateLimits {
                     max_active_tasks: 8,
-                    segment_bytes: 512,
+                    segment_bytes: 640,
                     max_segments: 3,
                 },
                 point,
@@ -1775,6 +1892,113 @@ mod tests {
     }
 
     #[test]
+    fn deleting_the_salt_after_history_exists_refuses_to_mint_a_new_key_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        store
+            .decide(
+                "task",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        drop(store);
+
+        let root = dir.path().join("routing-state");
+        fs::remove_file(root.join("salt")).unwrap();
+        // A fresh mint here would derive new, unrelated references over the surviving history
+        // rather than refuse outright.
+        assert!(matches!(
+            RoutingStateStore::open(dir.path(), RoutingStateLimits::default()),
+            Err(RoutingStateError::LegacyTaskReferenceSchema)
+        ));
+    }
+
+    #[test]
+    fn a_replaced_salt_refuses_to_open_via_the_fingerprint_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        store
+            .decide(
+                "task",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        drop(store);
+
+        let root = dir.path().join("routing-state");
+        // The salt file itself is intact and well-formed, so `load_salt` succeeds; only the
+        // fingerprint recorded in metadata.json can catch the swap.
+        let replacement = [9u8; 32];
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(root.join("salt"))
+            .unwrap()
+            .write_all(&replacement)
+            .unwrap();
+        assert!(matches!(
+            RoutingStateStore::open(dir.path(), RoutingStateLimits::default()),
+            Err(RoutingStateError::SaltFingerprintMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_newer_schema_is_distinguished_from_an_older_one_and_neither_shares_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        drop(store);
+        let path = dir.path().join("routing-state").join("metadata.json");
+        let base: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        let mut newer = base.clone();
+        newer["schema_version"] = serde_json::Value::from(ROUTING_STATE_SCHEMA_VERSION + 1);
+        fs::write(&path, serde_json::to_vec(&newer).unwrap()).unwrap();
+        let newer_result = RoutingStateStore::open(dir.path(), RoutingStateLimits::default());
+
+        let mut older = base;
+        older["schema_version"] = serde_json::Value::from(ROUTING_STATE_SCHEMA_VERSION - 1);
+        fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        let older_result = RoutingStateStore::open(dir.path(), RoutingStateLimits::default());
+
+        let newer_error = match newer_result {
+            Err(error) => error,
+            Ok(_) => panic!("expected the newer-schema guard to refuse"),
+        };
+        let older_error = match older_result {
+            Err(error) => error,
+            Ok(_) => panic!("expected the legacy-schema guard to refuse"),
+        };
+        assert_eq!(newer_error, RoutingStateError::NewerRoutingStateSchema);
+        assert_eq!(older_error, RoutingStateError::LegacyTaskReferenceSchema);
+        assert_ne!(newer_error, older_error);
+        assert_ne!(newer_error.to_string(), older_error.to_string());
+        assert!(
+            newer_error.to_string().contains("must not"),
+            "a newer directory's message must not read as safe to delete"
+        );
+    }
+
+    #[test]
+    fn a_stray_salt_temp_is_swept_at_recovery_and_open_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        drop(store);
+        let root = dir.path().join("routing-state");
+        let stray = root.join(format!(".routing-state-salt-{}.tmp", Uuid::new_v4()));
+        open_private_file(&stray, true, true).unwrap();
+        assert!(stray.exists());
+
+        RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        assert!(!stray.exists());
+    }
+
+    #[test]
     fn recovery_preserves_decision_source_and_rejects_semantic_record_tampering() {
         let dir = tempfile::tempdir().unwrap();
         let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
@@ -1824,7 +2048,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let limits = RoutingStateLimits {
             max_active_tasks: 8,
-            segment_bytes: 512,
+            segment_bytes: 640,
             max_segments: 1,
         };
         let store = RoutingStateStore::open(dir.path(), limits).unwrap();
@@ -1855,7 +2079,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let limits = RoutingStateLimits {
             max_active_tasks: 8,
-            segment_bytes: 512,
+            segment_bytes: 640,
             max_segments: 1,
         };
         let store = RoutingStateStore::open(dir.path(), limits).unwrap();
@@ -1941,7 +2165,7 @@ mod tests {
             max_active_tasks: 8,
             // A framed routing record is deliberately larger than this, so each accepted
             // decision has to occupy its own segment.
-            segment_bytes: 512,
+            segment_bytes: 640,
             max_segments: 3,
         };
         let store = RoutingStateStore::open(dir.path(), limits).unwrap();

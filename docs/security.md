@@ -2,7 +2,7 @@
 
 ## Routing boundary
 
-Routing stores a task reference, never a raw task ID, prompt, response, tool argument, body, or source content. The reference is HMAC-SHA256 over the task ID, keyed by a 32-byte salt generated at store creation and never sent anywhere, so a recipient cannot reverse it to the operator's task identifier even by dictionary. The advisory listener requires an exact Authorization value from a named environment variable and does not log or persist it. Switchyard observations contain only reference, protocol, step, and enumerated signals; remote use needs explicit HTTPS acknowledgement.
+Routing stores a task reference, never a raw task ID, prompt, response, tool argument, body, or source content. The reference is HMAC-SHA256 over the task ID, keyed by a 32-byte salt generated at store creation and never sent anywhere, so a recipient who does not hold the routing decision API credential cannot reverse it to the operator's task identifier even by dictionary. A party that does hold that credential can submit candidate task IDs to `POST /v1/routing/decision` and read back the resulting reference, rebuilding the dictionary directly rather than inverting the HMAC; `authorization_env` must therefore be scoped to the same trust boundary as the task identifiers it derives references from. The advisory listener requires an exact Authorization value from a named environment variable and does not log or persist it. Switchyard observations contain only reference, protocol, step, and enumerated signals; remote use needs explicit HTTPS acknowledgement.
 
 Bowline's Phase 1 security objective is byte-faithful default forwarding plus exact, bounded,
 reversible controlled authority with local integrity-disclosed evidence. It is not a content

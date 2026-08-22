@@ -202,11 +202,15 @@ async fn decision(State(state): State<RoutingApiState>, request: Request) -> Res
                 return routing_unavailable_error(RoutingUnavailableCauseV3::StartupUnavailable)
             }
             state_error => {
+                // `unavailable_cause` returns `None` for a store-open-time cause (for example
+                // `LegacyTaskReferenceSchema` or `NewerRoutingStateSchema`), which `decide_with_source`
+                // cannot itself return today but a future metadata revalidation on the decide path
+                // could. Fall back rather than assume every state error maps to a request-facing cause.
                 return routing_unavailable_error(
                     state_error
                         .unavailable_cause()
-                        .expect("state error has an unavailable cause"),
-                )
+                        .unwrap_or(RoutingUnavailableCauseV3::StartupUnavailable),
+                );
             }
         },
     };
