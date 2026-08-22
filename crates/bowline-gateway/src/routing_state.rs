@@ -86,8 +86,9 @@ pub struct RoutingStoredDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RoutingStateHealth {
     pub ready: bool,
-    /// Set when the store refused a decision for a reason retention cannot clear — a frame
-    /// larger than one segment. Distinct from `failed`, which means the writer itself broke.
+    /// Set when the store refused new history because its task or segment budget is spent. This
+    /// release does not reclaim: an operator resets the routing state directory. Distinct from
+    /// `failed`, which means the writer itself broke.
     pub capacity_exhausted: bool,
     pub active_tasks: usize,
     pub active_task_capacity: usize,
@@ -100,17 +101,8 @@ struct StateData {
     tasks: BTreeMap<String, Vec<StoredRecord>>,
     segments: Vec<SegmentState>,
     failed: bool,
-    /// Least-recently-used first. Every committed decision moves its task to the back. Rebuilt
-    /// deterministically by `recover()` by replaying commits in order, so it never needs its own
-    /// durable representation.
-    tasks_order: std::collections::VecDeque<String>,
-    /// The segment index holding each currently-retained task's first record. A reused task id
-    /// overwrites its entry when refounded, so a stale founding segment can never evict a task's
-    /// current history.
-    task_founding_segment: BTreeMap<String, u32>,
-    /// Set by the one genuinely terminal `Capacity` case — a frame larger than one segment — and
-    /// cleared by the next successful commit. Never persisted: a restart has no prior refusal to
-    /// remember.
+    /// Set by every refusal for capacity and cleared by the next successful commit. Never
+    /// persisted: a restart re-derives it from the first refusal after recovery.
     capacity_exhausted: bool,
 }
 
@@ -310,17 +302,10 @@ impl RoutingStateStore {
             return Err(RoutingStateError::WriterFailure);
         }
         let history = data.tasks.get(&task_ref);
-        let task_is_new = history.is_none();
-        if task_is_new && data.tasks.len() >= self.limits.max_active_tasks {
-            // Evict the least recently used task rather than refusing forever. An evicted task
-            // that returns mid-flight sees a step conflict, which already retains the capable
-            // target.
-            if let Some(evicted) = data.tasks_order.pop_front() {
-                data.tasks.remove(&evicted);
-                data.task_founding_segment.remove(&evicted);
-            }
+        if history.is_none() && data.tasks.len() >= self.limits.max_active_tasks {
+            data.capacity_exhausted = true;
+            return Err(RoutingStateError::Capacity);
         }
-        let history = data.tasks.get(&task_ref);
         if let Some(history) = history {
             let expected = history.len() as u64 + 1;
             if step_id <= history.len() as u64 {
@@ -417,15 +402,6 @@ impl RoutingStateStore {
                 return Err(RoutingStateError::WriterFailure);
             }
         };
-        // Segments present before this plan but absent from it were rolled off the front to make
-        // room for the rotation. Every task whose retained history began in one is evicted once
-        // this commit is durable.
-        let rolled_off: Vec<u32> = data
-            .segments
-            .iter()
-            .filter(|old| !segments.iter().any(|new| new.index == old.index))
-            .map(|old| old.index)
-            .collect();
         let mut journal = MetadataCommitJournal {
             schema_version: 1,
             phase: MetadataCommitPhase::Rollback,
@@ -466,39 +442,8 @@ impl RoutingStateStore {
         let _ = fs::remove_file(self.root.join(METADATA_COMMIT_JOURNAL));
         let _ = fail_metadata_at(MetadataFailurePoint::AfterJournalUnlink);
         let _ = sync_directory(&self.root);
-        // Eviction and cleanup below are best-effort bookkeeping: the commit above is already
-        // durable, and a crash here leaves stale segment files that the next `recover()` unlinks
-        // and stale task entries that the next `recover()` rebuilds identically by replay. The
-        // task in this very decision is excluded: its full history is already held above and
-        // remains valid for the life of this process, even though the segment holding its
-        // earliest steps is gone. Only a restart re-derives state from disk and, having no step
-        // one for it there, starts it over.
-        if !rolled_off.is_empty() {
-            let mut evicted_tasks: Vec<String> = Vec::new();
-            for (candidate, founding_segment) in &data.task_founding_segment {
-                if candidate != &task_ref && rolled_off.contains(founding_segment) {
-                    evicted_tasks.push(candidate.clone());
-                }
-            }
-            for evicted in &evicted_tasks {
-                data.tasks.remove(evicted);
-                data.task_founding_segment.remove(evicted);
-            }
-            data.tasks_order
-                .retain(|candidate| !evicted_tasks.contains(candidate));
-            for index in &rolled_off {
-                let _ = fs::remove_file(segment_path(&self.root, *index));
-            }
-        }
-        if task_is_new {
-            let active_index = segments.last().expect("a segment was allocated").index;
-            data.task_founding_segment
-                .insert(task_ref.clone(), active_index);
-        }
         data.segments = segments;
         data.tasks.entry(task_ref.clone()).or_default().push(record);
-        data.tasks_order.retain(|candidate| candidate != &task_ref);
-        data.tasks_order.push_back(task_ref.clone());
         data.capacity_exhausted = false;
         Ok(RoutingStoredDecision {
             task_ref,
@@ -628,8 +573,9 @@ fn planned_segments(
         .last()
         .is_none_or(|segment| segment.bytes.saturating_add(frame_bytes) > limits.segment_bytes);
     if needs_rotation {
-        // The next index is derived from the pre-roll-off tail so it can never collide with an
-        // index this same commit is about to drop: segment indices only ever increase.
+        if segments.len() >= limits.max_segments as usize {
+            return Err(RoutingStateError::Capacity);
+        }
         let index = segments
             .last()
             .map(|segment| {
@@ -640,11 +586,6 @@ fn planned_segments(
             })
             .transpose()?
             .unwrap_or(0);
-        // A full store no longer refuses new history: the oldest segment rolls off to make room.
-        // The caller evicts every task whose retained history began there once this commit lands.
-        while segments.len() >= limits.max_segments as usize {
-            segments.remove(0);
-        }
         segments.push(SegmentState { index, bytes: 0 });
     }
     let active = segments.last_mut().expect("a segment was allocated");
@@ -661,21 +602,23 @@ fn recover(root: &Path, limits: RoutingStateLimits) -> Result<StateData, Routing
         recover_metadata_journal(root, limits, &journal)?;
     }
     let metadata = load_metadata(root, limits)?;
-    let committed = metadata
-        .as_ref()
-        .map(|metadata| metadata.segments.as_slice())
-        .unwrap_or(&[]);
-    // A crash between the metadata commit publishing a roll-off and this store unlinking the
-    // rolled-off files leaves them on disk with an index below the committed prefix. They hold
-    // no state any live commit still references, so removing them here is the same best-effort
-    // cleanup a successful commit already performs, just retried at open.
-    cleanup_rolled_off_segments(root, committed)?;
     let mut paths = segment_paths(root)?;
     if paths.len() > limits.max_segments as usize {
         return Err(RoutingStateError::Capacity);
     }
     paths.sort_by_key(|(index, _)| *index);
+    if paths
+        .iter()
+        .enumerate()
+        .any(|(position, (index, _))| *index != position as u32)
+    {
+        return Err(RoutingStateError::Corrupt);
+    }
     let mut data = StateData::default();
+    let committed = metadata
+        .as_ref()
+        .map(|metadata| metadata.segments.as_slice())
+        .unwrap_or(&[]);
     if metadata.is_some() && paths.len() > committed.len() {
         // A failed rotation may have created a new uncommitted segment. Keeping the gateway
         // unavailable is safer than ever replaying a decision which the caller did not receive.
@@ -717,22 +660,7 @@ fn recover(root: &Path, limits: RoutingStateLimits) -> Result<StateData, Routing
             return Err(RoutingStateError::Corrupt);
         }
         for record in records {
-            let task_ref = record.task_ref.clone();
-            let task_is_new = !data.tasks.contains_key(&task_ref);
-            if task_is_new && record.step_id != 1 {
-                // No prior history and this is not a founding record: the segment that held its
-                // earlier steps already rolled off before this open. The live store evicted this
-                // task the moment that happened; replay reaches the identical state by silently
-                // dropping the orphaned tail instead of treating it as corruption.
-                continue;
-            }
-            if task_is_new && data.tasks.len() >= limits.max_active_tasks {
-                if let Some(evicted) = data.tasks_order.pop_front() {
-                    data.tasks.remove(&evicted);
-                    data.task_founding_segment.remove(&evicted);
-                }
-            }
-            let history = data.tasks.entry(task_ref.clone()).or_default();
+            let history = data.tasks.entry(record.task_ref.clone()).or_default();
             if record.step_id != history.len() as u64 + 1 {
                 return Err(RoutingStateError::Corrupt);
             }
@@ -741,11 +669,6 @@ fn recover(root: &Path, limits: RoutingStateLimits) -> Result<StateData, Routing
                 history.last().map(|prior| prior.state_digest.as_str()),
             )?;
             history.push(record);
-            data.tasks_order.retain(|candidate| candidate != &task_ref);
-            data.tasks_order.push_back(task_ref.clone());
-            if task_is_new {
-                data.task_founding_segment.insert(task_ref, *index);
-            }
         }
         data.segments.push(SegmentState {
             index: *index,
@@ -759,11 +682,6 @@ fn recover(root: &Path, limits: RoutingStateLimits) -> Result<StateData, Routing
             return Err(RoutingStateError::Corrupt);
         }
         if let Some((index, path)) = paths.first() {
-            // No metadata has ever been committed, so no rotation and no roll-off has ever
-            // happened: the only legitimate first segment is index 0.
-            if *index != 0 {
-                return Err(RoutingStateError::Corrupt);
-            }
             let descriptor_len = fs::metadata(path).map_err(|_| RoutingStateError::Io)?.len();
             if descriptor_len > limits.segment_bytes {
                 return Err(RoutingStateError::Corrupt);
@@ -980,28 +898,6 @@ fn segment_path(root: &Path, index: u32) -> PathBuf {
     root.join(format!("segment-{index:020}.log"))
 }
 
-fn cleanup_rolled_off_segments(
-    root: &Path,
-    committed: &[MetadataSegment],
-) -> Result<(), RoutingStateError> {
-    let Some(floor) = committed.first().map(|segment| segment.index) else {
-        // Nothing has ever been committed, so nothing has ever rolled off.
-        return Ok(());
-    };
-    let mut removed = false;
-    for (index, path) in segment_paths(root)? {
-        if index < floor {
-            validate_private_regular_file(&path)?;
-            fs::remove_file(&path).map_err(|_| RoutingStateError::Io)?;
-            removed = true;
-        }
-    }
-    if removed {
-        sync_directory(root)?;
-    }
-    Ok(())
-}
-
 fn parse_segment_name(name: &str) -> Option<u32> {
     let digits = name.strip_prefix("segment-")?.strip_suffix(".log")?;
     (digits.len() == 20 && digits.bytes().all(|byte| byte.is_ascii_digit()))
@@ -1152,14 +1048,9 @@ fn metadata_commit_is_coherent(committed: &StateMetadata, pending: &StateMetadat
             && pending_last.index == committed_last.index
             && pending_last.bytes > committed_last.bytes;
     }
-    // Every other coherent transition appends exactly one new segment, optionally rolling the
-    // oldest `dropped` segments off the front in the same commit (roll-off is `dropped >= 1`;
-    // an ordinary rotation is `dropped == 0`).
-    if pending_segments.is_empty() || pending_segments.len() > committed_segments.len() + 1 {
-        return false;
-    }
-    let dropped = committed_segments.len() + 1 - pending_segments.len();
-    if pending_segments[..pending_segments.len() - 1] != committed_segments[dropped..] {
+    if pending_segments.len() != committed_segments.len() + 1
+        || pending_segments[..committed_segments.len()] != committed_segments[..]
+    {
         return false;
     }
     let expected_index = match committed_segments.last() {
@@ -1327,20 +1218,6 @@ mod tests {
             progress_threshold: 2,
             default_target: RoutingTarget::Capable,
         }
-    }
-
-    fn decide_once(
-        store: &RoutingStateStore,
-        task_id: &str,
-        step_id: u64,
-    ) -> Result<RoutingStoredDecision, RoutingStateError> {
-        store.decide(
-            task_id,
-            step_id,
-            "sha256:route",
-            &profile(),
-            vec![RoutingSignal::Write],
-        )
     }
 
     #[test]
@@ -1843,88 +1720,6 @@ mod tests {
     }
 
     #[test]
-    fn exceeding_the_task_cap_evicts_the_least_recently_used_task_instead_of_failing() {
-        let dir = tempfile::tempdir().unwrap();
-        let limits = RoutingStateLimits {
-            max_active_tasks: 2,
-            segment_bytes: 1 << 20,
-            max_segments: 16,
-        };
-        let store = RoutingStateStore::open(dir.path(), limits).unwrap();
-
-        decide_once(&store, "task-a", 1).expect("first task is stored");
-        decide_once(&store, "task-b", 1).expect("second task is stored");
-        // task-a is now the least recently used.
-        decide_once(&store, "task-c", 1).expect("third task evicts task-a, it does not fail");
-
-        assert_eq!(store.active_tasks(), 2);
-        // task-a's history is gone, so its next step is a conflict, never an efficient decision.
-        let err = decide_once(&store, "task-a", 2).expect_err("evicted history conflicts");
-        assert!(matches!(err, RoutingStateError::StepConflict));
-    }
-
-    #[test]
-    fn segment_exhaustion_rolls_off_the_oldest_segment_and_keeps_accepting_decisions() {
-        let dir = tempfile::tempdir().unwrap();
-        let limits = RoutingStateLimits {
-            max_active_tasks: 4096,
-            segment_bytes: 2048,
-            max_segments: 2,
-        };
-        let store = RoutingStateStore::open(dir.path(), limits).unwrap();
-
-        // Far more decisions than two 2 KiB segments can hold.
-        for index in 0..200u64 {
-            let task_id = format!("task-{index}");
-            decide_once(&store, &task_id, 1)
-                .unwrap_or_else(|error| panic!("decision {index} must not fail: {error:?}"));
-        }
-
-        assert!(
-            store.health().segments <= 2,
-            "roll-off must respect max_segments"
-        );
-
-        // The store survives a restart with the rolled-off prefix gone.
-        drop(store);
-        let reopened = RoutingStateStore::open(dir.path(), limits).unwrap();
-        decide_once(&reopened, "task-after-restart", 1).expect("still accepting");
-    }
-
-    #[test]
-    fn a_tasks_own_continuation_can_roll_off_its_own_founding_segment_without_wedging() {
-        let dir = tempfile::tempdir().unwrap();
-        let limits = RoutingStateLimits {
-            max_active_tasks: 8,
-            segment_bytes: 512,
-            max_segments: 2,
-        };
-        let store = RoutingStateStore::open(dir.path(), limits).unwrap();
-        for step in 1..=4u64 {
-            decide_once(&store, "long-lived", step).expect("continuation must not fail");
-        }
-        // The task's own founding segment rolled off mid-flight; the live process kept its full
-        // in-memory continuity, so the very next step is not a phantom conflict.
-        decide_once(&store, "long-lived", 5).expect("no phantom step conflict after self roll-off");
-
-        // A restart has no step one on disk for this task, so it starts over rather than reading
-        // a gapped history or refusing to open.
-        drop(store);
-        let reopened = RoutingStateStore::open(dir.path(), limits).unwrap();
-        assert!(matches!(
-            reopened.decide(
-                "long-lived",
-                6,
-                "sha256:route",
-                &profile(),
-                vec![RoutingSignal::Write]
-            ),
-            Err(RoutingStateError::StepConflict)
-        ));
-        decide_once(&reopened, "long-lived", 1).expect("restarts cleanly at step one");
-    }
-
-    #[test]
     fn configured_capacity_refuses_new_history_without_deleting_live_state() {
         let dir = tempfile::tempdir().unwrap();
         let limits = RoutingStateLimits {
@@ -1942,51 +1737,101 @@ mod tests {
                 vec![RoutingSignal::Write],
             )
             .unwrap();
-        // Segment exhaustion no longer refuses: the single segment rolls off to make room.
-        store
-            .decide(
+        assert!(matches!(
+            store.decide(
                 "task-2",
                 1,
                 "sha256:route",
                 &profile(),
-                vec![RoutingSignal::Write],
-            )
-            .expect("roll-off makes room instead of failing forever");
-        assert_eq!(store.active_tasks(), 1);
-        // task-1's history rolled off with the segment, so its next step conflicts rather than
-        // reading a truncated history.
-        assert!(matches!(
-            store.decide(
-                "task-1",
-                2,
-                "sha256:route",
-                &profile(),
                 vec![RoutingSignal::Write]
             ),
-            Err(RoutingStateError::StepConflict)
+            Err(RoutingStateError::Capacity)
         ));
+        assert_eq!(store.active_tasks(), 1);
     }
 
     #[test]
     fn a_saturated_store_reports_not_ready_rather_than_healthy() {
         let dir = tempfile::tempdir().unwrap();
-        // One segment, and a frame larger than it can ever hold: the one genuinely terminal case.
         let limits = RoutingStateLimits {
             max_active_tasks: 8,
-            segment_bytes: 64,
+            segment_bytes: 512,
             max_segments: 1,
         };
         let store = RoutingStateStore::open(dir.path(), limits).unwrap();
+        assert!(store.health().ready, "a fresh store is ready");
 
-        let err = decide_once(&store, "task-a", 1).expect_err("frame cannot fit");
-        assert!(matches!(err, RoutingStateError::Capacity));
+        // This release does not reclaim, so the store stops at its budget. Readiness has to say so:
+        // a gateway that silently pins every routed request to the capable supply is not healthy.
+        let mut refusal = None;
+        for index in 0..64u64 {
+            let task_id = format!("task-{index}");
+            if let Err(error) = store.decide(
+                &task_id,
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            ) {
+                refusal = Some(error);
+                break;
+            }
+        }
+        assert!(
+            matches!(refusal, Some(RoutingStateError::Capacity)),
+            "the store must refuse for capacity"
+        );
 
         let health = store.health();
-        assert!(
-            !health.ready,
-            "a store that cannot accept any decision is not ready"
-        );
+        assert!(!health.ready, "a store refusing new history is not ready");
         assert!(health.capacity_exhausted);
+    }
+
+    #[test]
+    fn a_capacity_refusal_clears_once_the_store_commits_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = RoutingStateLimits {
+            max_active_tasks: 1,
+            segment_bytes: 1 << 20,
+            max_segments: 16,
+        };
+        let store = RoutingStateStore::open(dir.path(), limits).unwrap();
+        store
+            .decide(
+                "task-one",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+
+        // A second task exceeds the task cap and is refused.
+        assert!(matches!(
+            store.decide(
+                "task-two",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write]
+            ),
+            Err(RoutingStateError::Capacity)
+        ));
+        assert!(!store.health().ready);
+
+        // The established task can still continue, so the store is working again and must say so.
+        store
+            .decide(
+                "task-one",
+                2,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        let health = store.health();
+        assert!(health.ready, "a store that just committed is ready");
+        assert!(!health.capacity_exhausted);
     }
 
     #[test]

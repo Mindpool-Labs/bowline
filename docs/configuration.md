@@ -158,10 +158,11 @@ published constants (1048576 bytes and 16 segments), not the runtime's ledger bu
 is a private, exclusive-writer, CRC-checked durable prefix under the ledger directory. It survives
 activation and takeover. It is not a distributed coordinator or a volatile cache.
 A listener stops before lease-loss state drain; a standby does not bind or write routing state.
-Task state is retained by segment roll-off and LRU task eviction, not compaction: once the segment
-budget is reached, the oldest task history is discarded and that task's next step conflicts and
-retains the capable target rather than reading a truncated history. A store that failed to open at
-startup is retried on the reconcile tick and adopted without a restart.
+This release does not reclaim task state. At its task or segment budget the store refuses new
+history, reports not-ready, and retains the capable target for every affected request; an operator
+clears it by stopping the gateway and deleting the routing state directory. A store that failed to
+open at startup is retried on the existing file-lease reconcile tick and adopted without a restart;
+a single-instance deployment with no lease has no such tick and needs a restart.
 
 The decision API accepts only `POST /v1/routing/decision`, exactly one `Authorization` header
 whose byte value equals the value named by `authorization_env`, and JSON no larger than 65536 bytes.
