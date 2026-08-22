@@ -169,15 +169,21 @@ a single-instance deployment with no lease has no such tick and needs a restart.
 The stored task reference is an `hmac-sha256:`-prefixed HMAC-SHA256 keyed by a 32-byte salt
 generated at store creation, persisted privately alongside the routing state, and never disclosed;
 recovering it is not owed to anyone who only holds the reference. The salt is minted only for a
-genuinely empty store; a directory that already has history but no salt file, or whose metadata
-carries a salt fingerprint that does not match the loaded salt, refuses to open rather than mint a
-second key silently over the surviving history. This bumped the routing state metadata schema; a
-store recorded before the bump refuses to open with a distinct error rather than mixing
-derivations, and the one-time fix is the same as at capacity: stop the gateway and delete the
-routing state directory. A store recorded by a *newer* Bowline release (for example after a canary
-rollback) fails closed with a different, distinctly named error and must **not** be deleted this
-way — only a directory that predates salted task references is safe to reset. No release existed
-at the time of the bump, so no migration is owed.
+genuinely empty store; a directory that already has history but no salt file refuses to open with
+a distinct error naming the salt as missing. That directory was written by this build, not an
+older schema — restore the `salt` file from backup before considering a reset, since deleting the
+directory here destroys history the salt would have recovered. A directory whose metadata carries
+a salt fingerprint that does not match the loaded salt (for example a replaced salt file) refuses
+to open the same way, rather than mint a second key silently over the surviving history. An
+all-zero salt file, which a genuine random source never produces, is rejected on load exactly as
+`generate_salt` already refuses to mint it.
+This bumped the routing state metadata schema to 4; a store recorded before the bump refuses to
+open with a distinct error rather than mixing derivations, and the one-time fix is the same as at
+capacity: stop the gateway and delete the routing state directory. A store recorded by a *newer*
+Bowline release (for example after a canary rollback) fails closed with a different, distinctly
+named error and must **not** be deleted this way — only a directory that predates salted task
+references is safe to reset, and a directory only missing its salt file is never safe to reset.
+No release existed at the time of the bump, so no migration is owed.
 
 The decision API accepts only `POST /v1/routing/decision`, exactly one `Authorization` header
 whose byte value equals the value named by `authorization_env`, and JSON no larger than 65536 bytes.
