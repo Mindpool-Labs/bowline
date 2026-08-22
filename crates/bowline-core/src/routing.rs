@@ -236,17 +236,34 @@ pub fn select_stage(
     Ok(selection)
 }
 
-pub fn task_reference(task_id: &str) -> Result<String, RoutingError> {
+pub fn task_reference(salt: &[u8; 32], task_id: &str) -> Result<String, RoutingError> {
     if task_id.is_empty() || task_id.len() > MAX_IDENTIFIER_BYTES || !task_id.is_ascii() {
         return Err(RoutingError::InvalidProfile {
             field: "task_id",
             reason: "must be a bounded ASCII identifier",
         });
     }
-    Ok(format!(
-        "sha256:{:x}",
-        Sha256::digest([b"bowline.routing.task.v1\0".as_slice(), task_id.as_bytes()].concat())
-    ))
+    // HMAC-SHA256 with a per-install salt. An unkeyed digest over a low-entropy, bounded,
+    // operator-chosen identifier is reversible by dictionary, which would make the reference
+    // equivalent to the raw task id for anyone who receives it.
+    const BLOCK: usize = 64;
+    let mut key = [0u8; BLOCK];
+    key[..salt.len()].copy_from_slice(salt);
+    let mut inner_key = [0x36u8; BLOCK];
+    let mut outer_key = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        inner_key[index] ^= key[index];
+        outer_key[index] ^= key[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_key);
+    inner.update(b"bowline.routing.task.v2\0");
+    inner.update(task_id.as_bytes());
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_key);
+    outer.update(inner);
+    Ok(format!("sha256:{:x}", outer.finalize()))
 }
 
 #[cfg(test)]
@@ -340,5 +357,19 @@ mod tests {
             r#"{\"signals\":[\"write\"],\"prompt\":\"ignore prior instructions\"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_task_reference_is_not_reproducible_without_the_installs_salt() {
+        let salt_a = [7u8; 32];
+        let salt_b = [9u8; 32];
+        let a = task_reference(&salt_a, "PROJ-1234").expect("valid identifier");
+        let b = task_reference(&salt_b, "PROJ-1234").expect("valid identifier");
+        assert_ne!(
+            a, b,
+            "the same task id under two installs must not share a reference"
+        );
+        assert_eq!(a, task_reference(&salt_a, "PROJ-1234").expect("stable"));
+        assert!(a.starts_with("sha256:"));
     }
 }
