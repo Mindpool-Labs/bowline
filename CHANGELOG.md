@@ -98,14 +98,17 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metadata schema is bumped to 4, and a directory recorded before the bump refuses to open and needs
   a one-time reset (stop the gateway, delete the routing state directory — safe only for a directory
   that predates this change; a directory written by a *newer* Bowline release fails closed with a
-  distinct error and must not be deleted). The salt is minted only for a genuinely empty store; a
-  fingerprint derived from the salt (also `hmac-sha256:`-prefixed) is recorded in `metadata.json` and
-  detects a replaced or lost `salt` file, so losing or replacing it refuses to open rather than
-  silently mint a second key over surviving history. A directory that lost only its `salt` file gets
-  its own distinct error naming the file as missing rather than the "predates this change" message —
-  that directory is never safe to reset; restore the salt file instead. The salt is read via
-  `getrandom` rather than a raw `/dev/urandom` file read, and an all-zero salt is rejected both when
-  generated and when loaded from disk.
+  distinct error and must not be deleted). The schema is classified before the salt is ever loaded
+  or minted, so that classification never depends on whether a salt file also happens to be
+  present. A fingerprint derived from the salt (also `hmac-sha256:`-prefixed) is recorded in
+  `metadata.json` and detects a replaced or lost `salt` file, so losing or replacing it refuses to
+  open rather than silently mint a second key over surviving history — but only over a directory
+  that holds real history. A directory with **no** real history (zero segments, zero decisions)
+  mints a fresh salt on its own even if its `salt` file is absent or all-zero; only a directory that
+  already has real history and a missing or all-zero salt gets the distinct "restore the salt file"
+  error, since deleting that directory would destroy history the salt would have recovered. The
+  salt is read via `getrandom` rather than a raw `/dev/urandom` file read, and an all-zero salt is
+  rejected both when generated and when loaded from disk over real history.
 
 ## [0.1.0] - Unreleased
 
