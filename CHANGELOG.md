@@ -104,11 +104,14 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `metadata.json` and detects a replaced or lost `salt` file, so losing or replacing it refuses to
   open rather than silently mint a second key over surviving history — but only over a directory
   that holds real history. A directory with **no** real history (zero segments, zero decisions)
-  mints a fresh salt on its own even if its `salt` file is absent or all-zero; only a directory that
-  already has real history and a missing or all-zero salt gets the distinct "restore the salt file"
-  error, since deleting that directory would destroy history the salt would have recovered. The
-  salt is read via `getrandom` rather than a raw `/dev/urandom` file read, and an all-zero salt is
-  rejected both when generated and when loaded from disk over real history.
+  recovers on its own regardless of whether its `salt` file is absent, all-zero, or a valid salt
+  that simply does not match a stale `metadata.json` (for example a `salt` file restored from a
+  different install's backup): the stale `metadata.json` is discarded first, since nothing is
+  bound to it, and a valid salt is kept rather than re-minted. Only a directory that already has
+  real history and a missing or all-zero salt gets the distinct "restore the salt file" error,
+  since deleting that directory would destroy history the salt would have recovered. The salt is
+  read via `getrandom` rather than a raw `/dev/urandom` file read, and an all-zero salt is rejected
+  both when generated and when loaded from disk over real history.
 
 ## [0.1.0] - Unreleased
 

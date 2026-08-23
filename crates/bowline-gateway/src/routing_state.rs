@@ -1045,14 +1045,6 @@ struct JournalMetadataSchemaProbe {
     pending: MetadataSchemaProbe,
 }
 
-/// Reads only `metadata.json`'s `segments` list, ignoring element shape, to decide whether a
-/// directory holds real history. Run only once the schema direction is already confirmed equal, so
-/// the element shape is trusted without a strict parse.
-#[derive(Deserialize)]
-struct MetadataHistoryProbe {
-    segments: Vec<serde_json::Value>,
-}
-
 fn load_metadata(
     root: &Path,
     limits: RoutingStateLimits,
@@ -1122,8 +1114,11 @@ fn check_schema_direction(schema_version: u32) -> Result<(), RoutingStateError> 
 /// not depend on the accident of whether this directory's `salt` file also happens to be present.
 /// Reads `metadata.json` permissively if it exists; a directory with history but no `metadata.json`
 /// exists only mid-way through the very first successful `open`, which never itself needs this
-/// check, so falling back to the commit journal's embedded `committed` snapshot covers the one
-/// remaining case: a crash after the journal was written but before `metadata.json` was restored.
+/// check, so falling back to the commit journal covers the one remaining case: a crash after the
+/// journal was written but before `metadata.json` was restored. The journal branch mirrors
+/// `load_metadata_commit_journal` exactly — envelope direction first, then `committed` and
+/// `pending` both — so a future envelope revision that renames either field is classified by the
+/// envelope check alone, never flattened into `Corrupt` by a strict shape it hasn't earned yet.
 /// Finds no version at all only for a genuinely empty directory, which falls through unchanged.
 fn check_schema_direction_before_salt(
     root: &Path,
@@ -1139,9 +1134,13 @@ fn check_schema_direction_before_salt(
     let journal_path = root.join(METADATA_COMMIT_JOURNAL);
     if journal_path.exists() {
         let bytes = read_private_bounded(&journal_path, max_journal_bytes(limits))?;
+        let envelope: JournalSchemaProbe =
+            serde_json::from_slice(&bytes).map_err(|_| RoutingStateError::Corrupt)?;
+        check_journal_schema_direction(envelope.schema_version)?;
         let probe: JournalMetadataSchemaProbe =
             serde_json::from_slice(&bytes).map_err(|_| RoutingStateError::Corrupt)?;
-        return check_schema_direction(probe.committed.schema_version);
+        check_schema_direction(probe.committed.schema_version)?;
+        return check_schema_direction(probe.pending.schema_version);
     }
     Ok(())
 }
@@ -1355,38 +1354,42 @@ fn load_or_create_salt(
     limits: RoutingStateLimits,
 ) -> Result<[u8; 32], RoutingStateError> {
     let existing = read_salt_file(root)?;
-    if let Some(salt) = existing {
-        if salt != [0u8; 32] {
-            return Ok(salt);
-        }
-    }
-    // A salt is only ever minted (or re-minted) over a genuinely empty store. Doing so over
-    // surviving history (metadata with real segments, a pending commit journal, or a segment file)
-    // would silently start a second key: every in-flight task would derive a reference that
-    // misses its recorded history, conflict forever, and occupy `max_active_tasks` until the store
-    // wedges at capacity. A store holding real history and an absent or all-zero salt was written
-    // by *this* build — the salt file itself was simply lost, never landed, or was zeroed by a
-    // crash mid-rename — so the fix there is to restore it, not to delete history a restored file
-    // could have recovered.
+    // A directory with real history (metadata with real segments, a pending commit journal, or a
+    // segment file) has something bound to whatever key wrote it, so the salt is judged against
+    // that history first, before any early return. A store holding real history and an absent or
+    // all-zero salt was written by *this* build — the salt file itself was simply lost, never
+    // landed, or was zeroed by a crash mid-rename — so the fix there is to restore it, not to
+    // delete history a restored file could have recovered.
     if state_history_exists(root, limits)? {
-        return Err(match existing {
-            Some(_) => RoutingStateError::AllZeroRoutingStateSalt,
-            None => RoutingStateError::MissingRoutingStateSalt,
-        });
+        return match existing {
+            Some(salt) if salt != [0u8; 32] => Ok(salt),
+            Some(_) => Err(RoutingStateError::AllZeroRoutingStateSalt),
+            None => Err(RoutingStateError::MissingRoutingStateSalt),
+        };
     }
-    // Nothing here is bound to the old key: a directory with zero real history mints a fresh salt
-    // whether its salt file was absent or all-zero. A stale `metadata.json` (zero segments, but
-    // still carrying the prior salt's fingerprint) must be gone before the new salt is written —
-    // `recover` runs on the very next line and would otherwise refuse the fresh salt with
-    // `SaltFingerprintMismatch`. Unlinking first keeps every crash point safe: after the unlink but
-    // before `write_salt`, nothing survives to mint over, so a retry mints again; after
-    // `write_salt`, the new salt and the absent metadata agree, so `recover` starts fresh.
+    // Nothing here is bound to the old key, under any of the three arms: absent, all-zero, or a
+    // valid salt that simply does not match a stale `metadata.json`'s fingerprint (the shape an
+    // operator produces restoring a `salt` file backed up from a different install). A stale
+    // `metadata.json` (zero segments, but still carrying a prior salt's fingerprint) must be gone
+    // before the salt is judged — `recover` runs on the very next line and would otherwise refuse
+    // a kept or fresh salt with `SaltFingerprintMismatch`. Unlinking first keeps every crash point
+    // safe: after the unlink but before a salt is written, nothing survives to mint over, so a
+    // retry repeats the same decision; after `write_salt`, the new salt and the absent metadata
+    // agree, so `recover` starts fresh.
     let metadata_path = root.join("metadata.json");
     if metadata_path.exists() {
         fs::remove_file(&metadata_path).map_err(|_| RoutingStateError::Io)?;
         sync_directory(root)?;
     }
     fail_metadata_at(MetadataFailurePoint::AfterStaleMetadataUnlink)?;
+    // A valid, non-zero salt is kept rather than replaced: nothing here was bound to it, but it
+    // is still a real key, and re-minting for no reason would only make the absent- and all-zero-
+    // salt arms special cases instead of the common one.
+    if let Some(salt) = existing {
+        if salt != [0u8; 32] {
+            return Ok(salt);
+        }
+    }
     let salt = generate_salt()?;
     write_salt(root, &salt)?;
     Ok(salt)
@@ -1406,9 +1409,13 @@ fn state_history_exists(
     let metadata_path = root.join("metadata.json");
     if metadata_path.exists() {
         let bytes = read_private_bounded(&metadata_path, max_metadata_bytes(limits))?;
-        let probe: MetadataHistoryProbe =
+        // The schema direction is already confirmed exactly equal by the time this runs
+        // (`check_schema_direction_before_salt` ran first at `open`), so there is no legacy shape
+        // left to tolerate: parse the real `StateMetadata` rather than a loose probe, so a
+        // malformed element surfaces as `Corrupt` instead of being counted as history present.
+        let metadata: StateMetadata =
             serde_json::from_slice(&bytes).map_err(|_| RoutingStateError::Corrupt)?;
-        if !probe.segments.is_empty() {
+        if !metadata.segments.is_empty() {
             return Ok(true);
         }
     }
@@ -1482,7 +1489,22 @@ fn salt_fingerprint(salt: &[u8; 32]) -> String {
     fingerprint
 }
 
+#[cfg(test)]
+thread_local! {
+    static SYNC_DIRECTORY_CALLS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Pins that `sync_directory` was actually invoked, not merely claimed by a nearby comment. A
+/// per-thread count rather than a bool: `cargo test` runs each test on its own thread, and a
+/// caller comparing a before/after pair only needs monotonic advancement, not an absolute value.
+#[cfg(test)]
+fn sync_directory_call_count() -> u32 {
+    SYNC_DIRECTORY_CALLS.with(Cell::get)
+}
+
 fn sync_directory(root: &Path) -> Result<(), RoutingStateError> {
+    #[cfg(test)]
+    SYNC_DIRECTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
     File::open(root)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| RoutingStateError::Io)
@@ -2146,6 +2168,60 @@ mod tests {
     }
 
     #[test]
+    fn the_pre_salt_journal_probe_checks_the_envelope_before_the_metadata_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        store
+            .decide(
+                "task",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        inject_metadata_failure(MetadataFailurePoint::BeforeSegmentMutation);
+        assert!(matches!(
+            store.decide(
+                "task",
+                2,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            ),
+            Err(RoutingStateError::WriterFailure)
+        ));
+        drop(store);
+
+        let root = dir.path().join("routing-state");
+        // Delete metadata.json so `check_schema_direction_before_salt` falls through to its
+        // journal branch instead of returning at the metadata.json arm first — the branch under
+        // repair here is unreachable from the sibling test above for exactly that reason.
+        fs::remove_file(root.join("metadata.json")).unwrap();
+
+        let path = root.join(METADATA_COMMIT_JOURNAL);
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // A future envelope revision that renames `committed` must be classified by the envelope
+        // direction check alone, before a strict `committed`/`pending` shape is ever required —
+        // the same guarantee `load_metadata_commit_journal` already provides.
+        journal["schema_version"] =
+            serde_json::Value::from(METADATA_COMMIT_JOURNAL_SCHEMA_VERSION + 1);
+        let committed = journal
+            .as_object_mut()
+            .unwrap()
+            .remove("committed")
+            .unwrap();
+        journal["committed_metadata"] = committed;
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        assert!(matches!(
+            RoutingStateStore::open(dir.path(), RoutingStateLimits::default()),
+            Err(RoutingStateError::NewerRoutingStateSchema)
+        ));
+    }
+
+    #[test]
     fn a_stale_empty_metadata_is_unlinked_before_the_new_salt_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
@@ -2164,9 +2240,10 @@ mod tests {
 
         // A crash between the two steps must never leave stale metadata carrying the old salt's
         // fingerprint next to a brand new salt — that bricks the very next open with
-        // `SaltFingerprintMismatch`. Injecting the failure right after the unlink proves the
-        // unlink is already durable at that point: reversing the order would instead leave
-        // `metadata.json` still present and the salt already replaced.
+        // `SaltFingerprintMismatch`. Injecting the failure right after the unlink, before
+        // `write_salt` ever runs, isolates the unlink's own directory sync: the call-count
+        // assertion below can only advance from that sync, not from `write_salt`'s.
+        let sync_calls_before_unlink = sync_directory_call_count();
         inject_metadata_failure(MetadataFailurePoint::AfterStaleMetadataUnlink);
         assert!(matches!(
             RoutingStateStore::open(dir.path(), RoutingStateLimits::default()),
@@ -2174,6 +2251,9 @@ mod tests {
         ));
         assert!(!root.join("metadata.json").exists());
         assert_eq!(fs::read(root.join("salt")).unwrap(), vec![0u8; 32]);
+        // Pins the sync as actually executed rather than merely claimed by comment: deleting the
+        // `sync_directory` call in the unlink branch leaves this assertion false.
+        assert!(sync_directory_call_count() > sync_calls_before_unlink);
 
         // Retrying after the crash must mint cleanly rather than trip on stale metadata pointing
         // at a salt fingerprint the new salt cannot reproduce.
@@ -2326,6 +2406,67 @@ mod tests {
         assert!(matches!(
             RoutingStateStore::open(dir.path(), RoutingStateLimits::default()),
             Err(RoutingStateError::SaltFingerprintMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_replaced_salt_over_no_history_is_reset_rather_than_bricked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        drop(store);
+
+        let root = dir.path().join("routing-state");
+        // A valid, non-zero salt that does not match the fingerprint stale `metadata.json`
+        // carries — the shape an operator produces restoring a `salt` file backed up from a
+        // different install onto a directory with no real history of its own (shape #7 in the
+        // review matrix). No history is bound to either key, so this must not brick.
+        let replacement = [9u8; 32];
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(root.join("salt"))
+            .unwrap()
+            .write_all(&replacement)
+            .unwrap();
+
+        let reopened = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        // The restored salt is kept, not re-minted: history is what binds a key, and there is
+        // none here, but a real restored key is still worth keeping over minting a fresh one.
+        assert_eq!(*reopened.salt(), replacement);
+        assert_eq!(reopened.active_tasks(), 0);
+    }
+
+    #[test]
+    fn a_history_probe_disagreeing_with_the_strict_parse_is_corrupt_not_missing_salt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        store
+            .decide(
+                "task",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        drop(store);
+
+        let root = dir.path().join("routing-state");
+        let path = root.join("metadata.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // A loose `Vec<serde_json::Value>` probe accepts this element as "history present" since
+        // it ignores element shape; the strict `MetadataSegment` parse (`deny_unknown_fields`)
+        // rejects it outright. The two must agree once the schema direction is already confirmed
+        // equal, rather than let the loose probe steer a corrupt file toward the one error naming
+        // no remedy the operator can act on.
+        metadata["segments"][0]["unexpected_field"] = serde_json::Value::from("junk");
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        fs::remove_file(root.join("salt")).unwrap();
+
+        assert!(matches!(
+            RoutingStateStore::open(dir.path(), RoutingStateLimits::default()),
+            Err(RoutingStateError::Corrupt)
         ));
     }
 

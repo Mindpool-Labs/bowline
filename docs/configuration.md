@@ -182,12 +182,18 @@ commit journal. A directory with real history and no salt file refuses to open w
 error naming the salt as missing: it was written by this build, not an older schema, so restore the
 `salt` file from backup before considering a reset, since deleting the directory here destroys
 history the salt would have recovered. A directory whose metadata carries a salt fingerprint that
-does not match the loaded salt (for example a replaced salt file) refuses to open the same way,
-rather than mint a second key silently over the surviving history. An all-zero salt file, which a
-genuine random source never produces, is rejected the same way over real history, exactly as
-`generate_salt` already refuses to mint it. A directory with **no** real history mints a fresh salt
-on its own whether the salt file is absent or all-zero: nothing is bound to the old key, so
-re-minting there is strictly safe and recovers without an operator step.
+does not match the loaded salt (for example a replaced salt file) refuses to open the same way
+*only when it holds real history*: nothing there is safe to mint a second key over. An all-zero
+salt file, which a genuine random source never produces, is rejected the same way over real
+history, exactly as `generate_salt` already refuses to mint it. A directory with **no** real
+history recovers on its own regardless of which of these three shapes its salt file is in —
+absent, all-zero, or a valid salt that simply predates the current metadata (for example an
+operator restoring a `salt` file backed up from a different install): the store discards the
+stale `metadata.json` first, since nothing is bound to it, then keeps a valid salt or mints a
+fresh one, with no operator step. A `salt` file that fails to parse at all (the wrong length) is
+the one shape this does not repair on its own; over a history-free directory, delete just the
+`salt` file rather than the whole routing state directory, since there is no history there to
+lose.
 
 The decision API accepts only `POST /v1/routing/decision`, exactly one `Authorization` header
 whose byte value equals the value named by `authorization_env`, and JSON no larger than 65536 bytes.
