@@ -369,6 +369,7 @@ impl EnforcementRuntime {
                 guard.startup_unavailable = None;
             }
             Err(error) => {
+                tracing::warn!(error = %error, "retry failed to open routing state store; routed requests continue to retain capable upstream");
                 guard.startup_unavailable = Some(error.startup_unavailable_cause());
             }
         }
