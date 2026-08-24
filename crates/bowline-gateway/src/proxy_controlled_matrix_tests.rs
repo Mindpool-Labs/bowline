@@ -543,6 +543,72 @@ async fn real_proxy_switchyard_wire_uses_only_the_routed_binding_and_skips_unava
 }
 
 #[tokio::test]
+async fn switchyard_agreement_is_scored_against_the_pre_routing_native_target() {
+    const AUTH_ENV: &str = "BOWLINE_PROXY_SWITCHYARD_NATIVE_AUTH";
+    std::env::set_var(AUTH_ENV, "Bearer native-fixture-secret");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/decision",
+                post(|| async { Json(serde_json::json!({"backend_id":"capable-backend"})) }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let adapter = Arc::new(
+        crate::switchyard_observe::SwitchyardObserveAdapter::new(&SwitchyardObserveConfig {
+            version: 1,
+            decision_api_url: format!("http://{address}/decision"),
+            profile_id: "stage-main".into(),
+            authorization_env: AUTH_ENV.into(),
+            timeout_ms: 100,
+            capable_backend_id: "capable-backend".into(),
+            efficient_backend_id: "efficient-backend".into(),
+            observation_queue_capacity: 2,
+            remote_acknowledged: false,
+        })
+        .unwrap(),
+    );
+
+    // Enforce, a verified grant, and RoutingSetup::Capable: routing decides Capable and
+    // retain_capable forces the plan back to Original. Bowline's own selection before routing
+    // intervened was the candidate, i.e. Efficient — that is what agreement must be scored
+    // against, not the post-retention Original/Capable outcome.
+    run_case_with_switchyard(
+        MatrixCase {
+            name: "routed-enforce-capable-scored-against-native-efficient",
+            expected_original: 1,
+            expected_candidate: 0,
+            expected_target: PlanTarget::Original,
+            expected_evidence: EvidenceState::Unverified,
+            expected_reason: Some(SelectionReason::RoutingCapable),
+            routing: RoutingSetup::Capable,
+            ..base_case("routed-enforce-capable-scored-against-native-efficient")
+        },
+        Some(Arc::clone(&adapter)),
+        tempfile::tempdir().unwrap(),
+    )
+    .await;
+
+    let health = adapter.health();
+    assert_eq!(
+        health.native_capable, 0,
+        "retain_capable's forced Original must not be recorded as a capable native selection"
+    );
+    assert_eq!(
+        health.native_efficient, 1,
+        "the native selection routing changed was Efficient (the plan targeted Candidate before \
+         retain_capable ran)"
+    );
+    fixture.abort();
+    std::env::remove_var(AUTH_ENV);
+}
+
+#[tokio::test]
 async fn candidate_partial_observed_usage_is_durable_without_modeled_delta() {
     for (name, candidate) in [
         (
