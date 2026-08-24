@@ -369,8 +369,16 @@ impl EnforcementRuntime {
                 guard.startup_unavailable = None;
             }
             Err(error) => {
-                tracing::warn!(error = %error, "retry failed to open routing state store; routed requests continue to retain capable upstream");
-                guard.startup_unavailable = Some(error.startup_unavailable_cause());
+                let cause = error.startup_unavailable_cause();
+                // Every cause reaching this branch needs an operator and none clears on its own,
+                // so a permanent failure is retried every poll tick forever. Latch on the
+                // classified cause, mirroring `takeover_alerted` below: log once per cause, and
+                // again only if the cause changes, so a transition like `StateCorrupt` ->
+                // `StartupUnavailable` still surfaces.
+                if guard.startup_unavailable != Some(cause) {
+                    tracing::warn!(error = %error, "retry failed to open routing state store; routed requests continue to retain capable upstream");
+                }
+                guard.startup_unavailable = Some(cause);
             }
         }
     }
@@ -4928,5 +4936,171 @@ routes:
 
         // A standby must never open the store: retrying after deactivation is a safe no-op.
         supervisor.retry_routing_state();
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_keeps_failing_with_the_same_cause_logs_once_and_a_changed_cause_logs_again(
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+            type Writer = SharedBuffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        fn warn_line_count(buffer: &SharedBuffer) -> usize {
+            String::from_utf8(buffer.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("retry failed to open routing state store"))
+                .count()
+        }
+
+        fn counting_subscriber(buffer: &SharedBuffer) -> impl tracing::Subscriber + Send + Sync {
+            tracing_subscriber::fmt()
+                .with_writer(buffer.clone())
+                .with_ansi(false)
+                .finish()
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let kill = root.path().join("kill");
+        fs::create_dir(&kill).unwrap();
+        fs::set_permissions(&kill, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(kill.join("state"), b"armed\n").unwrap();
+        fs::set_permissions(kill.join("state"), fs::Permissions::from_mode(0o600)).unwrap();
+        let policy = root.path().join("policy.yaml");
+        fs::write(&policy, "version: 1\nidentities: []\nrules:\n  - name: default\n    default: true\n    require: {supply_class: [public-api]}\n").unwrap();
+        let registry = root.path().join("registry.json");
+        fs::write(
+            &registry,
+            r#"{"feed_version":"test","entries":[
+          {"id":"baseline","model":"baseline-model","location":"public","attributes":{"class":"public-api","jurisdiction":"us","retention":"none","training_use":false,"cloud_act_exposure":false},"price":{"input_per_mtok_usd":1.0,"output_per_mtok_usd":1.0},"ratings":{"unclassified":0.9}}
+        ]}"#,
+        )
+        .unwrap();
+        let enforcement = root.path().join("enforcement.yaml");
+        fs::write(
+            &enforcement,
+            format!(
+                r#"version: 2
+global_candidate_in_flight: 1
+kill_switch: {{trust_root: {}, relative_path: state}}
+actuators: []
+routing_profiles:
+  - profile_id: stage-main
+    kind: stage
+    recent_window: 4
+    error_threshold: 2
+    exploration_threshold: 2
+    progress_threshold: 1
+    default_target: capable
+routes:
+  - route_id: route
+    method: POST
+    path: /v1/responses
+    protocol: responses
+    workload: {{app: support, resolved_tags: []}}
+    mode: observe
+    rollout_ppm: 0
+    promoted_supply_id: candidate
+    actual_supply_id: baseline
+    task_class: unclassified
+    routing_profile_id: stage-main
+"#,
+                kill.canonicalize().unwrap().display()
+            ),
+        )
+        .unwrap();
+        let ledger = root.path().join("ledger");
+
+        // Pre-create the routing state directory with unsafe permissions so the store fails to
+        // open at startup without failing gateway activation.
+        let routing_state_dir = ledger.join("routing-state");
+        fs::create_dir_all(&routing_state_dir).unwrap();
+        fs::set_permissions(&routing_state_dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let config = Config {
+            listen: "127.0.0.1:0".into(),
+            upstream: "http://127.0.0.1:9".into(),
+            actual_supply_id: "baseline".into(),
+            policy_bundle: policy,
+            registry_feed: registry,
+            local_endpoints: Vec::new(),
+            ledger_dir: ledger,
+            tco: None,
+            attribution: None,
+            floors: None,
+            enforcement: Some(enforcement),
+            authority_signing: None,
+            promotion_approval: None,
+            state_backend: None,
+            routing: None,
+            switchyard_observe: None,
+            trusted_proxy_cidrs: vec!["127.0.0.1/32".parse().unwrap()],
+            runtime: RuntimeConfig::default(),
+        };
+        let factory_config = config.clone();
+        let mut factory = move || deps_from_config(&factory_config);
+
+        let mut supervisor = crate::supervisor::GatewaySupervisor::new(
+            config,
+            crate::serving_lease::LocalServingLease,
+        )
+        .unwrap();
+
+        let buffer = SharedBuffer::default();
+        // A `#[tokio::test]` runs on a single-thread current-thread runtime, so a thread-local
+        // default subscriber set here is still in effect on the other side of every `.await`
+        // below.
+        let subscriber_guard = tracing::subscriber::set_default(counting_subscriber(&buffer));
+
+        // Activation performs the first open attempt directly (not through `retry_routing_state`)
+        // and already latches its cause into the same `startup_unavailable` field the retry
+        // branch reads, so every retry below that finds the identical cause must add no line of
+        // its own.
+        supervisor.activate(&mut factory).await.unwrap();
+
+        // Still broken, same cause both times: the cause has not changed since activation, so
+        // neither call here may log.
+        supervisor.retry_routing_state();
+        supervisor.retry_routing_state();
+        assert_eq!(
+            warn_line_count(&buffer),
+            0,
+            "repeated failures with an unchanged cause must not log on the retry branch"
+        );
+
+        // Change the cause without ever succeeding: fix the permission problem but leave a
+        // corrupt salt file behind, so the classified cause moves from `StartupUnavailable` to
+        // `StateCorrupt`.
+        fs::set_permissions(&routing_state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let salt_path = routing_state_dir.join("salt");
+        fs::write(&salt_path, vec![7u8; 10]).unwrap();
+        fs::set_permissions(&salt_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        supervisor.retry_routing_state();
+        assert_eq!(
+            warn_line_count(&buffer),
+            1,
+            "a changed cause must still surface a new line"
+        );
+
+        drop(subscriber_guard);
     }
 }
