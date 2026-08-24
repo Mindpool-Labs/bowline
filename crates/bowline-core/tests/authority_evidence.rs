@@ -9,12 +9,49 @@ use bowline_core::{
         CircuitStateV2, CompletionStateV2, RoutingDecisionSourceV3, RoutingUnavailableCauseV3,
         UsageSource,
     },
-    run::AuthorityRunManifestV2,
+    run::{AuthorityRunDigestsV2, AuthorityRunManifestV2, AuthorityRunStoreV2},
     supply::TaskClass,
 };
 
 fn digest(label: &str) -> String {
     format!("sha256:{:064x}", label.len())
+}
+
+#[test]
+fn recorded_with_schema_leaves_the_durable_write_to_the_callers_flush() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("authority");
+    let store = AuthorityRunStoreV2::create(
+        &directory,
+        AuthorityRunDigestsV2 {
+            enforcement: digest("enforcement"),
+            actuator_set: digest("actuator"),
+            grant_set: digest("grant"),
+        },
+    )
+    .unwrap();
+    let manifest_path = store.manifest_path().to_path_buf();
+
+    let sequence = store.accept().unwrap();
+    store.recorded_with_schema(sequence, 3).unwrap();
+
+    // recorded_with_schema must no longer publish the manifest itself: only the caller's flush
+    // does. Before the fix, the durable manifest already read schema_version 3 here.
+    let durable = AuthorityRunStoreV2::load_manifest(&manifest_path).unwrap();
+    assert_eq!(
+        durable.schema_version, 2,
+        "recorded_with_schema alone must not write the durable manifest"
+    );
+
+    store.flush().unwrap();
+
+    // The caller's flush must still publish the schema-3 bump made in memory, so the fix cannot
+    // silently drop it along with the removed write.
+    let durable = AuthorityRunStoreV2::load_manifest(&manifest_path).unwrap();
+    assert_eq!(
+        durable.schema_version, 3,
+        "the writer's flush must publish the schema-3 bump recorded_with_schema made in memory"
+    );
 }
 
 #[test]
