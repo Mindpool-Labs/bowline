@@ -216,15 +216,13 @@ impl AuthorityRunStoreV2 {
             return Err(RunError::UnsupportedSchema(record_schema_version));
         }
         self.validate_authority_sequence(sequence)?;
-        let manifest = {
-            let mut manifest = self.lock_authority_manifest();
-            if record_schema_version == 3 {
-                manifest.schema_version = AUTHORITY_RUN_MANIFEST_ROUTING_SCHEMA_VERSION;
-            }
-            increment(&mut manifest.recorded, "recorded")?;
-            manifest.clone()
-        };
-        atomic_write_authority_manifest(&self.directory, &self.manifest_path, &manifest)
+        let mut manifest = self.lock_authority_manifest();
+        if record_schema_version == 3 {
+            manifest.schema_version = AUTHORITY_RUN_MANIFEST_ROUTING_SCHEMA_VERSION;
+        }
+        // The caller's flush publishes the manifest. Writing it here too doubled the fsyncs on
+        // every authority record, routed or not, inside the pre-dispatch path.
+        increment(&mut manifest.recorded, "recorded")
     }
 
     pub fn dropped(&self, sequence: u64) -> Result<(), RunError> {
