@@ -148,6 +148,10 @@ impl SwitchyardObserveAdapter {
             // The acknowledged endpoint is the entire transport boundary.  Following a redirect
             // could move an observation to a host which was neither validated nor acknowledged.
             .redirect(reqwest::redirect::Policy::none())
+            // Ambient proxy variables are a weaker boundary than the validated configuration, and
+            // reqwest has no implicit loopback bypass: without this, ALL_PROXY would send the
+            // observation and its bearer to a host configuration validation never saw.
+            .no_proxy()
             .build()?;
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<Observation>(config.observation_queue_capacity);
