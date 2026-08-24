@@ -1543,6 +1543,14 @@ async fn controlled_enforcement_response(
                 .unwrap_or(bowline_core::ledger::RoutingUnavailableCauseV3::StartupUnavailable)),
             (RoutingMetadataResolution::Unavailable(cause), _) => Err(*cause),
         };
+        // The native selection is what Bowline would have dispatched without routing. Reading it
+        // after retain_capable has forced Original would score every routing-changed decision as
+        // agreement, since the post-retention target is always Capable.
+        let native_target = if gateway_plan.target() == PlanTarget::Candidate {
+            bowline_core::routing::RoutingTarget::Efficient
+        } else {
+            bowline_core::routing::RoutingTarget::Capable
+        };
         match selected {
             Ok(decision) => {
                 routing = Some(bowline_core::ledger::AuthorityRoutingBindingV3::Decision {
@@ -1584,11 +1592,6 @@ async fn controlled_enforcement_response(
             .as_ref()
             .filter(|adapter| adapter.matches_profile(&profile.profile_id))
         {
-            let native_target = if gateway_plan.target() == PlanTarget::Candidate {
-                bowline_core::routing::RoutingTarget::Efficient
-            } else {
-                bowline_core::routing::RoutingTarget::Capable
-            };
             let protocol = match protocol {
                 AuthorityProtocol::ChatCompletions => "chat-completions",
                 AuthorityProtocol::Responses => "responses",
