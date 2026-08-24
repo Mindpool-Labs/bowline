@@ -293,7 +293,7 @@ impl RoutingStateStore {
         ensure_private_dir(&root)?;
         let writer_lock = acquire_writer_lock(&root)?;
         check_schema_direction_before_salt(&root, limits)?;
-        let salt = load_or_create_salt(&root, limits)?;
+        let salt = load_or_create_salt(&root)?;
         let data = recover(&root, limits, &salt)?;
         write_metadata(&root, &data.segments, &salt)?;
         Ok(Self {
@@ -1349,18 +1349,15 @@ fn write_metadata_value(
     Ok(())
 }
 
-fn load_or_create_salt(
-    root: &Path,
-    limits: RoutingStateLimits,
-) -> Result<[u8; 32], RoutingStateError> {
+fn load_or_create_salt(root: &Path) -> Result<[u8; 32], RoutingStateError> {
     let existing = read_salt_file(root)?;
-    // A directory with real history (metadata with real segments, a pending commit journal, or a
-    // segment file) has something bound to whatever key wrote it, so the salt is judged against
-    // that history first, before any early return. A store holding real history and an absent or
-    // all-zero salt was written by *this* build — the salt file itself was simply lost, never
-    // landed, or was zeroed by a crash mid-rename — so the fix there is to restore it, not to
-    // delete history a restored file could have recovered.
-    if state_history_exists(root, limits)? {
+    // A directory with real history (a pending commit journal or a segment file) has something
+    // bound to whatever key wrote it, so the salt is judged against that history first, before
+    // any early return. A store holding real history and an absent or all-zero salt was written
+    // by *this* build — the salt file itself was simply lost, never landed, or was zeroed by a
+    // crash mid-rename — so the fix there is to restore it, not to delete history a restored
+    // file could have recovered.
+    if state_history_exists(root)? {
         return match existing {
             Some(salt) if salt != [0u8; 32] => Ok(salt),
             Some(_) => Err(RoutingStateError::AllZeroRoutingStateSalt),
@@ -1395,29 +1392,18 @@ fn load_or_create_salt(
     Ok(salt)
 }
 
-/// Real history: a segment file on disk, a non-empty `segments` list in `metadata.json`, or a
-/// pending commit journal (which, mid-write, may not have an on-disk segment yet). A directory
-/// with `metadata.json` but zero segments has only ever been opened, never written to, so it has
-/// nothing an absent or zeroed salt could orphan.
-fn state_history_exists(
-    root: &Path,
-    limits: RoutingStateLimits,
-) -> Result<bool, RoutingStateError> {
+/// Real history: a segment file on disk, or a pending commit journal (which, mid-write, may not
+/// yet have an on-disk segment). `metadata.json` is deliberately not consulted: records only ever
+/// reach disk inside a segment file, `append_record` creates that file eagerly before the frame
+/// write, segment files are never removed outside a journalled rollback, and any rollback in
+/// flight leaves the journal behind, which the check above already catches. A `metadata.json`
+/// listing segments while no segment file exists and no journal is present describes history that
+/// does not exist — treating that directory as empty is correct, not a special case, and it also
+/// means a `metadata.json` shape this function does not understand (an unknown field, or segments
+/// out of order) can never brick this judgment: the file is simply never read here.
+fn state_history_exists(root: &Path) -> Result<bool, RoutingStateError> {
     if root.join(METADATA_COMMIT_JOURNAL).exists() {
         return Ok(true);
-    }
-    let metadata_path = root.join("metadata.json");
-    if metadata_path.exists() {
-        let bytes = read_private_bounded(&metadata_path, max_metadata_bytes(limits))?;
-        // The schema direction is already confirmed exactly equal by the time this runs
-        // (`check_schema_direction_before_salt` ran first at `open`), so there is no legacy shape
-        // left to tolerate: parse the real `StateMetadata` rather than a loose probe, so a
-        // malformed element surfaces as `Corrupt` instead of being counted as history present.
-        let metadata: StateMetadata =
-            serde_json::from_slice(&bytes).map_err(|_| RoutingStateError::Corrupt)?;
-        if !metadata.segments.is_empty() {
-            return Ok(true);
-        }
     }
     for entry in fs::read_dir(root).map_err(|_| RoutingStateError::Io)? {
         let entry = entry.map_err(|_| RoutingStateError::Io)?;
@@ -2252,14 +2238,94 @@ mod tests {
         assert!(!root.join("metadata.json").exists());
         assert_eq!(fs::read(root.join("salt")).unwrap(), vec![0u8; 32]);
         // Pins the sync as actually executed rather than merely claimed by comment: deleting the
-        // `sync_directory` call in the unlink branch leaves this assertion false.
-        assert!(sync_directory_call_count() > sync_calls_before_unlink);
+        // `sync_directory` call in the unlink branch leaves this assertion false. Exact rather
+        // than `>`: only one sync is reachable in this window today, and `==` catches a sync
+        // added anywhere earlier in `open` that would otherwise satisfy a looser bound vacuously.
+        assert_eq!(sync_directory_call_count(), sync_calls_before_unlink + 1);
 
         // Retrying after the crash must mint cleanly rather than trip on stale metadata pointing
         // at a salt fingerprint the new salt cannot reproduce.
         let reopened = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
         assert_ne!(*reopened.salt(), [0u8; 32]);
         assert_eq!(reopened.active_tasks(), 0);
+    }
+
+    #[test]
+    fn a_zero_segment_metadata_with_an_unknown_field_self_heals_rather_than_bricking() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        drop(store);
+
+        let root = dir.path().join("routing-state");
+        let path = root.join("metadata.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // A field a future build added must not brick this directory: `state_history_exists` no
+        // longer parses `metadata.json` at all, so an unrecognized field here can never turn an
+        // empty directory into `Corrupt` before the unlink that would otherwise heal it.
+        metadata["reserved_for_a_later_release"] = serde_json::Value::from("placeholder");
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let reopened = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        assert_eq!(reopened.active_tasks(), 0);
+    }
+
+    #[test]
+    fn out_of_order_metadata_segments_with_no_salt_self_heal_instead_of_naming_a_missing_salt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        drop(store);
+
+        let root = dir.path().join("routing-state");
+        fs::remove_file(root.join("salt")).unwrap();
+        let bogus = serde_json::json!({
+            "schema_version": ROUTING_STATE_SCHEMA_VERSION,
+            "segments": [{"index": 5, "bytes": 64}, {"index": 2, "bytes": 32}],
+            "active_segment": 2,
+            "salt_digest": format!("hmac-sha256:{}", "0".repeat(64)),
+        });
+        fs::write(
+            root.join("metadata.json"),
+            serde_json::to_vec(&bogus).unwrap(),
+        )
+        .unwrap();
+
+        // No segment file backs either listed entry and no journal is present, so ground truth
+        // says there is no real history: the absent salt must be minted fresh rather than refused
+        // as `MissingRoutingStateSalt`, an error naming a remedy — restoring a backup — the
+        // operator cannot perform for a directory that never held real history.
+        let reopened = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        assert_eq!(reopened.active_tasks(), 0);
+        assert_ne!(*reopened.salt(), [0u8; 32]);
+    }
+
+    #[test]
+    fn metadata_listing_a_segment_with_no_file_on_disk_self_heals() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        let salt = *store.salt();
+        drop(store);
+
+        let root = dir.path().join("routing-state");
+        let bogus = serde_json::json!({
+            "schema_version": ROUTING_STATE_SCHEMA_VERSION,
+            "segments": [{"index": 0, "bytes": 64}],
+            "active_segment": 0,
+            "salt_digest": salt_fingerprint(&salt),
+        });
+        fs::write(
+            root.join("metadata.json"),
+            serde_json::to_vec(&bogus).unwrap(),
+        )
+        .unwrap();
+
+        // The salt on disk is untouched and its fingerprint matches, isolating this case to the
+        // segment-file judgment alone: metadata.json claims a segment, but no `segment-*.log`
+        // exists and no journal is present, so ground truth says there is no real history to
+        // recover.
+        let reopened = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
+        assert_eq!(reopened.active_tasks(), 0);
+        assert_eq!(*reopened.salt(), salt);
     }
 
     #[test]
@@ -2437,7 +2503,7 @@ mod tests {
     }
 
     #[test]
-    fn a_history_probe_disagreeing_with_the_strict_parse_is_corrupt_not_missing_salt() {
+    fn a_malformed_metadata_shape_over_real_history_still_names_the_missing_salt() {
         let dir = tempfile::tempdir().unwrap();
         let store = RoutingStateStore::open(dir.path(), RoutingStateLimits::default()).unwrap();
         store
@@ -2455,18 +2521,20 @@ mod tests {
         let path = root.join("metadata.json");
         let mut metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        // A loose `Vec<serde_json::Value>` probe accepts this element as "history present" since
-        // it ignores element shape; the strict `MetadataSegment` parse (`deny_unknown_fields`)
-        // rejects it outright. The two must agree once the schema direction is already confirmed
-        // equal, rather than let the loose probe steer a corrupt file toward the one error naming
-        // no remedy the operator can act on.
+        // `state_history_exists` no longer parses `metadata.json` at all, so a malformed segment
+        // element here cannot steer its judgment: the real `segment-*.log` file this `decide`
+        // call left on disk is what marks this directory as holding real history, independent of
+        // metadata.json's shape. The absent salt is judged against that real history and named
+        // directly, rather than masked behind a `Corrupt` this function no longer has a way to
+        // detect early — `recover`'s own strict parse still catches the malformed segment once a
+        // salt is available to reach it.
         metadata["segments"][0]["unexpected_field"] = serde_json::Value::from("junk");
         fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
         fs::remove_file(root.join("salt")).unwrap();
 
         assert!(matches!(
             RoutingStateStore::open(dir.path(), RoutingStateLimits::default()),
-            Err(RoutingStateError::Corrupt)
+            Err(RoutingStateError::MissingRoutingStateSalt)
         ));
     }
 

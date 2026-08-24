@@ -33,3 +33,6 @@ url.workspace = true
 csv.workspace = true
 libc.workspace = true
 crc32fast.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

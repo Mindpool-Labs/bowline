@@ -177,8 +177,10 @@ directory. A directory recorded by a *newer* Bowline release (for example after 
 fails closed with a different, distinctly named error and must **not** be deleted this way. No
 release existed at the time of the bump, so no migration is owed.
 Only once the schema is confirmed current is the salt itself judged, and only against a directory
-that holds real history — a segment file, a non-empty segment list in its metadata, or a pending
-commit journal. A directory with real history and no salt file refuses to open with a distinct
+that holds real history — a segment file on disk or a pending commit journal; `metadata.json` is
+never consulted for this, so a directory whose metadata lists segments that do not exist on disk,
+or that carries a field this build does not recognize, is judged exactly as if it were empty. A
+directory with real history and no salt file refuses to open with a distinct
 error naming the salt as missing: it was written by this build, not an older schema, so restore the
 `salt` file from backup before considering a reset, since deleting the directory here destroys
 history the salt would have recovered. A directory whose metadata carries a salt fingerprint that
