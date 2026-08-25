@@ -1194,7 +1194,9 @@ fn read_private_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, RoutingSta
     let length = metadata.len();
     // Use descriptor metadata after O_NOFOLLOW open. A sparse regular file is never a valid
     // metadata object: accepting it would let a tiny allocation claim a huge logical payload.
-    if length > maximum || metadata.blocks().saturating_mul(512) < length {
+    // Filesystems that inline small files (btrfs below max_inline, ext4 with inline_data) report
+    // zero blocks for a valid metadata object, so only apply the sparse test above one block.
+    if length > maximum || (length > 4096 && metadata.blocks().saturating_mul(512) < length) {
         return Err(RoutingStateError::Corrupt);
     }
     let capacity = usize::try_from(length).map_err(|_| RoutingStateError::Corrupt)?;
@@ -1778,6 +1780,45 @@ mod tests {
                 Err(RoutingStateError::Corrupt)
             ));
         }
+    }
+
+    #[test]
+    fn a_small_sparse_file_is_not_rejected_as_corrupt() {
+        // Filesystems that inline small files (btrfs below max_inline, ext4 with inline_data)
+        // report zero blocks for a valid, well under one page, object. A held-open, unwritten
+        // hole below that same threshold must reproduce identically: st_blocks * 512 < length,
+        // yet the object is not corrupt merely for being small.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small-sparse");
+        open_private_file(&path, true, true).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(100)
+            .unwrap();
+
+        assert_eq!(read_private_bounded(&path, 4096).unwrap().len(), 100);
+    }
+
+    #[test]
+    fn a_large_sparse_file_is_still_rejected_as_corrupt() {
+        // Above the one-page threshold, a sparse hole remains a defence: a tiny allocation
+        // claiming a huge logical payload is exactly what H5's guard exists to catch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-sparse");
+        open_private_file(&path, true, true).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8192)
+            .unwrap();
+
+        assert!(matches!(
+            read_private_bounded(&path, 1 << 20),
+            Err(RoutingStateError::Corrupt)
+        ));
     }
 
     fn assert_rollback_fault_never_replays_unreturned(
@@ -2664,7 +2705,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_capacity_refuses_new_history_without_deleting_live_state() {
+    fn segment_exhaustion_refuses_new_history_without_deleting_live_state() {
         let dir = tempfile::tempdir().unwrap();
         let limits = RoutingStateLimits {
             max_active_tasks: 8,
@@ -2692,6 +2733,69 @@ mod tests {
             Err(RoutingStateError::Capacity)
         ));
         assert_eq!(store.active_tasks(), 1);
+    }
+
+    #[test]
+    fn task_cap_exhaustion_refuses_new_history_without_deleting_live_state() {
+        // Isolated from segment exhaustion: a generous segment budget, so the only limit a
+        // third distinct task can hit is max_active_tasks.
+        let dir = tempfile::tempdir().unwrap();
+        let limits = RoutingStateLimits {
+            max_active_tasks: 2,
+            segment_bytes: 1 << 20,
+            max_segments: 16,
+        };
+        let store = RoutingStateStore::open(dir.path(), limits).unwrap();
+        store
+            .decide(
+                "task-1",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        store
+            .decide(
+                "task-2",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.decide(
+                "task-3",
+                1,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write]
+            ),
+            Err(RoutingStateError::Capacity)
+        ));
+        assert_eq!(store.active_tasks(), 2);
+
+        // The two tasks admitted before the cap was hit keep appending.
+        store
+            .decide(
+                "task-1",
+                2,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        store
+            .decide(
+                "task-2",
+                2,
+                "sha256:route",
+                &profile(),
+                vec![RoutingSignal::Write],
+            )
+            .unwrap();
+        assert_eq!(store.active_tasks(), 2);
     }
 
     #[test]

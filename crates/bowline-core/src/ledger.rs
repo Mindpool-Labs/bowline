@@ -1626,7 +1626,7 @@ impl AuthorityLedgerV2 {
         directory: &Path,
         manifest: &AuthorityRunManifestV2,
     ) -> Result<Vec<AuthorityRecordV2>, LedgerError> {
-        if manifest.schema_version != 2
+        if !matches!(manifest.schema_version, 2 | 3)
             || !manifest.clean_shutdown
             || !manifest.writer_healthy
             || manifest.dropped != 0
@@ -2780,7 +2780,10 @@ mod tests {
     use super::*;
     use crate::decision::{Decision, Placement};
     use crate::policy::WorkloadIdentity;
-    use crate::run::{AuthorityRunDigestsV2, AuthorityRunStoreV2, RunDigests, RunLimits, RunStore};
+    use crate::run::{
+        AuthorityRunDigestsV2, AuthorityRunStoreV2, RunDigests, RunLimits, RunStore,
+        AUTHORITY_RUN_MANIFEST_ROUTING_SCHEMA_VERSION,
+    };
     use crate::supply::TaskClass;
     use crate::traffic::{CoverageStatus, ObservationSource, ProtocolKind};
 
@@ -3587,6 +3590,67 @@ mod tests {
 
         std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(ledger.integrity_inventory().is_ok());
+    }
+
+    #[test]
+    fn read_authoritative_run_accepts_a_routed_schema_v3_manifest() {
+        let temp = tempdir().unwrap();
+        let directory = temp.path().join("authority");
+        let digest = |value: u8| format!("sha256:{value:064x}");
+        let run = AuthorityRunStoreV2::create(
+            &directory,
+            AuthorityRunDigestsV2 {
+                enforcement: digest(1),
+                actuator_set: digest(2),
+                grant_set: digest(3),
+            },
+        )
+        .unwrap();
+        let snapshot = run.snapshot();
+        let mut ledger =
+            AuthorityLedgerV2::create(&directory, &snapshot.records_file, 1024 * 1024).unwrap();
+
+        let mut decision = remediation_candidate_decision("decision-1");
+        decision.routing = Some(AuthorityRoutingBindingV3::Decision {
+            routing_decision_digest: remediation_digest(10),
+            routing_state_digest: remediation_digest(11),
+            profile_digest: remediation_digest(12),
+            task_reference_digest: format!("hmac-sha256:{:064x}", 13),
+            step_id: 1,
+            semantic_target: crate::routing::RoutingTarget::Capable,
+            reason: crate::routing::RoutingReason::DefaultCapable,
+            source: RoutingDecisionSourceV3::TrustedImmediatePeer,
+        });
+        let sequence = run.accept().unwrap();
+        let record = AuthorityRecordV2::decision(sequence, decision).unwrap();
+        assert_eq!(
+            record.schema_version(),
+            3,
+            "routing binding must select schema v3"
+        );
+        ledger.append(&record).unwrap();
+        run.recorded_with_schema(sequence, record.schema_version())
+            .unwrap();
+
+        let (bytes, records_digest) = ledger.integrity().unwrap();
+        run.finish(true, Some(bytes), Some(records_digest)).unwrap();
+        run.flush().unwrap();
+        let manifest = run.snapshot();
+        assert_eq!(
+            manifest.schema_version, AUTHORITY_RUN_MANIFEST_ROUTING_SCHEMA_VERSION,
+            "the first routed record must upgrade the manifest to schema v3"
+        );
+        drop(ledger);
+        drop(run);
+
+        let directory = fs::canonicalize(&directory).unwrap();
+        assert_eq!(
+            AuthorityLedgerV2::read_authoritative_run(&directory, &manifest)
+                .unwrap()
+                .len(),
+            1,
+            "the public reader must accept a routed schema-v3 manifest, not only schema v2"
+        );
     }
 
     #[test]

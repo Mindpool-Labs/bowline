@@ -204,9 +204,12 @@ Its grammar is `schema_version: 1`, bounded `route_id`, bounded `task_id`, unsig
 version, opaque decision ID, route and profile digest bindings, task-reference digest, step,
 target, selected supply ID, deterministic reason, state digest, and `authority`. Errors are 400
 `invalid_request`, 401 `unauthorized`, 404 `unknown_route`, 409 `step_conflict`, 413
-`body_too_large`, and 503 `routing_unavailable`. A 503 retains a typed cause:
-`missing-metadata`, `untrusted-metadata`, `malformed-metadata`, `step-conflict`,
-`capacity-exhausted`, `state-corrupt`, `writer-failure`, or `startup-unavailable`.
+`body_too_large`, and 503 `routing_unavailable`. The 503 body carries no typed cause: every
+`routing_unavailable` response is identical whichever of `missing-metadata`,
+`untrusted-metadata`, `malformed-metadata`, `capacity-exhausted`, `state-corrupt`,
+`writer-failure`, or `startup-unavailable` produced it. The typed cause is retained only in
+schema-v3 authority evidence, never on the decision API response. `step-conflict` is not one of
+these causes: it is its own 409 `step_conflict`, decided before the unavailable-cause branch.
 
 Trusted inference metadata is one `x-bowline-task-id`, one decimal `x-bowline-step-id`, and one
 `x-bowline-agent-signals` value. Task IDs use the bounded identifier grammar; signals are a JSON
@@ -215,6 +218,12 @@ headers are accepted only from a configured trusted immediate peer and are strip
 forwarding. Missing, untrusted, malformed, conflicting, capacity-exhausted, corrupt, writer-failed,
 or unavailable routing retains the capable/original target. Schema-v3 authority decision and
 outcome evidence binds either the durable routing decision or that unavailable cause and source.
+
+A routed request durably consumes its step before dispatch, whether or not that dispatch
+completes. A refused request must therefore be retried with byte-identical signals for the same
+step; a retry that carries new signals (for example an agent adding `tool-error` after a refusal)
+conflicts with the already-committed step and gets `step_conflict`, which retains the
+capable/original target rather than making a fresh routing decision.
 
 `switchyard_observe` is optional. It targets the experimental NVIDIA NeMo Relay 0.6.0 Switchyard
 decision API, a plugin NVIDIA removes in NeMo Relay 0.8; Bowline treats it as a pilot and never

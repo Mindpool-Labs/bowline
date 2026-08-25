@@ -40,13 +40,19 @@ pub struct ControlledEnforcementTotals {
     pub fail_closed: u64,
     pub failures: u64,
     /// Failures of a candidate dispatch only. Original-path failures remain in `failures`.
+    /// Absent, and defaulted to 0, in every schema-v1 report a v1 crate wrote.
+    #[serde(default)]
     pub candidate_failures: u64,
     pub cancellations: u64,
     pub incomplete: u64,
     /// Routed decisions are counted by semantic routing result. They are not folded into
-    /// authority bypass or candidate-dispatch counts.
+    /// authority bypass or candidate-dispatch counts. Absent, and defaulted to 0, in every
+    /// schema-v1 report: routing did not exist when schema_version stayed 1.
+    #[serde(default)]
     pub routing_capable: u64,
+    #[serde(default)]
     pub routing_efficient: u64,
+    #[serde(default)]
     pub routing_unavailable: u64,
     pub observed_enforced_cost_micros: Option<u64>,
     #[serde(with = "controlled_optional_i64")]
@@ -151,7 +157,7 @@ fn aggregate_controlled_enforcement_report(
         })
         .collect();
     Ok(ControlledEnforcementReport {
-        schema_version: 1,
+        schema_version: 2,
         authority_schema_version: if records.iter().any(|record| record.schema_version() == 3) {
             3
         } else {
@@ -615,6 +621,47 @@ mod controlled_aggregation_tests {
             .unwrap();
         assert_eq!(canary.totals.observed_enforced_cost_micros, None);
         assert_eq!(canary.totals.enforced_modeled_delta_micros, None);
+    }
+
+    #[test]
+    fn a_schema_v1_totals_document_loads_with_the_new_routing_counters_defaulted() {
+        // Shape of a totals document as it was published before routing_capable,
+        // routing_efficient, routing_unavailable, and candidate_failures existed: no such fields,
+        // deny_unknown_fields on the struct. A version-1 report written by an old crate must still
+        // load under the new one.
+        let legacy = serde_json::json!({
+            "decisions": 3,
+            "candidate_dispatches": 2,
+            "pre_dispatch_rejections": 1,
+            "bypasses": 0,
+            "fail_closed": 0,
+            "failures": 0,
+            "cancellations": 0,
+            "incomplete": 0,
+            "observed_enforced_cost_micros": null,
+            "enforced_modeled_delta_micros": null,
+        });
+        let totals: ControlledEnforcementTotals = serde_json::from_value(legacy)
+            .expect("a schema-v1 totals document must still deserialize");
+        assert_eq!(totals.candidate_failures, 0);
+        assert_eq!(totals.routing_capable, 0);
+        assert_eq!(totals.routing_efficient, 0);
+        assert_eq!(totals.routing_unavailable, 0);
+    }
+
+    #[test]
+    fn a_new_report_is_stamped_schema_v2() {
+        let report = aggregate_controlled_enforcement_report(
+            "run",
+            &format!("sha256:{}", "9".repeat(64)),
+            &[],
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.schema_version, 2);
+        let round_tripped: ControlledEnforcementReport =
+            serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+        assert_eq!(round_tripped, report);
     }
 }
 
