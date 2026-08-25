@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "bowline"
-version = "0.1.0-dev"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bowline-core",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "bowline-core"
-version = "0.1.0-dev"
+version = "0.1.0"
 dependencies = [
  "crc32fast",
  "ipnet",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "bowline-gateway"
-version = "0.1.0-dev"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
