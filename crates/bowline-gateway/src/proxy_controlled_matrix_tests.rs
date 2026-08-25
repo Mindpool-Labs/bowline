@@ -368,6 +368,21 @@ async fn routed_proxy_branches_keep_native_dispatch_and_bind_schema_v3_evidence(
         ..base_case("routed-recommend-unavailable")
     })
     .await;
+    // Enforce with a verified grant is the only mode in which the plan's target is still
+    // Candidate when routing resolves, so it is the only mode in which retain_capable mutates
+    // anything. The Unavailable arm of that mutation had no test at all: every other routed case
+    // runs in observe or recommend, where the target is already Original and the call is a no-op.
+    run_case(MatrixCase {
+        name: "routed-enforce-unavailable",
+        expected_original: 1,
+        expected_candidate: 0,
+        expected_target: PlanTarget::Original,
+        expected_evidence: EvidenceState::Unverified,
+        expected_reason: Some(SelectionReason::RoutingUnavailable),
+        routing: RoutingSetup::UnavailableMissingMetadata,
+        ..base_case("routed-enforce-unavailable")
+    })
+    .await;
     run_case(MatrixCase {
         name: "routed-enforce-efficient",
         routing: RoutingSetup::Efficient,
