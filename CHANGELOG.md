@@ -5,6 +5,12 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-08-25
+
+Introduces the initial shadow-observer feature set.
+
 ### Added
 
 - Production-PoV preflight, health, run manifests, bounded segmented evidence, integrity reports,
@@ -113,6 +119,3 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read via `getrandom` rather than a raw `/dev/urandom` file read, and an all-zero salt is rejected
   both when generated and when loaded from disk over real history.
 
-## [0.1.0] - Unreleased
-
-Introduces the initial shadow-observer feature set.
