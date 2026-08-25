@@ -76,8 +76,10 @@ for claim in \
   'The decision API accepts only `POST /v1/routing/decision`' \
   'exactly one `Authorization` header' \
   'JSON no larger than 65536 bytes' \
-  '`missing-metadata`, `untrusted-metadata`, `malformed-metadata`, `step-conflict`' \
-  '`capacity-exhausted`, `state-corrupt`, `writer-failure`, or `startup-unavailable`' \
+  'The 503 body carries no typed cause' \
+  '`untrusted-metadata`, `malformed-metadata`, `capacity-exhausted`, `state-corrupt`,' \
+  '`writer-failure`, or `startup-unavailable` produced it' \
+  'it is its own 409 `step_conflict`, decided before the unavailable-cause branch' \
   'headers are accepted only from a configured trusted immediate peer' \
   'The adapter disables redirects, bounds a successful response' \
   'Switchyard is observe-only: it cannot change'; do

@@ -779,7 +779,8 @@ fn controlled_enforcement_markdown(report: &ControlledEnforcementReport) -> Stri
 pub fn render_controlled_enforcement_payloads(
     report: &ControlledEnforcementReport,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
-    if report.schema_version != 1 || !matches!(report.authority_schema_version, 2 | 3) {
+    if !matches!(report.schema_version, 1 | 2) || !matches!(report.authority_schema_version, 2 | 3)
+    {
         anyhow::bail!("unsupported controlled-enforcement report schema");
     }
     let markdown = controlled_enforcement_markdown(report);
