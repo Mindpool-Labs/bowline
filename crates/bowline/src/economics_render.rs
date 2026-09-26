@@ -100,6 +100,7 @@ mod tests {
                 totals,
             }],
             shadow_opportunity: None,
+            reprocessing: None,
         };
 
         let payloads = render_controlled_enforcement_payloads(&report).unwrap();
@@ -576,7 +577,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use bowline_core::economics::{ActionableEconomicsReport, Blocker};
-use bowline_core::report::{ControlledEnforcementReport, ControlledEnforcementTotals};
+use bowline_core::report::{
+    ControlledEnforcementReport, ControlledEnforcementTotals, ReprocessingSection,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -750,7 +753,7 @@ fn controlled_enforcement_markdown(report: &ControlledEnforcementReport) -> Stri
         },
     );
     format!(
-        "# Bowline Controlled Enforcement Report\n\nComplete: `{}`  \nAuthority schema: `v{}`  \nDecisions: `{}`  \nCandidate dispatches: `{}`  \nPre-dispatch rejections: `{}`  \nBypasses: `{}`  \nFail-closed: `{}`  \nFailures: `{}`  \nCandidate failures: `{}`  \nCancellations: `{}`  \nIncomplete: `{}`  \nRouting capable: `{}`  \nRouting efficient: `{}`  \nRouting unavailable: `{}`  \nObserved enforced cost: `${}`  \nEnforced modeled cost delta: `${}`  \nShadow opportunity groups: `{}`  \nShadow modeled opportunity: `${}`\n\nEnforced outcomes and shadow opportunity are separate evidence classes.\n\n## Canonical evidence\n\n{}",
+        "# Bowline Controlled Enforcement Report\n\nComplete: `{}`  \nAuthority schema: `v{}`  \nDecisions: `{}`  \nCandidate dispatches: `{}`  \nPre-dispatch rejections: `{}`  \nBypasses: `{}`  \nFail-closed: `{}`  \nFailures: `{}`  \nCandidate failures: `{}`  \nCancellations: `{}`  \nIncomplete: `{}`  \nRouting capable: `{}`  \nRouting efficient: `{}`  \nRouting unavailable: `{}`  \nObserved enforced cost: `${}`  \nEnforced modeled cost delta: `${}`  \nShadow opportunity groups: `{}`  \nShadow modeled opportunity: `${}`\n\nEnforced outcomes and shadow opportunity are separate evidence classes.\n\n{}## Canonical evidence\n\n{}",
         report.complete,
         report.authority_schema_version,
         report.totals.decisions,
@@ -769,10 +772,34 @@ fn controlled_enforcement_markdown(report: &ControlledEnforcementReport) -> Stri
         fixed_signed_usd(report.totals.enforced_modeled_delta_micros.map(i128::from)),
         shadow_groups,
         shadow_delta,
+        report
+            .reprocessing
+            .as_ref()
+            .map_or_else(String::new, reprocessing_markdown),
         canonical
             .lines()
             .map(|line| format!("    {line}\n"))
             .collect::<String>()
+    )
+}
+
+fn reprocessing_markdown(section: &ReprocessingSection) -> String {
+    format!(
+        "## Modeled context reprocessing\n\nThis section is modeled, not observed. It prices each routed step at the model that served it, with the operator's cache ratios, and counts every model switch as a full cache miss on the new model. Steps that never reached a model are excluded and counted.\n\nManifest digest: `{}`  \nStatus: `{}`  \nTasks: `{}`  \nRouted steps: `{}`  \nCold steps: `{}`  \nSwitch steps: `{}`  \nSteady steps: `{}`  \nSwitches to efficient: `{}`  \nSwitches to capable: `{}`  \nExcluded undispatched steps: `{}`  \nModeled reprocessing cost: `${}`  \nCache-adjusted enforced cost: `${}`  \nCache-adjusted counterfactual cost: `${}`  \nCache-adjusted modeled delta: `${}`\n\n",
+        section.manifest_digest,
+        enum_name(&section.status),
+        section.tasks,
+        section.routed_steps,
+        section.cold_steps,
+        section.switch_steps,
+        section.steady_steps,
+        section.switches_to_efficient,
+        section.switches_to_capable,
+        section.excluded_undispatched_steps,
+        fixed_usd(section.reprocessing_cost_micros),
+        fixed_usd(section.cache_adjusted_enforced_cost_micros),
+        fixed_usd(section.cache_adjusted_counterfactual_cost_micros),
+        fixed_signed_usd(section.cache_adjusted_delta_micros),
     )
 }
 

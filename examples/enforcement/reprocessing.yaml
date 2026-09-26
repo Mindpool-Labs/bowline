@@ -1,0 +1,19 @@
+# Synthetic reprocessing manifest for `bowline report --authority-manifest <manifest> --reprocessing <this file>`.
+# The prices are placeholders. Replace them with the list prices of the two models behind the
+# routing profile. Ratios are parts per million of the model's own input price.
+schema_version: 1
+# Share of a non-switch step's input that the model reads from its prompt cache.
+steady_cache_hit_ppm: 950000
+targets:
+  capable:
+    input_per_mtok_usd: 5.0
+    output_per_mtok_usd: 25.0
+    # Cache read at 0.1x input.
+    cache_read_ppm: 100000
+    # Cache write at 1.25x input (five-minute cache lifetime).
+    cache_write_ppm: 1250000
+  efficient:
+    input_per_mtok_usd: 3.0
+    output_per_mtok_usd: 15.0
+    cache_read_ppm: 100000
+    cache_write_ppm: 1250000

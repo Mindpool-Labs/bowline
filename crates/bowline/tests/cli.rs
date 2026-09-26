@@ -1893,6 +1893,99 @@ fn schema_v3_routed_authority_report_exposes_routing_categories_in_all_cli_forma
     }
 }
 
+#[test]
+fn authority_report_adds_the_modeled_reprocessing_section_only_when_a_manifest_is_given() {
+    let dir = tempdir("reprocessing-authority-report");
+    let manifest = create_cancelled_authority_run(&dir);
+    let manifest = manifest.to_str().unwrap();
+    let example = bowline_root().join("examples/enforcement/reprocessing.yaml");
+    let example = example.to_str().unwrap();
+    let report = |extra: &[&str]| {
+        let mut command = bowline();
+        command.args([
+            "report",
+            "--authority-manifest",
+            manifest,
+            "--allow-incomplete",
+        ]);
+        command.args(extra);
+        command.output().unwrap()
+    };
+
+    let plain = report(&["--json"]);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain_json: serde_json::Value = serde_json::from_slice(&plain.stdout).unwrap();
+    assert!(plain_json.get("reprocessing").is_none());
+    let plain_markdown = report(&[]);
+    assert!(plain_markdown.status.success());
+    assert!(!String::from_utf8_lossy(&plain_markdown.stdout).contains("reprocessing"));
+
+    let modeled = report(&["--json", "--reprocessing", example]);
+    assert!(
+        modeled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&modeled.stderr)
+    );
+    let modeled_json: serde_json::Value = serde_json::from_slice(&modeled.stdout).unwrap();
+    let section = &modeled_json["reprocessing"];
+    // The fixture run is incomplete and its routed step has no usage: counts only, no total.
+    assert_eq!(section["status"], "incomplete");
+    assert_eq!(section["tasks"], 1);
+    assert_eq!(section["routed_steps"], 1);
+    assert_eq!(section["cold_steps"], 1);
+    assert_eq!(section["excluded_undispatched_steps"], 0);
+    assert!(section["cache_adjusted_delta_micros"].is_null());
+    let digest = section["manifest_digest"].as_str().unwrap();
+    assert!(digest.starts_with("sha256:") && digest.len() == 71);
+    let mut without = modeled_json.clone();
+    without.as_object_mut().unwrap().remove("reprocessing");
+    assert_eq!(without, plain_json);
+    let repeated = report(&["--json", "--reprocessing", example]);
+    assert_eq!(repeated.stdout, modeled.stdout);
+
+    let markdown = report(&["--reprocessing", example]);
+    assert!(markdown.status.success());
+    let markdown = String::from_utf8(markdown.stdout).unwrap();
+    assert!(markdown.contains("## Modeled context reprocessing"));
+    assert!(markdown.contains("Excluded undispatched steps: `0`"));
+    assert!(markdown.contains(digest));
+
+    let invalid = dir.join("invalid-reprocessing.yaml");
+    fs::write(
+        &invalid,
+        fs::read_to_string(example).unwrap() + "ttl_seconds: 300\n",
+    )
+    .unwrap();
+    let out = dir.join("rejected.json");
+    let rejected = report(&[
+        "--json",
+        "--reprocessing",
+        invalid.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(!rejected.status.success());
+    assert!(!out.exists());
+
+    let config = absent_ledger_config(&dir);
+    let shadow = bowline()
+        .args([
+            "report",
+            "--config",
+            config.to_str().unwrap(),
+            "--reprocessing",
+            example,
+        ])
+        .output()
+        .unwrap();
+    assert!(!shadow.status.success());
+    assert!(String::from_utf8_lossy(&shadow.stderr).contains("--authority-manifest"));
+}
+
 fn create_cancelled_authority_run(root: &Path) -> PathBuf {
     let digest = |_ch: char| format!("sha256:{}", "a".repeat(64));
     let directory = root.join("authority");

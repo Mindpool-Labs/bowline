@@ -43,6 +43,7 @@ fn canonical_totals_are_explicit_and_unvalidated_shadow_opportunity_is_unavailab
             totals,
         }],
         shadow_opportunity: None,
+        reprocessing: None,
     };
 
     let value = serde_json::to_value(report).unwrap();
@@ -50,6 +51,7 @@ fn canonical_totals_are_explicit_and_unvalidated_shadow_opportunity_is_unavailab
     assert_eq!(value["totals"]["enforced_modeled_delta_micros"], "300000");
     assert!(value["shadow_opportunity"].is_null());
     assert!(value.get("realized_savings").is_none());
+    assert!(value.get("reprocessing").is_none());
 }
 
 fn digest(_value: char) -> String {

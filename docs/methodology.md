@@ -235,3 +235,68 @@ Any applicable missing or overflowing input makes that aggregate unavailable or 
 construction; it is never replaced by a partial subtotal or zero. Bypass, fail-closed, candidate
 failure, cancellation, estimated usage, stale/unpriceable evidence, and incomplete authority runs
 are separate counts and produce no enforced modeled delta.
+
+## Modeled context reprocessing
+
+The enforced modeled delta prices both paths at the full input rate. A long task on one model
+mostly reads its prompt from cache, so the full rate overstates what the capable path costs. A
+model switch also has a cost: the model that the task switches to has no cache for that prompt
+and reloads it at the cache-write rate. The optional reprocessing section models both effects
+from an operator input file. It is modeled from list prices and ratios; it is not observed cache
+usage and not a billing result.
+
+For each target `t`, with steady hit share `h`, cache-read ratio `read_t`, and cache-write ratio
+`write_t`:
+
+```text
+steady input multiplier  s_t = h * read_t + (1 - h) * write_t
+miss input multiplier    m_t = write_t
+```
+
+Bowline groups routed outcomes by task reference. For each step `k`, `t_k` is the model that
+served the step, not the semantic routing target: `Candidate` is efficient and `Original` is
+capable. Routing can only force capable, so observe mode, recommend mode, and a lost grant serve
+`Original` for a semantically efficient step. An outcome that never reached a model (not
+dispatched, or `target: None`) is excluded and counted in `excluded_undispatched_steps`; the next
+step then has no predecessor. A replacement dispatch counts as the step it replaced, through
+`replaces_decision_id`, and is priced at the model that served it. Bowline classifies each
+remaining step:
+
+| class | rule | enforced input multiplier | counterfactual input multiplier |
+|---|---|---|---|
+| cold | `step_id == 1` | `m_{t_k}` | `m_capable` |
+| switch | step `k - 1` of the task is absent from the run, or a different model served it | `m_{t_k}` | `s_capable` |
+| steady | otherwise | `s_{t_k}` | `s_capable` |
+
+```text
+enforced       = I_k * input_{t_k} * enforced multiplier + O_k * output_{t_k}
+counterfactual = I_k * input_capable * counterfactual multiplier + O_k * output_capable
+reprocessing   = I_k * input_{t_k} * (m_{t_k} - s_{t_k})      (switch steps only)
+delta          = sum(counterfactual) - sum(enforced)
+```
+
+`I_k` and `O_k` are the recorded input and output tokens. The counterfactual keeps the task on
+`capable` for every step. Prices convert to integer micros per million tokens and ratios stay in
+parts per million. Bowline computes each step exactly in 128-bit integers, rounds it half-up to
+whole micros once, and sums the steps with checked arithmetic. The reprocessing figure is a
+separate per-step rounding of the switch premium.
+
+Assumptions and limits:
+
+- Every switch step is a full cache miss on the new model. The model has no cache lifetime and no
+  timestamps.
+- An absent or excluded predecessor step is priced as a switch. This choice never overstates the
+  saving.
+- The counterfactual input equals the recorded input: the same request on the other model. The
+  enforced modeled delta makes the same assumption.
+- The steady hit share is the same for both targets and every task.
+- The section does not change records, grants, promotion, or gating. Bowline does not report
+  realized savings.
+
+The example file uses the published cache ratios: cache read at 0.1x the input price and cache
+write at 1.25x for a five-minute cache. See
+[Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
+[OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching), and
+[Amazon Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).
+Use the ratios and the cache lifetime that apply to the deployed models. Set
+`steady_cache_hit_ppm` from the deployment's own cache usage.

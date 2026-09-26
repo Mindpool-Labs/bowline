@@ -28,6 +28,179 @@ pub struct ControlledEnforcementReport {
     pub totals: ControlledEnforcementTotals,
     pub by_mode: Vec<ControlledEnforcementModeRow>,
     pub shadow_opportunity: Option<ShadowOpportunitySummary>,
+    /// Present only when the operator supplies a reprocessing manifest. Absent, the report
+    /// serializes exactly as it did before this section existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprocessing: Option<ReprocessingSection>,
+}
+
+pub const REPROCESSING_SCHEMA_VERSION: u32 = 1;
+pub const MAX_REPROCESSING_YAML_BYTES: usize = 64 * 1024;
+const PPM: u128 = 1_000_000;
+const MIN_CACHE_WRITE_PPM: u64 = 1_000_000;
+const MAX_CACHE_WRITE_PPM: u64 = 4_000_000;
+
+/// Operator-supplied prices and cache ratios for the modeled context-reprocessing section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReprocessingManifest {
+    pub schema_version: u32,
+    /// Share of a non-switch step's input that the model reads from its prompt cache.
+    pub steady_cache_hit_ppm: u64,
+    pub targets: ReprocessingTargets,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReprocessingTargets {
+    pub capable: ReprocessingTargetRate,
+    pub efficient: ReprocessingTargetRate,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReprocessingTargetRate {
+    pub input_per_mtok_usd: f64,
+    pub output_per_mtok_usd: f64,
+    /// Cache-read price as a fraction of the input price.
+    pub cache_read_ppm: u64,
+    /// Cache-write price as a fraction of the input price.
+    pub cache_write_ppm: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum ReprocessingManifestError {
+    #[error("reprocessing manifest exceeds {MAX_REPROCESSING_YAML_BYTES} bytes")]
+    InputLimit,
+    #[error("failed to parse reprocessing manifest: {0}")]
+    Parse(#[from] serde_yaml::Error),
+    #[error("invalid reprocessing manifest")]
+    Invalid,
+}
+
+impl ReprocessingManifest {
+    pub fn from_yaml(input: &str) -> Result<Self, ReprocessingManifestError> {
+        if input.len() > MAX_REPROCESSING_YAML_BYTES {
+            return Err(ReprocessingManifestError::InputLimit);
+        }
+        let value: Self = serde_yaml::from_str(input)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ReprocessingManifestError> {
+        if self.schema_version != REPROCESSING_SCHEMA_VERSION
+            || u128::from(self.steady_cache_hit_ppm) > PPM
+            || !self.targets.capable.valid()
+            || !self.targets.efficient.valid()
+        {
+            return Err(ReprocessingManifestError::Invalid);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, ReprocessingManifestError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|_| ReprocessingManifestError::Invalid)?;
+        Ok(crate::billing::domain_digest(
+            b"bowline.report.reprocessing.v1",
+            &bytes,
+        ))
+    }
+
+    fn pricing(
+        &self,
+        target: crate::routing::RoutingTarget,
+    ) -> Result<ReprocessingPricing, ReprocessingManifestError> {
+        let rate = match target {
+            crate::routing::RoutingTarget::Capable => &self.targets.capable,
+            crate::routing::RoutingTarget::Efficient => &self.targets.efficient,
+        };
+        let hit = u128::from(self.steady_cache_hit_ppm);
+        let read = u128::from(rate.cache_read_ppm);
+        let write = u128::from(rate.cache_write_ppm);
+        let micros = |usd| {
+            crate::economics::float_usd_to_micros(usd)
+                .map(u128::from)
+                .map_err(|_| ReprocessingManifestError::Invalid)
+        };
+        Ok(ReprocessingPricing {
+            input_micros: micros(rate.input_per_mtok_usd)?,
+            output_micros: micros(rate.output_per_mtok_usd)?,
+            steady_ppm2: hit * read + (PPM - hit) * write,
+            miss_ppm2: write * PPM,
+        })
+    }
+}
+
+impl ReprocessingTargetRate {
+    fn valid(&self) -> bool {
+        [self.input_per_mtok_usd, self.output_per_mtok_usd]
+            .into_iter()
+            .all(|rate| {
+                rate.is_finite()
+                    && (0.0..=crate::economics::MAX_COST_RATE_USD_PER_MTOK).contains(&rate)
+            })
+            && self.cache_read_ppm <= crate::economics::MAX_PPM
+            && (MIN_CACHE_WRITE_PPM..=MAX_CACHE_WRITE_PPM).contains(&self.cache_write_ppm)
+    }
+}
+
+/// Integer prices for one target. Multipliers are in ppm squared (1e12 = 1x) so that the
+/// steady mix `h * read + (1 - h) * write` stays exact.
+struct ReprocessingPricing {
+    input_micros: u128,
+    output_micros: u128,
+    steady_ppm2: u128,
+    miss_ppm2: u128,
+}
+
+impl ReprocessingPricing {
+    /// Rounds half-up to whole micros once per step, as `CostRateMicros::cost_micros` does.
+    fn cost_micros(&self, input: u64, output: u64, multiplier_ppm2: u128) -> Option<u64> {
+        let input_term = u128::from(input)
+            .checked_mul(self.input_micros)?
+            .checked_mul(multiplier_ppm2)?;
+        let output_term = u128::from(output)
+            .checked_mul(self.output_micros)?
+            .checked_mul(PPM * PPM)?;
+        let rounded = input_term
+            .checked_add(output_term)?
+            .checked_add(PPM * PPM * PPM / 2)?
+            / (PPM * PPM * PPM);
+        u64::try_from(rounded).ok()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReprocessingStatus {
+    Available,
+    Incomplete,
+}
+
+/// Modeled, cache-adjusted pricing of routed tasks. Every switch step is priced as a full cache
+/// miss on the target the task switches to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReprocessingSection {
+    pub manifest_digest: String,
+    pub status: ReprocessingStatus,
+    pub tasks: u64,
+    pub routed_steps: u64,
+    pub cold_steps: u64,
+    pub switch_steps: u64,
+    pub steady_steps: u64,
+    pub switches_to_efficient: u64,
+    pub switches_to_capable: u64,
+    /// Routed outcomes that never reached a model: rejected before dispatch or fail-closed.
+    pub excluded_undispatched_steps: u64,
+    pub reprocessing_cost_micros: Option<u64>,
+    pub cache_adjusted_enforced_cost_micros: Option<u64>,
+    pub cache_adjusted_counterfactual_cost_micros: Option<u64>,
+    /// Counterfactual minus enforced.
+    #[serde(with = "controlled_optional_i128")]
+    pub cache_adjusted_delta_micros: Option<i128>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +286,8 @@ mod controlled_optional_i64 {
 pub enum ControlledEnforcementReportError {
     #[error("controlled-enforcement report metric overflow: {metric}")]
     MetricOverflow { metric: &'static str },
+    #[error("invalid reprocessing manifest")]
+    InvalidReprocessingManifest,
 }
 
 pub fn compute_controlled_enforcement_report(
@@ -171,7 +346,214 @@ fn aggregate_controlled_enforcement_report(
         // Ledger reporting has no opaque validated economics join. Never fabricate an
         // opportunity total.
         shadow_opportunity: None,
+        reprocessing: None,
     })
+}
+
+/// Computes the modeled reprocessing section for a validated authority run. The caller attaches
+/// it to the report; without a manifest the report carries no such section.
+pub fn compute_reprocessing_section(
+    run: &ValidatedAuthorityDiagnosticRunReadV2,
+    manifest: &ReprocessingManifest,
+) -> Result<ReprocessingSection, ControlledEnforcementReportError> {
+    aggregate_reprocessing_section(run.records(), run.is_complete(), manifest)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepClass {
+    Cold,
+    Switch,
+    Steady,
+}
+
+fn aggregate_reprocessing_section(
+    records: &[AuthorityRecordV2],
+    complete: bool,
+    manifest: &ReprocessingManifest,
+) -> Result<ReprocessingSection, ControlledEnforcementReportError> {
+    use crate::routing::RoutingTarget;
+
+    let overflow =
+        |metric: &'static str| ControlledEnforcementReportError::MetricOverflow { metric };
+    let invalid = |_| ControlledEnforcementReportError::InvalidReprocessingManifest;
+    let manifest_digest = manifest.digest().map_err(invalid)?;
+    let capable = manifest.pricing(RoutingTarget::Capable).map_err(invalid)?;
+    let efficient = manifest
+        .pricing(RoutingTarget::Efficient)
+        .map_err(invalid)?;
+    let outcomes = records.iter().filter_map(|record| match record {
+        AuthorityRecordV2::Outcome { outcome, .. } => Some(outcome),
+        AuthorityRecordV2::Decision { .. } => None,
+    });
+    fn routed_step(outcome: &crate::ledger::AuthorityOutcomeV2) -> Option<(&str, u64)> {
+        match outcome.routing.as_ref() {
+            Some(crate::ledger::AuthorityRoutingBindingV3::Decision {
+                task_reference_digest,
+                step_id,
+                ..
+            }) => Some((task_reference_digest.as_str(), *step_id)),
+            _ => None,
+        }
+    }
+    // A replacement dispatch carries no routing binding. Run validation links it exactly once to
+    // the candidate it replaced, so it inherits that candidate's (task, step) in any record order.
+    let step_by_decision: BTreeMap<&str, (&str, u64)> = outcomes
+        .clone()
+        .filter_map(|outcome| Some((outcome.decision_id.as_str(), routed_step(outcome)?)))
+        .collect();
+    let mut excluded_undispatched_steps = 0_u64;
+    let mut steps = Vec::new();
+    for outcome in outcomes {
+        let step = routed_step(outcome).or_else(|| {
+            outcome
+                .replaces_decision_id
+                .as_deref()
+                .and_then(|replaced| step_by_decision.get(replaced).copied())
+        });
+        let Some((task_reference_digest, step_id)) = step else {
+            continue;
+        };
+        // Price the model that served the step, not the semantic target: routing can only force
+        // capable, and observe, recommend, and grant loss serve `Original` for an efficient step.
+        let served = match (outcome.actual_dispatch, outcome.target) {
+            (0, _) | (_, PlanTarget::None) => None,
+            (_, PlanTarget::Candidate) => Some(RoutingTarget::Efficient),
+            (_, PlanTarget::Original) => Some(RoutingTarget::Capable),
+        };
+        match served {
+            Some(served) => steps.push((task_reference_digest, step_id, served, outcome)),
+            // A fail-closed replacement's step is already counted through its rejected candidate.
+            None if routed_step(outcome).is_none() => {}
+            None => ControlledAccumulator::increment(
+                &mut excluded_undispatched_steps,
+                "excluded_undispatched_steps",
+            )?,
+        }
+    }
+    // Per (task, step): whether a capable model served it, and whether an efficient one did.
+    let seen = |target: &RoutingTarget| match target {
+        RoutingTarget::Capable => [true, false],
+        RoutingTarget::Efficient => [false, true],
+    };
+    let mut targets_by_step = BTreeMap::<(&str, u64), [bool; 2]>::new();
+    for (task, step_id, target, _) in &steps {
+        let entry = targets_by_step.entry((*task, *step_id)).or_default();
+        let target = seen(target);
+        entry[0] |= target[0];
+        entry[1] |= target[1];
+    }
+    let tasks = targets_by_step
+        .keys()
+        .map(|(task, _)| *task)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let costs_available = complete
+        && steps.iter().all(|(_, _, _, outcome)| {
+            outcome.input_tokens.is_some() && outcome.output_tokens.is_some()
+        });
+
+    let mut section = ReprocessingSection {
+        manifest_digest,
+        status: if costs_available {
+            ReprocessingStatus::Available
+        } else {
+            ReprocessingStatus::Incomplete
+        },
+        tasks: u64::try_from(tasks).map_err(|_| overflow("tasks"))?,
+        routed_steps: 0,
+        cold_steps: 0,
+        switch_steps: 0,
+        steady_steps: 0,
+        switches_to_efficient: 0,
+        switches_to_capable: 0,
+        excluded_undispatched_steps,
+        reprocessing_cost_micros: None,
+        cache_adjusted_enforced_cost_micros: None,
+        cache_adjusted_counterfactual_cost_micros: None,
+        cache_adjusted_delta_micros: None,
+    };
+    let (mut reprocessing, mut enforced, mut counterfactual) = (0_u64, 0_u64, 0_u64);
+    for (task, step_id, target, outcome) in &steps {
+        ControlledAccumulator::increment(&mut section.routed_steps, "routed_steps")?;
+        // An absent predecessor is priced as a miss: that never overstates the saving.
+        let class = if *step_id == 1 {
+            StepClass::Cold
+        } else if targets_by_step
+            .get(&(*task, step_id - 1))
+            .is_some_and(|previous| *previous == seen(target))
+        {
+            StepClass::Steady
+        } else {
+            StepClass::Switch
+        };
+        match class {
+            StepClass::Cold => {
+                ControlledAccumulator::increment(&mut section.cold_steps, "cold_steps")?
+            }
+            StepClass::Steady => {
+                ControlledAccumulator::increment(&mut section.steady_steps, "steady_steps")?
+            }
+            StepClass::Switch => {
+                ControlledAccumulator::increment(&mut section.switch_steps, "switch_steps")?;
+                match target {
+                    RoutingTarget::Efficient => ControlledAccumulator::increment(
+                        &mut section.switches_to_efficient,
+                        "switches_to_efficient",
+                    )?,
+                    RoutingTarget::Capable => ControlledAccumulator::increment(
+                        &mut section.switches_to_capable,
+                        "switches_to_capable",
+                    )?,
+                }
+            }
+        }
+        if !costs_available {
+            continue;
+        }
+        let (Some(input), Some(output)) = (outcome.input_tokens, outcome.output_tokens) else {
+            continue;
+        };
+        let pricing = match target {
+            RoutingTarget::Capable => &capable,
+            RoutingTarget::Efficient => &efficient,
+        };
+        let enforced_multiplier = match class {
+            StepClass::Cold | StepClass::Switch => pricing.miss_ppm2,
+            StepClass::Steady => pricing.steady_ppm2,
+        };
+        let counterfactual_multiplier = match class {
+            StepClass::Cold => capable.miss_ppm2,
+            StepClass::Switch | StepClass::Steady => capable.steady_ppm2,
+        };
+        let step_enforced = pricing
+            .cost_micros(input, output, enforced_multiplier)
+            .ok_or(overflow("cache_adjusted_enforced_cost_micros"))?;
+        let step_counterfactual = capable
+            .cost_micros(input, output, counterfactual_multiplier)
+            .ok_or(overflow("cache_adjusted_counterfactual_cost_micros"))?;
+        enforced = enforced
+            .checked_add(step_enforced)
+            .ok_or(overflow("cache_adjusted_enforced_cost_micros"))?;
+        counterfactual = counterfactual
+            .checked_add(step_counterfactual)
+            .ok_or(overflow("cache_adjusted_counterfactual_cost_micros"))?;
+        if class == StepClass::Switch {
+            let step_reprocessing = pricing
+                .cost_micros(input, 0, pricing.miss_ppm2 - pricing.steady_ppm2)
+                .ok_or(overflow("reprocessing_cost_micros"))?;
+            reprocessing = reprocessing
+                .checked_add(step_reprocessing)
+                .ok_or(overflow("reprocessing_cost_micros"))?;
+        }
+    }
+    if costs_available {
+        section.reprocessing_cost_micros = Some(reprocessing);
+        section.cache_adjusted_enforced_cost_micros = Some(enforced);
+        section.cache_adjusted_counterfactual_cost_micros = Some(counterfactual);
+        section.cache_adjusted_delta_micros =
+            Some(i128::from(counterfactual) - i128::from(enforced));
+    }
+    Ok(section)
 }
 
 pub fn compute_controlled_enforcement_diagnostic_report(
@@ -349,7 +731,7 @@ mod controlled_aggregation_tests {
         supply::TaskClass,
     };
 
-    fn candidate_outcome(
+    pub(super) fn candidate_outcome(
         completion: CompletionStateV2,
         cost: Option<u64>,
         delta: Option<i128>,
@@ -662,6 +1044,748 @@ mod controlled_aggregation_tests {
         let round_tripped: ControlledEnforcementReport =
             serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
         assert_eq!(round_tripped, report);
+    }
+
+    #[test]
+    fn a_report_without_reprocessing_serializes_to_the_pinned_bytes() {
+        let report = aggregate_controlled_enforcement_report(
+            "run",
+            &format!("sha256:{}", "9".repeat(64)),
+            &[],
+            true,
+        )
+        .unwrap();
+        let pinned = format!(
+            r#"{{
+  "schema_version": 2,
+  "authority_schema_version": 2,
+  "complete": true,
+  "run_id": "run",
+  "records_digest": "sha256:{}",
+  "totals": {{
+    "decisions": 0,
+    "candidate_dispatches": 0,
+    "pre_dispatch_rejections": 0,
+    "bypasses": 0,
+    "fail_closed": 0,
+    "failures": 0,
+    "candidate_failures": 0,
+    "cancellations": 0,
+    "incomplete": 0,
+    "routing_capable": 0,
+    "routing_efficient": 0,
+    "routing_unavailable": 0,
+    "observed_enforced_cost_micros": null,
+    "enforced_modeled_delta_micros": null
+  }},
+  "by_mode": [],
+  "shadow_opportunity": null
+}}"#,
+            "9".repeat(64)
+        );
+        let serialized = serde_json::to_string_pretty(&report).unwrap();
+        assert_eq!(serialized, pinned);
+        let reloaded: ControlledEnforcementReport = serde_json::from_str(&pinned).unwrap();
+        assert_eq!(serde_json::to_string_pretty(&reloaded).unwrap(), pinned);
+    }
+}
+
+#[cfg(test)]
+mod reprocessing_tests {
+    use super::controlled_aggregation_tests::candidate_outcome;
+    use super::*;
+    use crate::economics::MAX_EXACT_TOKEN_COUNT;
+    use crate::ledger::{AuthorityOutcomeV2, AuthorityRoutingBindingV3, RoutingDecisionSourceV3};
+    use crate::routing::{RoutingReason, RoutingTarget};
+
+    const EXAMPLE_MANIFEST: &str = "schema_version: 1
+steady_cache_hit_ppm: 950000
+targets:
+  capable:
+    input_per_mtok_usd: 5.0
+    output_per_mtok_usd: 25.0
+    cache_read_ppm: 100000
+    cache_write_ppm: 1250000
+  efficient:
+    input_per_mtok_usd: 3.0
+    output_per_mtok_usd: 15.0
+    cache_read_ppm: 100000
+    cache_write_ppm: 1250000
+";
+
+    fn manifest() -> ReprocessingManifest {
+        ReprocessingManifest::from_yaml(EXAMPLE_MANIFEST).unwrap()
+    }
+
+    fn task(n: u8) -> String {
+        format!("sha256:{}", format!("{n:x}").repeat(64))
+    }
+
+    /// A routed step whose served model matches its semantic target: `Candidate` serves
+    /// efficient and `Original` serves capable.
+    fn step(
+        task_reference_digest: &str,
+        step_id: u64,
+        target: RoutingTarget,
+        input: Option<u64>,
+        output: Option<u64>,
+    ) -> AuthorityRecordV2 {
+        let served = match target {
+            RoutingTarget::Capable => PlanTarget::Original,
+            RoutingTarget::Efficient => PlanTarget::Candidate,
+        };
+        served_step(
+            task_reference_digest,
+            step_id,
+            target,
+            served,
+            input,
+            output,
+        )
+    }
+
+    /// A routed step with an explicit served model, which can differ from the semantic target.
+    fn served_step(
+        task_reference_digest: &str,
+        step_id: u64,
+        target: RoutingTarget,
+        served: PlanTarget,
+        input: Option<u64>,
+        output: Option<u64>,
+    ) -> AuthorityRecordV2 {
+        let mut outcome: AuthorityOutcomeV2 =
+            candidate_outcome(CompletionStateV2::Succeeded, Some(1), Some(0));
+        if served != PlanTarget::Candidate {
+            outcome.target = served;
+            outcome.model_rewritten = false;
+            outcome.grant_digest = None;
+            outcome.grant_expires_at_ms = None;
+            outcome.actuator_identity_digest = None;
+            outcome.actuator_config_digest = None;
+            outcome.observed_actual_cost_micros = None;
+            outcome.approved_counterfactual_cost_micros = None;
+            outcome.enforced_modeled_delta_micros = None;
+        }
+        if served == PlanTarget::None {
+            outcome.actual_dispatch = 0;
+            outcome.completion = CompletionStateV2::Local;
+            outcome.status = None;
+        }
+        outcome.input_tokens = input;
+        outcome.output_tokens = output;
+        outcome.routing = Some(AuthorityRoutingBindingV3::Decision {
+            routing_decision_digest: format!("sha256:{}", "1".repeat(64)),
+            routing_state_digest: format!("sha256:{}", "2".repeat(64)),
+            profile_digest: format!("sha256:{}", "3".repeat(64)),
+            task_reference_digest: task_reference_digest.to_owned(),
+            step_id,
+            semantic_target: target,
+            reason: match target {
+                RoutingTarget::Capable => RoutingReason::DefaultCapable,
+                RoutingTarget::Efficient => RoutingReason::RecentProgress,
+            },
+            source: RoutingDecisionSourceV3::TrustedImmediatePeer,
+        });
+        AuthorityRecordV2::Outcome {
+            schema_version: 3,
+            sequence: step_id,
+            outcome,
+        }
+    }
+
+    fn section(records: &[AuthorityRecordV2], complete: bool) -> ReprocessingSection {
+        aggregate_reprocessing_section(records, complete, &manifest()).unwrap()
+    }
+
+    /// Golden vector. Rates from `EXAMPLE_MANIFEST`, in micros per Mtok: capable input 5_000_000,
+    /// output 25_000_000; efficient input 3_000_000, output 15_000_000. Cache read 0.1x, write
+    /// 1.25x, steady hit h = 0.95 for both targets.
+    ///
+    /// Multipliers: steady s = 0.95 * 0.1 + 0.05 * 1.25 = 0.095 + 0.0625 = 0.1575.
+    /// Miss m = 1.25. Reload premium m - s = 1.0925.
+    ///
+    /// Step 1, capable, cold, I = 100_000, O = 1_000:
+    ///   enforced       = 0.1 Mtok * $5 * 1.25 + 0.001 Mtok * $25 = 0.625 + 0.025 = $0.650000
+    ///   counterfactual = the same cold price                        = $0.650000
+    /// Step 2, efficient, switch (step 1 was capable), I = 120_000, O = 2_000:
+    ///   enforced       = 0.12 * $3 * 1.25 + 0.002 * $15   = 0.45 + 0.03    = $0.480000
+    ///   counterfactual = 0.12 * $5 * 0.1575 + 0.002 * $25 = 0.0945 + 0.05  = $0.144500
+    ///   reprocessing   = 0.12 * $3 * 1.0925                                 = $0.393300
+    /// Step 3, capable, switch (step 2 was efficient), I = 140_000, O = 3_000:
+    ///   enforced       = 0.14 * $5 * 1.25 + 0.003 * $25   = 0.875 + 0.075  = $0.950000
+    ///   counterfactual = 0.14 * $5 * 0.1575 + 0.003 * $25 = 0.11025 + 0.075 = $0.185250
+    ///   reprocessing   = 0.14 * $5 * 1.0925                                 = $0.764750
+    ///
+    /// Totals: enforced 650_000 + 480_000 + 950_000 = 2_080_000 micros.
+    /// Counterfactual 650_000 + 144_500 + 185_250 = 979_750 micros.
+    /// Reprocessing 393_300 + 764_750 = 1_158_050 micros.
+    /// Delta (counterfactual - enforced) = 979_750 - 2_080_000 = -1_100_250 micros.
+    /// Counts: 1 task, 3 routed steps, 1 cold, 2 switch, 0 steady, 1 to efficient, 1 to capable.
+    #[test]
+    fn golden_vector_prices_each_switch_as_a_full_cache_miss() {
+        let t = task(7);
+        let records = [
+            step(&t, 1, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+            step(&t, 2, RoutingTarget::Efficient, Some(120_000), Some(2_000)),
+            step(&t, 3, RoutingTarget::Capable, Some(140_000), Some(3_000)),
+        ];
+        let result = section(&records, true);
+        assert_eq!(
+            result,
+            ReprocessingSection {
+                manifest_digest: manifest().digest().unwrap(),
+                status: ReprocessingStatus::Available,
+                tasks: 1,
+                routed_steps: 3,
+                cold_steps: 1,
+                switch_steps: 2,
+                steady_steps: 0,
+                switches_to_efficient: 1,
+                switches_to_capable: 1,
+                excluded_undispatched_steps: 0,
+                reprocessing_cost_micros: Some(1_158_050),
+                cache_adjusted_enforced_cost_micros: Some(2_080_000),
+                cache_adjusted_counterfactual_cost_micros: Some(979_750),
+                cache_adjusted_delta_micros: Some(-1_100_250),
+            }
+        );
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["status"], "available");
+        assert_eq!(json["cache_adjusted_delta_micros"], "-1100250");
+        assert_eq!(json["reprocessing_cost_micros"], 1_158_050);
+        // Record order in the ledger does not change the result.
+        let mut reversed = records.to_vec();
+        reversed.reverse();
+        assert_eq!(section(&reversed, true), result);
+    }
+
+    /// All capable, steps 1..=3, I = 100_000, O = 1_000 each. Step 1 is cold on both paths.
+    /// Steps 2 and 3 are steady on both paths: 0.1 * $5 * 0.1575 + 0.001 * $25 = $0.103750.
+    /// Enforced = counterfactual = 650_000 + 2 * 103_750 = 857_500 micros; delta 0.
+    #[test]
+    fn a_task_that_never_switches_has_no_reprocessing_and_no_delta() {
+        let t = task(8);
+        let records: Vec<_> = (1..=3)
+            .map(|id| step(&t, id, RoutingTarget::Capable, Some(100_000), Some(1_000)))
+            .collect();
+        let section = section(&records, true);
+        assert_eq!(section.status, ReprocessingStatus::Available);
+        assert_eq!(
+            (
+                section.cold_steps,
+                section.switch_steps,
+                section.steady_steps
+            ),
+            (1, 0, 2)
+        );
+        assert_eq!(section.reprocessing_cost_micros, Some(0));
+        assert_eq!(section.cache_adjusted_enforced_cost_micros, Some(857_500));
+        assert_eq!(
+            section.cache_adjusted_counterfactual_cost_micros,
+            Some(857_500)
+        );
+        assert_eq!(section.cache_adjusted_delta_micros, Some(0));
+    }
+
+    /// Steps 1 and 3 only, both capable. Step 3 has no step 2 in the run, so it is a switch:
+    ///   enforced       = 0.1 * $5 * 1.25 + 0.001 * $25   = $0.650000
+    ///   counterfactual = 0.1 * $5 * 0.1575 + 0.001 * $25 = $0.103750
+    ///   reprocessing   = 0.1 * $5 * 1.0925               = $0.546250
+    /// Delta = (650_000 + 103_750) - (650_000 + 650_000) = -546_250 micros.
+    #[test]
+    fn an_absent_predecessor_prices_the_step_as_a_switch() {
+        let t = task(9);
+        let records = [
+            step(&t, 1, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+            step(&t, 3, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+        ];
+        let section = section(&records, true);
+        assert_eq!(
+            (
+                section.cold_steps,
+                section.switch_steps,
+                section.steady_steps
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(section.switches_to_capable, 1);
+        assert_eq!(section.switches_to_efficient, 0);
+        assert_eq!(section.reprocessing_cost_micros, Some(546_250));
+        assert_eq!(section.cache_adjusted_enforced_cost_micros, Some(1_300_000));
+        assert_eq!(
+            section.cache_adjusted_counterfactual_cost_micros,
+            Some(753_750)
+        );
+        assert_eq!(section.cache_adjusted_delta_micros, Some(-546_250));
+    }
+
+    fn with_outcome(
+        mut record: AuthorityRecordV2,
+        change: impl FnOnce(&mut AuthorityOutcomeV2),
+    ) -> AuthorityRecordV2 {
+        if let AuthorityRecordV2::Outcome { outcome, .. } = &mut record {
+            change(outcome);
+        }
+        record
+    }
+
+    /// Step 2 is semantically efficient but `Original` served it (for example on grant loss).
+    /// It is priced as capable and is steady after capable step 1, on both paths:
+    /// 650_000 + (0.1 * $5 * 0.1575 + 0.001 * $25 = 103_750) = 753_750 micros; delta 0.
+    #[test]
+    fn a_semantic_efficient_step_served_by_the_original_is_priced_as_capable() {
+        let t = task(1);
+        let records = [
+            step(&t, 1, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+            served_step(
+                &t,
+                2,
+                RoutingTarget::Efficient,
+                PlanTarget::Original,
+                Some(100_000),
+                Some(1_000),
+            ),
+        ];
+        let section = section(&records, true);
+        assert_eq!(section.status, ReprocessingStatus::Available);
+        assert_eq!((section.switch_steps, section.steady_steps), (0, 1));
+        assert_eq!(
+            (section.switches_to_efficient, section.switches_to_capable),
+            (0, 0)
+        );
+        assert_eq!(section.reprocessing_cost_micros, Some(0));
+        assert_eq!(section.cache_adjusted_enforced_cost_micros, Some(753_750));
+        assert_eq!(
+            section.cache_adjusted_counterfactual_cost_micros,
+            Some(753_750)
+        );
+        assert_eq!(section.cache_adjusted_delta_micros, Some(0));
+    }
+
+    /// Observe mode never dispatches the candidate. Semantic capable, efficient, efficient all
+    /// run on `Original`, so the task never switches models.
+    #[test]
+    fn an_observe_run_has_no_switches_whatever_the_semantic_targets() {
+        let t = task(2);
+        let records: Vec<_> = [
+            RoutingTarget::Capable,
+            RoutingTarget::Efficient,
+            RoutingTarget::Efficient,
+        ]
+        .into_iter()
+        .zip(1..)
+        .map(|(target, id)| {
+            with_outcome(
+                served_step(
+                    &t,
+                    id,
+                    target,
+                    PlanTarget::Original,
+                    Some(100_000),
+                    Some(1_000),
+                ),
+                |outcome| outcome.mode = RouteMode::Observe,
+            )
+        })
+        .collect();
+        let section = section(&records, true);
+        assert_eq!(section.status, ReprocessingStatus::Available);
+        assert_eq!(
+            (
+                section.cold_steps,
+                section.switch_steps,
+                section.steady_steps
+            ),
+            (1, 0, 2)
+        );
+        assert_eq!(
+            (section.switches_to_efficient, section.switches_to_capable),
+            (0, 0)
+        );
+        assert_eq!(section.reprocessing_cost_micros, Some(0));
+        assert_eq!(section.cache_adjusted_delta_micros, Some(0));
+    }
+
+    /// Step 2's candidate is rejected before dispatch and has no usage. It is excluded, so step
+    /// 3 has no predecessor and is a switch to capable: reprocessing 0.1 * $5 * 1.0925 = 546_250.
+    #[test]
+    fn a_pre_dispatch_rejected_candidate_is_excluded_without_making_the_section_incomplete() {
+        let (first, rejected, _, third) = rejected_candidate_fixture(3);
+        let section = section(&[first, rejected, third], true);
+        assert_eq!(section.status, ReprocessingStatus::Available);
+        assert_eq!(section.excluded_undispatched_steps, 1);
+        assert_eq!(section.routed_steps, 2);
+        assert_eq!((section.switch_steps, section.switches_to_capable), (1, 1));
+        assert_eq!(section.reprocessing_cost_micros, Some(546_250));
+    }
+
+    /// The shape an enforce run writes: step 1 capable; step 2's efficient candidate rejected
+    /// before dispatch; its replacement served by `Original` with `routing: None` and
+    /// `replaces_decision_id` set; step 3 capable. Returns (first, rejected, replacement, third).
+    fn rejected_candidate_fixture(
+        n: u8,
+    ) -> (
+        AuthorityRecordV2,
+        AuthorityRecordV2,
+        AuthorityRecordV2,
+        AuthorityRecordV2,
+    ) {
+        let t = task(n);
+        let named = |record, id: &'static str| {
+            with_outcome(record, |outcome| outcome.decision_id = id.into())
+        };
+        let first = named(
+            step(&t, 1, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+            "step-1",
+        );
+        let rejected = with_outcome(
+            step(&t, 2, RoutingTarget::Efficient, None, None),
+            |outcome| {
+                outcome.decision_id = "step-2-candidate".into();
+                outcome.completion = CompletionStateV2::PreDispatchRejected;
+                outcome.actual_dispatch = 0;
+                outcome.status = None;
+            },
+        );
+        let replacement = with_outcome(
+            served_step(
+                &t,
+                2,
+                RoutingTarget::Efficient,
+                PlanTarget::Original,
+                Some(100_000),
+                Some(1_000),
+            ),
+            |outcome| {
+                outcome.decision_id = "step-2-replacement".into();
+                outcome.replaces_decision_id = Some("step-2-candidate".into());
+                outcome.routing = None;
+            },
+        );
+        let third = named(
+            step(&t, 3, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+            "step-3",
+        );
+        (first, rejected, replacement, third)
+    }
+
+    /// The replacement carries no routing binding. It counts as step 2, served by capable, so
+    /// step 3 is steady: 650_000 + 103_750 + 103_750 = 857_500 micros on both paths; delta 0.
+    #[test]
+    fn a_replacement_dispatch_counts_as_the_step_it_replaced() {
+        let (first, rejected, replacement, third) = rejected_candidate_fixture(5);
+        let orders = [
+            vec![
+                first.clone(),
+                rejected.clone(),
+                replacement.clone(),
+                third.clone(),
+            ],
+            vec![replacement, third, rejected, first],
+        ];
+        let sections: Vec<_> = orders
+            .iter()
+            .map(|records| section(records, true))
+            .collect();
+        for section in &sections {
+            assert_eq!(section.status, ReprocessingStatus::Available);
+            assert_eq!(section.excluded_undispatched_steps, 1);
+            assert_eq!(section.tasks, 1);
+            assert_eq!(
+                (
+                    section.routed_steps,
+                    section.cold_steps,
+                    section.switch_steps,
+                    section.steady_steps
+                ),
+                (3, 1, 0, 2)
+            );
+            assert_eq!(
+                (section.switches_to_efficient, section.switches_to_capable),
+                (0, 0)
+            );
+            assert_eq!(section.reprocessing_cost_micros, Some(0));
+            assert_eq!(section.cache_adjusted_enforced_cost_micros, Some(857_500));
+            assert_eq!(section.cache_adjusted_delta_micros, Some(0));
+        }
+        assert_eq!(sections[0], sections[1]);
+    }
+
+    /// A fail-closed replacement (`target: None`) never reached a model either. Its rejected
+    /// candidate already counts as the one excluded step, so step 3 has no predecessor.
+    #[test]
+    fn a_fail_closed_replacement_is_not_counted_as_a_second_excluded_step() {
+        let (first, rejected, _, third) = rejected_candidate_fixture(8);
+        let t = task(8);
+        let replacement = with_outcome(
+            served_step(
+                &t,
+                2,
+                RoutingTarget::Efficient,
+                PlanTarget::None,
+                None,
+                None,
+            ),
+            |outcome| {
+                outcome.decision_id = "step-2-replacement".into();
+                outcome.replaces_decision_id = Some("step-2-candidate".into());
+                outcome.routing = None;
+            },
+        );
+        let section = section(&[first, rejected, replacement, third], true);
+        assert_eq!(section.status, ReprocessingStatus::Available);
+        assert_eq!(section.excluded_undispatched_steps, 1);
+        assert_eq!((section.routed_steps, section.switch_steps), (2, 1));
+    }
+
+    /// A replacement whose replaced decision is not a routed decision in this run stays out.
+    #[test]
+    fn a_replacement_of_an_unrouted_decision_stays_outside_the_section() {
+        let (first, _, replacement, _) = rejected_candidate_fixture(6);
+        let section = section(&[first, replacement], true);
+        assert_eq!(section.routed_steps, 1);
+        assert_eq!(section.excluded_undispatched_steps, 0);
+        assert_eq!(section.cache_adjusted_enforced_cost_micros, Some(650_000));
+    }
+
+    /// A fail-closed step (`target: None`, `completion: Local`) never reached a model.
+    #[test]
+    fn a_fail_closed_step_is_excluded_without_making_the_section_incomplete() {
+        let t = task(4);
+        let records = [
+            step(&t, 1, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+            served_step(
+                &t,
+                2,
+                RoutingTarget::Efficient,
+                PlanTarget::None,
+                None,
+                None,
+            ),
+        ];
+        let section = section(&records, true);
+        assert_eq!(section.status, ReprocessingStatus::Available);
+        assert_eq!(section.excluded_undispatched_steps, 1);
+        assert_eq!((section.tasks, section.routed_steps), (1, 1));
+        assert_eq!(section.cache_adjusted_enforced_cost_micros, Some(650_000));
+        assert_eq!(section.cache_adjusted_delta_micros, Some(0));
+    }
+
+    /// Step 1 efficient with zero usage (cost 0). Step 2 efficient steady, I = 200, O = 0:
+    ///   enforced       = 200 tokens * 3 micros * 0.1575 = 94.5 micros -> 95 (half-up, not 94)
+    ///   counterfactual = 200 tokens * 5 micros * 0.1575 = 157.5 micros -> 158
+    #[test]
+    fn each_step_rounds_half_up_to_whole_micros() {
+        let t = task(6);
+        let records = [
+            step(&t, 1, RoutingTarget::Efficient, Some(0), Some(0)),
+            step(&t, 2, RoutingTarget::Efficient, Some(200), Some(0)),
+        ];
+        let section = section(&records, true);
+        assert_eq!(section.steady_steps, 1);
+        assert_eq!(section.cache_adjusted_enforced_cost_micros, Some(95));
+        assert_eq!(section.cache_adjusted_counterfactual_cost_micros, Some(158));
+        assert_eq!(section.cache_adjusted_delta_micros, Some(63));
+    }
+
+    #[test]
+    fn steps_group_by_task_and_other_tasks_never_supply_a_predecessor() {
+        let (a, b) = (task(10), task(11));
+        let records = [
+            step(&a, 1, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+            step(&b, 2, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+        ];
+        let section = section(&records, true);
+        assert_eq!(section.tasks, 2);
+        assert_eq!((section.cold_steps, section.switch_steps), (1, 1));
+    }
+
+    #[test]
+    fn missing_usage_on_a_routed_step_makes_the_section_incomplete_without_a_total() {
+        let t = task(12);
+        for (input, output) in [(None, Some(1_000)), (Some(100_000), None)] {
+            let records = [
+                step(&t, 1, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+                step(&t, 2, RoutingTarget::Efficient, input, output),
+            ];
+            let section = section(&records, true);
+            assert_eq!(section.status, ReprocessingStatus::Incomplete);
+            assert_eq!(section.routed_steps, 2);
+            assert_eq!(section.switch_steps, 1);
+            assert_eq!(section.switches_to_efficient, 1);
+            assert_eq!(section.reprocessing_cost_micros, None);
+            assert_eq!(section.cache_adjusted_enforced_cost_micros, None);
+            assert_eq!(section.cache_adjusted_counterfactual_cost_micros, None);
+            assert_eq!(section.cache_adjusted_delta_micros, None);
+            assert_eq!(
+                serde_json::to_value(&section).unwrap()["status"],
+                "incomplete"
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_run_makes_the_section_incomplete_without_a_total() {
+        let t = task(13);
+        let records = [step(&t, 1, RoutingTarget::Capable, Some(1), Some(1))];
+        let section = section(&records, false);
+        assert_eq!(section.status, ReprocessingStatus::Incomplete);
+        assert_eq!(section.routed_steps, 1);
+        assert_eq!(section.cache_adjusted_enforced_cost_micros, None);
+        assert_eq!(section.cache_adjusted_delta_micros, None);
+    }
+
+    #[test]
+    fn unrouted_outcomes_are_outside_the_section() {
+        let unrouted = AuthorityRecordV2::Outcome {
+            schema_version: 2,
+            sequence: 1,
+            outcome: candidate_outcome(CompletionStateV2::Succeeded, None, None),
+        };
+        let section = section(&[unrouted], true);
+        assert_eq!((section.tasks, section.routed_steps), (0, 0));
+        assert_eq!(section.status, ReprocessingStatus::Available);
+        assert_eq!(section.cache_adjusted_enforced_cost_micros, Some(0));
+    }
+
+    #[test]
+    fn the_same_run_and_manifest_produce_identical_bytes() {
+        let t = task(14);
+        let records = [
+            step(&t, 1, RoutingTarget::Capable, Some(100_000), Some(1_000)),
+            step(&t, 2, RoutingTarget::Efficient, Some(120_000), Some(2_000)),
+        ];
+        let first = serde_json::to_vec_pretty(&section(&records, true)).unwrap();
+        let second = serde_json::to_vec_pretty(&section(&records, true)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            manifest().digest().unwrap(),
+            ReprocessingManifest::from_yaml(EXAMPLE_MANIFEST)
+                .unwrap()
+                .digest()
+                .unwrap()
+        );
+        assert!(manifest().digest().unwrap().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn manifest_validation_rejects_each_out_of_range_field_and_unknown_fields() {
+        let valid = manifest();
+        valid.validate().unwrap();
+        let mut invalid = Vec::new();
+        let mut value = valid.clone();
+        value.schema_version = 2;
+        invalid.push(("schema_version", value));
+        let mut value = valid.clone();
+        value.steady_cache_hit_ppm = 1_000_001;
+        invalid.push(("steady_cache_hit_ppm", value));
+        for (name, apply) in [
+            (
+                "input_per_mtok_usd negative",
+                (|rate: &mut ReprocessingTargetRate| rate.input_per_mtok_usd = -1.0)
+                    as fn(&mut ReprocessingTargetRate),
+            ),
+            ("input_per_mtok_usd nan", |rate| {
+                rate.input_per_mtok_usd = f64::NAN
+            }),
+            ("input_per_mtok_usd above cap", |rate| {
+                rate.input_per_mtok_usd = 1_000_000_001.0
+            }),
+            ("output_per_mtok_usd negative", |rate| {
+                rate.output_per_mtok_usd = -1.0
+            }),
+            ("output_per_mtok_usd infinite", |rate| {
+                rate.output_per_mtok_usd = f64::INFINITY
+            }),
+            ("cache_read_ppm", |rate| rate.cache_read_ppm = 1_000_001),
+            ("cache_write_ppm low", |rate| rate.cache_write_ppm = 999_999),
+            ("cache_write_ppm high", |rate| {
+                rate.cache_write_ppm = 4_000_001
+            }),
+        ] {
+            let mut capable = valid.clone();
+            apply(&mut capable.targets.capable);
+            invalid.push((name, capable));
+            let mut efficient = valid.clone();
+            apply(&mut efficient.targets.efficient);
+            invalid.push((name, efficient));
+        }
+        for (name, value) in invalid {
+            assert!(
+                matches!(value.validate(), Err(ReprocessingManifestError::Invalid)),
+                "{name} must be rejected"
+            );
+            let yaml = serde_yaml::to_string(&value).unwrap();
+            assert!(
+                ReprocessingManifest::from_yaml(&yaml).is_err(),
+                "{name} must be rejected from YAML"
+            );
+        }
+        let mut boundary = valid.clone();
+        boundary.steady_cache_hit_ppm = 1_000_000;
+        boundary.targets.capable.cache_read_ppm = 1_000_000;
+        boundary.targets.capable.cache_write_ppm = 1_000_000;
+        boundary.targets.efficient.cache_write_ppm = 4_000_000;
+        boundary.validate().unwrap();
+
+        for unknown in [
+            format!("{EXAMPLE_MANIFEST}ttl_seconds: 300\n"),
+            EXAMPLE_MANIFEST.replace(
+                "    cache_read_ppm: 100000\n    cache_write_ppm: 1250000\n  efficient:",
+                "    cache_read_ppm: 100000\n    cache_write_ppm: 1250000\n    ttl: 1\n  efficient:",
+            ),
+            EXAMPLE_MANIFEST.replace("targets:\n", "targets:\n  frontier: {}\n"),
+        ] {
+            assert!(
+                matches!(
+                    ReprocessingManifest::from_yaml(&unknown),
+                    Err(ReprocessingManifestError::Parse(_))
+                ),
+                "unknown field must be rejected: {unknown}"
+            );
+        }
+        let oversized = format!("{EXAMPLE_MANIFEST}#{}\n", "x".repeat(64 * 1024));
+        assert!(matches!(
+            ReprocessingManifest::from_yaml(&oversized),
+            Err(ReprocessingManifestError::InputLimit)
+        ));
+    }
+
+    #[test]
+    fn overflow_at_the_exact_token_limit_is_an_explicit_error() {
+        let mut wide = manifest();
+        wide.targets.capable.input_per_mtok_usd = 1_000_000_000.0;
+        wide.targets.capable.output_per_mtok_usd = 1_000_000_000.0;
+        wide.validate().unwrap();
+        let t = task(15);
+        let records = [step(
+            &t,
+            1,
+            RoutingTarget::Capable,
+            Some(MAX_EXACT_TOKEN_COUNT),
+            Some(MAX_EXACT_TOKEN_COUNT),
+        )];
+        assert!(matches!(
+            aggregate_reprocessing_section(&records, true, &wide),
+            Err(ControlledEnforcementReportError::MetricOverflow { .. })
+        ));
+
+        // Each step fits in u64 at the example rates (a capable switch step is about 5.6e16
+        // micros), but 1_000 alternating switch steps exceed u64::MAX (about 1.8e19).
+        let records: Vec<_> = (1..=1_000)
+            .map(|id| {
+                let target = if id % 2 == 0 {
+                    RoutingTarget::Efficient
+                } else {
+                    RoutingTarget::Capable
+                };
+                step(&t, id, target, Some(MAX_EXACT_TOKEN_COUNT), Some(0))
+            })
+            .collect();
+        assert!(matches!(
+            aggregate_reprocessing_section(&records, true, &manifest()),
+            Err(ControlledEnforcementReportError::MetricOverflow { .. })
+        ));
     }
 }
 

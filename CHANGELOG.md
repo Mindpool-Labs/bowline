@@ -5,7 +5,14 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `bowline report --authority-manifest <manifest> --reprocessing <file>` adds an optional,
+  modeled `reprocessing` section to the controlled-enforcement report. It counts model switches
+  per routed task, prices each switch as a full prompt-cache miss, and reports cache-adjusted
+  enforced cost, counterfactual cost, and delta with the input file's digest. Without the flag,
+  report output does not change. See `docs/methodology.md` and
+  `examples/enforcement/reprocessing.yaml`.
 
 ## [0.1.0] - 2026-08-25
 
