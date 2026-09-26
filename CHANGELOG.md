@@ -14,6 +14,12 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   report output does not change. See `docs/methodology.md` and
   `examples/enforcement/reprocessing.yaml`.
 
+### Security
+
+- Upgrade `rustls` from 0.23.42 to 0.23.45 and `rustls-webpki` from 0.103.13 to 0.103.15 for
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285). `cargo audit` and
+  `cargo deny check` pass.
+
 ## [0.1.0] - 2026-08-25
 
 Introduces the initial shadow-observer feature set.
