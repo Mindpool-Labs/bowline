@@ -12,15 +12,16 @@ use bowline_core::{
     decision::QualityFloors,
     ledger::{AuthorityLedgerV2, Ledger, RecoveryOutcome, SegmentedLedger},
     report::{
-        compute_controlled_enforcement_diagnostic_report, compute_report, compute_run_report,
-        render_markdown,
+        compute_controlled_enforcement_diagnostic_report, compute_report,
+        compute_reprocessing_section, compute_run_report, render_markdown, ReprocessingManifest,
+        MAX_REPROCESSING_YAML_BYTES,
     },
     run::{RunManifest, RunStore},
     supply::{Registry, SupplyClass},
 };
 use clap::{Args as ClapArgs, ValueEnum};
 
-use crate::economics_render::render_controlled_enforcement_payloads;
+use crate::{economics_render::render_controlled_enforcement_payloads, safe_path};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum AuthorityReportFormat {
@@ -48,11 +49,17 @@ pub struct Args {
     authority_manifest: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = AuthorityReportFormat::Markdown)]
     authority_format: AuthorityReportFormat,
+    /// Operator YAML that prices modeled context reprocessing for routed tasks.
+    #[arg(long)]
+    reprocessing: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     if let Some(manifest) = args.authority_manifest.as_deref() {
         return run_authority_report(&args, manifest);
+    }
+    if args.reprocessing.is_some() {
+        anyhow::bail!("--reprocessing requires --authority-manifest");
     }
     let config_path = args
         .config
@@ -133,10 +140,21 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
 }
 
 fn run_authority_report(args: &Args, manifest: &Path) -> anyhow::Result<ExitCode> {
+    let reprocessing = args
+        .reprocessing
+        .as_deref()
+        .map(load_reprocessing_manifest)
+        .transpose()?;
     let validated = AuthorityLedgerV2::read_validated_authority_diagnostic_run(manifest)
         .context("failed to read validated schema-v2 authority evidence")?;
-    let report = compute_controlled_enforcement_diagnostic_report(&validated)
+    let mut report = compute_controlled_enforcement_diagnostic_report(&validated)
         .context("failed to construct controlled-enforcement report")?;
+    if let Some(reprocessing) = reprocessing.as_ref() {
+        report.reprocessing = Some(
+            compute_reprocessing_section(&validated, reprocessing)
+                .context("failed to compute the modeled reprocessing section")?,
+        );
+    }
     let payloads = render_controlled_enforcement_payloads(&report)?;
     let format = if args.json {
         AuthorityReportFormat::Json
@@ -161,6 +179,17 @@ fn run_authority_report(args: &Args, manifest: &Path) -> anyhow::Result<ExitCode
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn load_reprocessing_manifest(path: &Path) -> anyhow::Result<ReprocessingManifest> {
+    let bytes =
+        safe_path::read_bounded_bytes(path, MAX_REPROCESSING_YAML_BYTES).map_err(|failure| {
+            anyhow::anyhow!("reprocessing manifest {}: {failure}", path.display())
+        })?;
+    let source = std::str::from_utf8(&bytes)
+        .with_context(|| format!("reprocessing manifest {} is not UTF-8", path.display()))?;
+    ReprocessingManifest::from_yaml(source)
+        .with_context(|| format!("failed to load reprocessing manifest {}", path.display()))
 }
 
 fn atomic_write_report(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

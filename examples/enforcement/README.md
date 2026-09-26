@@ -25,3 +25,17 @@ create a dedicated private trust root. While the kill state remains `bypass`, ru
 promotion seal` to create the configured private sidecar, then run full `bowline preflight`.
 Review [controlled enforcement](../../docs/controlled-enforcement.md) and obtain the deployment's
 separate approval before any operator arms authority.
+
+## Synthetic reprocessing input
+
+`reprocessing.yaml` is a synthetic input for the modeled context-reprocessing section of the
+controlled-enforcement report. Its prices are placeholders and its cache ratios match published
+list ratios. It grants nothing and contacts nothing:
+
+```sh
+./target/debug/bowline report --authority-manifest <authority-run-manifest> \
+  --reprocessing examples/enforcement/reprocessing.yaml --json
+```
+
+See [reporting](../../docs/reporting.md#modeled-context-reprocessing) for the fields and
+[methodology](../../docs/methodology.md#modeled-context-reprocessing) for the formula.

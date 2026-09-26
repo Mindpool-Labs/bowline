@@ -111,3 +111,43 @@ Authority records are content-free and retain sanitized target/config identities
 URLs or authorization. They are modeled operational evidence, not provider-reconciled financial
 results. Archive the private grant inputs, schema-v2 run, exact config/policy/registry/TCO, and
 rendered report together.
+
+### Modeled context reprocessing
+
+`bowline report --authority-manifest <manifest> --reprocessing <file>` adds an optional
+`reprocessing` section to the controlled-enforcement report. Without `--reprocessing`, the report
+has no such key and its bytes do not change. The flag is valid only with `--authority-manifest`.
+The input file is strict YAML, at most 65536 bytes, with no unknown fields. A synthetic example is
+at `examples/enforcement/reprocessing.yaml`:
+
+| field | meaning | valid range |
+|---|---|---|
+| `schema_version` | input format version | `1` |
+| `steady_cache_hit_ppm` | share of a non-switch step's input that the model reads from cache | 0 to 1000000 |
+| `targets.capable`, `targets.efficient` | prices of the model behind each routing target | both required |
+| `input_per_mtok_usd`, `output_per_mtok_usd` | list price per million tokens | finite, 0 to 1e9 |
+| `cache_read_ppm` | cache-read price as a fraction of the input price | 0 to 1000000 |
+| `cache_write_ppm` | cache-write price as a fraction of the input price | 1000000 to 4000000 |
+
+The section covers authority outcomes that carry a routing decision. It groups them by task
+reference and step, and prices each step at the model that served it: `Candidate` is efficient
+and `Original` is capable. An outcome that never reached a model, because the candidate was
+rejected before dispatch or the route failed closed, is left out and counted in
+`excluded_undispatched_steps`. A replacement dispatch counts as the step it replaced: it has no
+routing binding of its own, so the section links it through `replaces_decision_id`. It reports `manifest_digest`, `status`, `tasks`, `routed_steps`,
+`cold_steps`, `switch_steps`, `steady_steps`, `switches_to_efficient`, `switches_to_capable`,
+`excluded_undispatched_steps`, `reprocessing_cost_micros`, `cache_adjusted_enforced_cost_micros`,
+`cache_adjusted_counterfactual_cost_micros`, and `cache_adjusted_delta_micros`. The delta is
+counterfactual minus enforced, serialized as a decimal string. `manifest_digest` is a
+domain-separated SHA-256 of the validated manifest values, serialized as canonical JSON. It does
+not cover the file bytes: two files that differ only in comments or layout have the same digest.
+
+`status` is `available` or `incomplete`. It is `incomplete` when the run is incomplete, or when
+any dispatched routed outcome has no input or output token count. An incomplete section keeps its counts and
+sets every cost field to `null`; it never shows a partial total. Checked arithmetic overflow stops
+report construction. Markdown and HTML show the section, labeled modeled, with the manifest digest.
+CSV does not change. The formula and its assumptions are in
+[methodology](methodology.md#modeled-context-reprocessing).
+
+To check a result, recompute each step by hand from the formula and the input file, then compare
+with the JSON. The same run and the same input file produce the same bytes.
